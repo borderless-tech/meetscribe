@@ -170,3 +170,49 @@ def test_derive_window_from_started_at():
     started, ended = _window(started_at=start, duration_s=60.0, mic_wav=None, system_wav=None)
     assert started == "2026-08-02T14:00:00+00:00"
     assert ended == "2026-08-02T14:01:00+00:00"
+
+
+# ---- run --bundle (fake stages) -----------------------------------------------------
+
+def _fake_models_dir(tmp_path):
+    """A models dir just complete enough for run(): a spk model file to sha256."""
+    spk = tmp_path / "models" / "spk"
+    spk.mkdir(parents=True)
+    (spk / "model.onnx").write_bytes(b"fake")
+    return str(spk.parent)
+
+
+def test_run_with_bundle_writes_mscribe(tmp_path, monkeypatch):
+    from meetscribe import pipeline
+
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "mic.wav")
+    _write_wav(rec / "raw" / "system.wav")
+
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(pipeline, "build_components", lambda models_dir: _components())
+
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), bundle=True) == 0
+
+    assert (out / f"meeting-{out.name}.mscribe").exists()
+    # the loose dir is still produced alongside the bundle
+    assert (out / "transcript.json").exists()
+    assert (out / "embeddings.npz").exists()
+    assert (out / "meta.json").exists()
+
+
+def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
+    from meetscribe import pipeline
+
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "system.wav")
+
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(pipeline, "build_components", lambda models_dir: _components())
+
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
+    assert not list(out.glob("*.mscribe"))

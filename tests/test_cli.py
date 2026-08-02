@@ -45,3 +45,13 @@ def test_version_exits_zero():
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(["--version"])
     assert exc.value.code == 0
+
+
+def test_process_parser_accepts_bundle():
+    args = build_parser().parse_args(["process", "x.wav", "--bundle"])
+    assert args.bundle is True
+
+
+def test_record_parser_accepts_bundle():
+    args = build_parser().parse_args(["record", "--bundle"])
+    assert args.bundle is True

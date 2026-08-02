@@ -42,12 +42,20 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--out", default=None,
         help="output directory for artifacts (default: ./meetscribe-<timestamp>)",
     )
+    p_record.add_argument(
+        "--bundle", action="store_true",
+        help="also emit a single meeting-<id>.mscribe upload bundle",
+    )
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
     p_process.add_argument("audio", nargs="?", help="path to an existing recording to process")
     p_process.add_argument(
         "-o", "--out", default=None,
         help="output directory for artifacts",
+    )
+    p_process.add_argument(
+        "--bundle", action="store_true",
+        help="also emit a single meeting-<id>.mscribe upload bundle",
     )
 
     sub.add_parser("doctor", help="check the audio setup is ready to record")
@@ -81,6 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return pipeline.run(
             audio=getattr(args, "audio", None),
             out_dir=getattr(args, "out", None),
+            bundle=getattr(args, "bundle", False),
             reporter=reporter,
         )
 

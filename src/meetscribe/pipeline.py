@@ -256,6 +256,14 @@ def run(
     write_transcript(out / "transcript.json", meeting_id, result.duration_s, result.utterances)
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
+
+    if bundle:
+        from .output import bundle_dir, default_bundle_name
+
+        bundle_path = out / default_bundle_name(meta)
+        bundle_dir(out, bundle_path)
+        print(f"wrote {bundle_path.name}")
+
     reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
     return 0
