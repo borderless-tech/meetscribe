@@ -7,6 +7,7 @@ stored in meta.json and used to size the npz arrays. Never hard-code 512.
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -109,3 +110,27 @@ def write_embeddings(
         cluster_ids=cluster_ids,
         cluster_vectors=cluster_vectors,
     )
+
+
+# The .mscribe bundle: a plain zip of these three fixed-name members (design doc).
+BUNDLE_MEMBERS = ("transcript.json", "embeddings.npz", "meta.json")
+
+
+def bundle_dir(src_dir: str | Path, out_path: str | Path) -> Path:
+    """Zip the three artifacts from ``src_dir`` into a single ``.mscribe`` file.
+
+    Single validation point: every member must exist and ``meta.json`` must carry a
+    ``format_version`` before we write anything.
+    """
+    src = Path(src_dir)
+    for name in BUNDLE_MEMBERS:
+        if not (src / name).exists():
+            raise FileNotFoundError(f"cannot bundle: missing {name} in {src}")
+    meta = json.loads((src / "meta.json").read_text())
+    if "format_version" not in meta:
+        raise ValueError(f"cannot bundle: meta.json in {src} lacks format_version")
+    out = Path(out_path)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in BUNDLE_MEMBERS:
+            z.write(src / name, arcname=name)
+    return out
