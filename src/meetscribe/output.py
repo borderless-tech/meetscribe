@@ -56,6 +56,10 @@ def build_meta(
     }
 
 
+def default_bundle_name(meta: dict) -> str:
+    return f"meeting-{meta['meeting_id']}.mscribe"
+
+
 def write_meta(path: str | Path, meta: dict) -> None:
     Path(path).write_text(json.dumps(meta, indent=2))
 

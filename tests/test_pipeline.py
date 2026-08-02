@@ -153,3 +153,20 @@ def test_process_system_only(tmp_path):
     res = process(None, str(tmp_path / "system.wav"), _components())
     assert all(u.track == "system" for u in res.utterances)
     assert all(t[0].startswith("sys_") for t in res.turns)
+
+
+def test_default_bundle_name_uses_meeting_id():
+    from meetscribe.output import default_bundle_name
+
+    assert default_bundle_name({"meeting_id": "abc123"}) == "meeting-abc123.mscribe"
+
+
+def test_derive_window_from_started_at():
+    from datetime import datetime, timezone
+
+    from meetscribe.pipeline import _window
+
+    start = datetime(2026, 8, 2, 14, 0, 0, tzinfo=timezone.utc)
+    started, ended = _window(started_at=start, duration_s=60.0, mic_wav=None, system_wav=None)
+    assert started == "2026-08-02T14:00:00+00:00"
+    assert ended == "2026-08-02T14:01:00+00:00"
