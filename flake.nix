@@ -1,16 +1,10 @@
 {
   description = "meetscribe — offline dual-track meeting recorder + diarized transcriber (CPU-only)";
 
-  # Optional binary cache (what-we-build.md §9). Without it everything still works — the first
-  # `nix run` just builds locally instead of substituting.
-  # TODO(maintainer): create the cache (`cachix create meetscribe`) and replace the public key
-  # below with the one from `cachix generate-keypair` / the cache settings page.
-  nixConfig = {
-    extra-substituters = [ "https://meetscribe.cachix.org" ];
-    extra-trusted-public-keys = [
-      "meetscribe.cachix.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-    ];
-  };
+  # NOTE: a binary cache (Cachix) is intentionally NOT configured yet — no account exists.
+  # Everything works without one (the first `nix run` just builds locally). To add it later,
+  # set `nixConfig.extra-substituters` + `extra-trusted-public-keys` here and re-enable the
+  # cachix step in .github/workflows/build.yml.
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
