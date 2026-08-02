@@ -74,40 +74,73 @@ def process(
     if mic_wav:
         samples, _ = load_wav_f32(mic_wav)
         duration = max(duration, len(samples) / SAMPLE_RATE)
-        segs = transcribe_chunks(components.recognizer, components.vad.chunks(samples))
+        with reporter.stage("transcribe (mic)"):
+            segs = _transcribe(components, samples, reporter, "ASR (mic)")
         mic_utts = [
             Utterance(s.start, s.end, "me", "mic", s.text, s.words) for s in segs
         ]
         # §2.6: embed the mic segments too → a clean "me" profile without clustering risk.
         mic_diar = filter_short([DiarSegment(s.start, s.end, "me") for s in segs])
-        turns += _prefix_turns(
-            embed_turns(components.embedder, samples, SAMPLE_RATE, mic_diar), "mic"
-        )
-        if mic_diar:
-            clusters += cluster_centroids(
-                components.embedder, samples, SAMPLE_RATE, {"me": mic_diar}
+        with reporter.stage("embed (mic)"):
+            turns += _prefix_turns(
+                embed_turns(components.embedder, samples, SAMPLE_RATE, mic_diar), "mic"
             )
+            if mic_diar:
+                clusters += cluster_centroids(
+                    components.embedder, samples, SAMPLE_RATE, {"me": mic_diar}
+                )
 
     # ---- system track: everyone else, diarized -------------------------------------
     if system_wav:
         samples, _ = load_wav_f32(system_wav)
         duration = max(duration, len(samples) / SAMPLE_RATE)
-        diar = diarize_run(components.diarizer, samples)
-        segs = transcribe_chunks(components.recognizer, components.vad.chunks(samples))
+        with reporter.stage("diarize (system)"):
+            diar = diarize_run(components.diarizer, samples)
+        with reporter.stage("transcribe (system)"):
+            segs = _transcribe(components, samples, reporter, "ASR (system)")
         words = [w for s in segs for w in s.words]
         system_utts = assign_words_to_speakers(words, diar)
 
         diar_f = filter_short(diar)
-        turns += _prefix_turns(
-            embed_turns(components.embedder, samples, SAMPLE_RATE, diar_f), "sys"
-        )
-        clusters += cluster_centroids(
-            components.embedder, samples, SAMPLE_RATE, _group_by_speaker(diar_f)
-        )
+        with reporter.stage("embed (system)"):
+            turns += _prefix_turns(
+                embed_turns(components.embedder, samples, SAMPLE_RATE, diar_f), "sys"
+            )
+            clusters += cluster_centroids(
+                components.embedder, samples, SAMPLE_RATE, _group_by_speaker(diar_f)
+            )
 
     utterances = merge_tracks(mic_utts, system_utts)
     duration = max([duration] + [u.end for u in utterances])
     return Result(utterances, turns, clusters, dim, duration)
+
+
+def _transcribe(components, samples, reporter, label):
+    """VAD-chunk then transcribe, driving a progress bar over the chunk count."""
+    chunks = components.vad.chunks(samples)
+    with reporter.track(label, total=len(chunks)) as bar:
+        return transcribe_chunks(components.recognizer, chunks, on_advance=bar.advance)
+
+
+def summarize(result: Result) -> "Summary":
+    """Aggregate a Result into a Summary (per-speaker talk time, ordered by talk time)."""
+    from .progress import Summary
+
+    talk: dict[str, float] = {}
+    track: dict[str, str] = {}
+    order: list[str] = []
+    for u in result.utterances:
+        if u.speaker not in talk:
+            talk[u.speaker] = 0.0
+            order.append(u.speaker)
+        talk[u.speaker] += u.end - u.start
+        track[u.speaker] = u.track
+    speakers = sorted(order, key=lambda sp: (-talk[sp], order.index(sp)))
+    return Summary(
+        duration_s=result.duration_s,
+        n_segments=len(result.utterances),
+        speakers=[(sp, talk[sp], track[sp]) for sp in speakers],
+    )
 
 
 def resolve_inputs(path: str) -> tuple[str | None, str | None]:
@@ -174,6 +207,9 @@ def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> 
     out.mkdir(parents=True, exist_ok=True)
     meeting_id = out.name if out.name else f"{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
 
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
     components = build_components(models_dir)
     result = process(mic_wav, system_wav, components, reporter=reporter)
 
@@ -190,5 +226,6 @@ def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> 
     write_transcript(out / "transcript.json", meeting_id, result.duration_s, result.utterances)
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
+    reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
     return 0

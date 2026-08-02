@@ -67,11 +67,20 @@ def tokens_to_words(
     return words
 
 
-def transcribe_chunks(recognizer: Recognizer, chunks: Sequence[Chunk]) -> list[Segment]:
-    """Recognize each VAD chunk and shift its word timestamps by the chunk's absolute offset."""
+def transcribe_chunks(
+    recognizer: Recognizer,
+    chunks: Sequence[Chunk],
+    on_advance=None,
+) -> list[Segment]:
+    """Recognize each VAD chunk and shift its word timestamps by the chunk's absolute offset.
+
+    ``on_advance`` (if given) is called once per chunk — used to drive a progress bar.
+    """
     segments: list[Segment] = []
     for chunk in chunks:
         res = recognizer.recognize(chunk.samples)
+        if on_advance is not None:
+            on_advance()
         local_words = tokens_to_words(res.tokens, res.timestamps, res.durations)
         if not local_words:
             continue  # silence / no decoded words

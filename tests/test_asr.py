@@ -57,6 +57,20 @@ def test_transcribe_chunks_applies_offset():
     assert segs[0].start == 10.0 and segs[0].end == 10.9
 
 
+def test_transcribe_chunks_calls_on_advance_once_per_chunk():
+    class R:
+        def recognize(self, samples):
+            return RawResult("hi", [f"{MARK}hi"], [0.0], [0.2])
+
+    chunks = [
+        Chunk(0.0, np.zeros(10, dtype=np.float32), 16000),
+        Chunk(1.0, np.zeros(10, dtype=np.float32), 16000),
+    ]
+    calls = []
+    transcribe_chunks(R(), chunks, on_advance=lambda: calls.append(1))
+    assert len(calls) == 2
+
+
 def test_transcribe_skips_silent_chunk_with_no_words():
     class Silent:
         def recognize(self, samples):

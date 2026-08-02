@@ -105,6 +105,49 @@ def test_process_both_tracks(tmp_path):
     assert res.duration_s == 1.0
 
 
+class RecordingReporter:
+    def __init__(self):
+        self.stages = []
+        self.advances = 0
+
+    def stage(self, label):
+        self.stages.append(label)
+        import contextlib
+
+        return contextlib.nullcontext()
+
+    def track(self, label, total):
+        outer = self
+
+        class T:
+            def advance(self, n=1):
+                outer.advances += 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                pass
+
+        return T()
+
+    def info(self, msg):
+        pass
+
+    def summary(self, s):
+        pass
+
+
+def test_process_reports_stages_and_asr_progress(tmp_path):
+    _write_wav(tmp_path / "mic.wav")
+    _write_wav(tmp_path / "system.wav")
+    rep = RecordingReporter()
+    process(str(tmp_path / "mic.wav"), str(tmp_path / "system.wav"), _components(), reporter=rep)
+    assert any("transcribe" in s for s in rep.stages)
+    assert any("diarize" in s for s in rep.stages)
+    assert rep.advances >= 1  # ASR chunk progress advanced
+
+
 def test_process_system_only(tmp_path):
     _write_wav(tmp_path / "system.wav")
     res = process(None, str(tmp_path / "system.wav"), _components())
