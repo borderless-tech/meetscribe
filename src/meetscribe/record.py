@@ -51,19 +51,37 @@ def match_device(devices: list[tuple[int, str]], name: str) -> int:
     raise ValueError(f"audio device not found: {name}")
 
 
+# Extra filtergraph that taps the two mono streams and prints per-channel RMS (dBFS) to stdout —
+# channel .1 = mic, .2 = system — for the live meters. Reset per frame gives momentary levels.
+_METER_TAIL = (
+    "[mic]asplit=2[micout][mica];[sys]asplit=2[sysout][sysa];"
+    "[mica][sysa]amerge=inputs=2[an];"
+    "[an]astats=metadata=1:reset=1,ametadata=mode=print:file=-[anull]"
+)
+
+
 def build_macos_ffmpeg_cmd(
-    aggregate_index: int, mic_out: str, system_out: str
+    aggregate_index: int, mic_out: str, system_out: str, metered: bool = False
 ) -> list[str]:
     """One avfoundation input against the aggregate device, split by channel with ``pan``.
 
     Convention for the ``meetscribe`` aggregate (BlackHole 2ch + Mic): channels 0/1 are the
     system output (downmixed to mono), channel 2 is the microphone.
     """
+    split = "[0:a]pan=mono|c0=c2[mic];[0:a]pan=mono|c0=c0+c1[sys]"
+    if metered:
+        return [
+            "ffmpeg", "-y", "-hide_banner",
+            "-f", "avfoundation", "-i", f":{aggregate_index}",
+            "-filter_complex", f"{split};{_METER_TAIL}",
+            "-map", "[micout]", "-ar", "16000", "-ac", "1", mic_out,
+            "-map", "[sysout]", "-ar", "16000", "-ac", "1", system_out,
+            "-map", "[anull]", "-f", "null", "/dev/null",
+        ]
     return [
         "ffmpeg", "-y", "-hide_banner",
         "-f", "avfoundation", "-i", f":{aggregate_index}",
-        "-filter_complex",
-        "[0:a]pan=mono|c0=c2[mic];[0:a]pan=mono|c0=c0+c1[sys]",
+        "-filter_complex", split,
         "-map", "[mic]", "-ar", "16000", "-ac", "1", mic_out,
         "-map", "[sys]", "-ar", "16000", "-ac", "1", system_out,
     ]
@@ -91,9 +109,24 @@ def find_monitor_source(names: list[str]) -> str:
 
 
 def build_linux_ffmpeg_cmd(
-    mic_source: str, monitor_source: str, mic_out: str, system_out: str
+    mic_source: str, monitor_source: str, mic_out: str, system_out: str,
+    metered: bool = False,
 ) -> list[str]:
     """Two ``-f pulse`` inputs (mic + sink monitor) into two mono 16 kHz files."""
+    if metered:
+        split = (
+            "[0:a]aresample=16000,pan=mono|c0=c0[mic];"
+            "[1:a]aresample=16000,pan=mono|c0=c0[sys]"
+        )
+        return [
+            "ffmpeg", "-y", "-hide_banner",
+            "-f", "pulse", "-i", mic_source,
+            "-f", "pulse", "-i", monitor_source,
+            "-filter_complex", f"{split};{_METER_TAIL}",
+            "-map", "[micout]", "-ar", "16000", "-ac", "1", mic_out,
+            "-map", "[sysout]", "-ar", "16000", "-ac", "1", system_out,
+            "-map", "[anull]", "-f", "null", "/dev/null",
+        ]
     return [
         "ffmpeg", "-y", "-hide_banner",
         "-f", "pulse", "-i", mic_source,
@@ -104,6 +137,23 @@ def build_linux_ffmpeg_cmd(
 
 
 # ---- RMS / silence / graceful stop -----------------------------------------------------
+
+_ASTATS_RMS = re.compile(r"lavfi\.astats\.(\d+)\.RMS_level=(-?inf|-?\d+(?:\.\d+)?)")
+
+
+def parse_astats(line: str) -> tuple[int, float] | None:
+    """Parse one ffmpeg ``ametadata`` RMS line → ``(channel, dbfs)``; non-RMS lines → ``None``.
+
+    ffmpeg prints e.g. ``lavfi.astats.1.RMS_level=-29.53`` (channel 1 = mic, 2 = system);
+    silence is ``-inf``.
+    """
+    m = _ASTATS_RMS.search(line)
+    if not m:
+        return None
+    value = m.group(2)
+    dbfs = float("-inf") if value.endswith("inf") else float(value)
+    return int(m.group(1)), dbfs
+
 
 def rms(samples: np.ndarray) -> float:
     if len(samples) == 0:
@@ -170,7 +220,17 @@ def _list_linux_sources() -> list[str]:
 def record_tracks(
     mic_out: str, system_out: str, duration: float | None = None, reporter=None
 ) -> None:
-    """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given."""
+    """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given.
+
+    When ``reporter`` provides live meters (a TTY RichReporter), ffmpeg is launched with an
+    ``astats`` side-channel printing per-channel RMS to stdout, which a reader thread parses to
+    drive the level meters.
+    """
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+    metered = getattr(reporter, "supports_meters", lambda: False)() and duration is None
+
     system = platform.system()
     if system == "Darwin":
         listing = subprocess.run(
@@ -179,11 +239,11 @@ def record_tracks(
             capture_output=True, text=True, timeout=10,
         ).stderr
         idx = match_device(parse_avfoundation_devices(listing), "meetscribe")
-        cmd = build_macos_ffmpeg_cmd(idx, mic_out, system_out)
+        cmd = build_macos_ffmpeg_cmd(idx, mic_out, system_out, metered=metered)
     else:
         sources = _list_linux_sources()
         monitor = find_monitor_source(sources)
-        cmd = build_linux_ffmpeg_cmd("default", monitor, mic_out, system_out)
+        cmd = build_linux_ffmpeg_cmd("default", monitor, mic_out, system_out, metered=metered)
 
     if duration is not None:
         # Bound EACH input by placing -t before every -i (a single leading -t would only
@@ -196,10 +256,21 @@ def record_tracks(
             bounded.append(tok)
         cmd = bounded
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE if metered else None,
+        text=True if metered else None,
+    )
     prev = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, lambda *_: stop_ffmpeg(proc))
     try:
+        if metered and proc.stdout is not None:
+            with reporter.meters({1: "mic", 2: "system"}) as meters:
+                for line in proc.stdout:  # channel .1 = mic, .2 = system
+                    parsed = parse_astats(line)
+                    if parsed is not None:
+                        meters.update(parsed[0], parsed[1])
         proc.wait()
     finally:
         signal.signal(signal.SIGINT, prev)

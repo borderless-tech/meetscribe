@@ -14,6 +14,7 @@ from meetscribe.record import (
     build_macos_ffmpeg_cmd,
     find_monitor_source,
     match_device,
+    parse_astats,
     parse_avfoundation_devices,
     parse_pw_sources,
     rms,
@@ -95,6 +96,42 @@ def test_warn_if_silent_flags_silent_wav(tmp_path):
         w.writeframes(np.zeros(16000, dtype="<i2").tobytes())
     msg = warn_if_silent(p)
     assert msg is not None and "silent" in msg.lower()
+
+
+## ---- astats metering ---------------------------------------------------------------
+
+def test_parse_astats_per_channel():
+    assert parse_astats("lavfi.astats.1.RMS_level=-29.537922") == (1, -29.537922)
+    assert parse_astats("lavfi.astats.2.RMS_level=-16.258925") == (2, -16.258925)
+
+
+def test_parse_astats_inf_is_negative_infinity():
+    assert parse_astats("lavfi.astats.1.RMS_level=-inf") == (1, float("-inf"))
+
+
+def test_parse_astats_non_matching_returns_none():
+    assert parse_astats("frame:0    pts:0       pts_time:0") is None
+    assert parse_astats("lavfi.astats.Overall.Peak_level=-3.0") is None
+
+
+def test_linux_metered_cmd_has_astats_amerge_and_two_wavs():
+    cmd = build_linux_ffmpeg_cmd("mic_src", "sink.monitor", "mic.wav", "sys.wav", metered=True)
+    j = " ".join(cmd)
+    assert "astats" in j and "amerge" in j and "ametadata" in j
+    assert j.count("pulse") == 2
+    assert "mic.wav" in cmd and "sys.wav" in cmd
+
+
+def test_macos_metered_cmd_has_astats_and_pan():
+    cmd = build_macos_ffmpeg_cmd(1, "mic.wav", "sys.wav", metered=True)
+    j = " ".join(cmd)
+    assert "astats" in j and "amerge" in j and "pan=" in j
+
+
+def test_non_metered_cmds_unchanged():
+    # default (metered=False) keeps the simple two-output command
+    assert build_linux_ffmpeg_cmd("m", "s", "a", "b").count("-map") == 2
+    assert "astats" not in " ".join(build_macos_ffmpeg_cmd(0, "a", "b"))
 
 
 def test_stop_ffmpeg_sends_q_not_kill():

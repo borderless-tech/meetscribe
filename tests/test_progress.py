@@ -3,7 +3,7 @@
 import io
 import re
 
-from meetscribe.progress import NullReporter, RichReporter, Summary
+from meetscribe.progress import NullReporter, RichReporter, Summary, rms_to_meter
 
 ANSI = re.compile(r"\x1b\[")
 
@@ -57,6 +57,22 @@ def test_rich_reporter_verbose_gates_info():
     loud = RichReporter(file=buf2, force_terminal=False, verbose=True)
     loud.info("shown")
     assert "shown" in buf2.getvalue()
+
+
+def test_rms_to_meter_full_at_zero_db():
+    assert rms_to_meter(0.0, width=8).count("▇") == 8
+
+
+def test_rms_to_meter_empty_at_silence():
+    assert set(rms_to_meter(float("-inf"), width=8)) == {"▁"}
+    assert set(rms_to_meter(-80.0, width=8)) == {"▁"}
+
+
+def test_rms_to_meter_monotonic_and_width():
+    quiet = rms_to_meter(-40.0, 8).count("▇")
+    loud = rms_to_meter(-10.0, 8).count("▇")
+    assert loud >= quiet
+    assert len(rms_to_meter(-25.0, 8)) == 8
 
 
 def test_rich_reporter_summary_renders_speaker_table():
