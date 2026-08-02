@@ -7,6 +7,7 @@ stored in meta.json and used to size the npz arrays. Never hard-code 512.
 from __future__ import annotations
 
 import json
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,14 +16,30 @@ import numpy as np
 from . import __version__
 from .types import Utterance
 
+# Bumped whenever the on-disk artifact/meta shape changes (forward-compat lever).
+FORMAT_VERSION = 1
+
 # (id, vector of shape (dim,), speaker)
 Turn = tuple[str, np.ndarray, str]
 # (cluster_id, vector of shape (dim,))
 Cluster = tuple[str, np.ndarray]
 
 
-def build_meta(models: dict, embedding_dim: int, sample_rate: int = 16000) -> dict:
-    """Assemble meta.json. ``models`` supplies the model names + embedding hash."""
+def build_meta(
+    models: dict,
+    embedding_dim: int,
+    *,
+    meeting_id: str,
+    started_at: str,
+    ended_at: str,
+    duration_s: float,
+    sample_rate: int = 16000,
+) -> dict:
+    """Assemble meta.json. ``models`` supplies the model names + embedding hash.
+
+    ``started_at``/``ended_at`` are tz-aware ISO 8601 strings (with offset) — the
+    calendar-reconciliation match window.
+    """
     return {
         "embedding_model": models["embedding_model"],
         "embedding_model_sha256": models["embedding_model_sha256"],
@@ -31,7 +48,16 @@ def build_meta(models: dict, embedding_dim: int, sample_rate: int = 16000) -> di
         "segmentation_model": models["segmentation_model"],
         "sample_rate": sample_rate,
         "meetscribe_version": __version__,
+        "meeting_id": meeting_id,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_s": duration_s,
+        "format_version": FORMAT_VERSION,
     }
+
+
+def default_bundle_name(meta: dict) -> str:
+    return f"meeting-{meta['meeting_id']}.mscribe"
 
 
 def write_meta(path: str | Path, meta: dict) -> None:
@@ -88,3 +114,27 @@ def write_embeddings(
         cluster_ids=cluster_ids,
         cluster_vectors=cluster_vectors,
     )
+
+
+# The .mscribe bundle: a plain zip of these three fixed-name members (design doc).
+BUNDLE_MEMBERS = ("transcript.json", "embeddings.npz", "meta.json")
+
+
+def bundle_dir(src_dir: str | Path, out_path: str | Path) -> Path:
+    """Zip the three artifacts from ``src_dir`` into a single ``.mscribe`` file.
+
+    Single validation point: every member must exist and ``meta.json`` must carry a
+    ``format_version`` before we write anything.
+    """
+    src = Path(src_dir)
+    for name in BUNDLE_MEMBERS:
+        if not (src / name).exists():
+            raise FileNotFoundError(f"cannot bundle: missing {name} in {src}")
+    meta = json.loads((src / "meta.json").read_text())
+    if "format_version" not in meta:
+        raise ValueError(f"cannot bundle: meta.json in {src} lacks format_version")
+    out = Path(out_path)
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in BUNDLE_MEMBERS:
+            z.write(src / name, arcname=name)
+    return out

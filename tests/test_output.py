@@ -5,7 +5,13 @@ import json
 import numpy as np
 
 from meetscribe import __version__
-from meetscribe.output import build_meta, write_embeddings, write_meta, write_transcript
+from meetscribe.output import (
+    FORMAT_VERSION,
+    build_meta,
+    write_embeddings,
+    write_meta,
+    write_transcript,
+)
 from meetscribe.types import Utterance, Word
 
 DIM = 192  # CAM++ embedding dim (research report — NOT the 512 in the spec)
@@ -17,9 +23,17 @@ MODELS = {
     "segmentation_model": "pyannote-segmentation-3.0",
 }
 
+# The bundle fields build_meta now requires (design §meta enrichment).
+BUNDLE_FIELDS = {
+    "meeting_id": "abc123",
+    "started_at": "2026-08-02T14:03:11+02:00",
+    "ended_at": "2026-08-02T14:47:52+02:00",
+    "duration_s": 2681.0,
+}
+
 
 def test_build_meta_has_all_required_keys():
-    meta = build_meta(MODELS, embedding_dim=DIM)
+    meta = build_meta(MODELS, embedding_dim=DIM, **BUNDLE_FIELDS)
     for key in [
         "embedding_model",
         "embedding_model_sha256",
@@ -35,8 +49,24 @@ def test_build_meta_has_all_required_keys():
     assert meta["meetscribe_version"] == __version__
 
 
+def test_build_meta_includes_bundle_fields():
+    meta = build_meta(
+        MODELS,
+        embedding_dim=DIM,
+        meeting_id="abc123",
+        started_at="2026-08-02T14:03:11+02:00",
+        ended_at="2026-08-02T14:47:52+02:00",
+        duration_s=2681.0,
+    )
+    assert meta["meeting_id"] == "abc123"
+    assert meta["started_at"] == "2026-08-02T14:03:11+02:00"
+    assert meta["ended_at"] == "2026-08-02T14:47:52+02:00"
+    assert meta["duration_s"] == 2681.0
+    assert meta["format_version"] == FORMAT_VERSION
+
+
 def test_write_meta_round_trips(tmp_path):
-    meta = build_meta(MODELS, embedding_dim=DIM)
+    meta = build_meta(MODELS, embedding_dim=DIM, **BUNDLE_FIELDS)
     p = tmp_path / "meta.json"
     write_meta(p, meta)
     assert json.loads(p.read_text()) == meta

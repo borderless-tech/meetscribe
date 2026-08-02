@@ -185,7 +185,29 @@ def build_components(models_dir: str) -> Components:
     )
 
 
-def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> int:
+def _window(started_at, duration_s, mic_wav, system_wav):
+    """Return (started_at, ended_at) as tz-aware ISO 8601 strings (with offset).
+
+    ``started_at`` (a tz-aware datetime) wins; otherwise fall back to the input WAV's
+    mtime as a best-effort capture time for the ``process`` path.
+    """
+    from datetime import datetime, timedelta
+
+    if started_at is None:
+        src = mic_wav or system_wav
+        ts = Path(src).stat().st_mtime if src else 0.0
+        started_at = datetime.fromtimestamp(ts).astimezone()
+    ended_at = started_at + timedelta(seconds=duration_s)
+    return started_at.isoformat(), ended_at.isoformat()
+
+
+def run(
+    audio: str | None = None,
+    out_dir: str | None = None,
+    bundle: bool = False,
+    started_at=None,
+    reporter=None,
+) -> int:
     import os
     from datetime import datetime, timezone
 
@@ -217,6 +239,7 @@ def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> 
     result = process(mic_wav, system_wav, components, reporter=reporter)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
+    started_iso, ended_iso = _window(started_at, result.duration_s, mic_wav, system_wav)
     meta = build_meta(
         {
             "embedding_model": "3dspeaker_campplus_sv_zh_en_16k",
@@ -225,10 +248,22 @@ def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> 
             "segmentation_model": "pyannote-segmentation-3.0",
         },
         embedding_dim=result.dim,
+        meeting_id=meeting_id,
+        started_at=started_iso,
+        ended_at=ended_iso,
+        duration_s=result.duration_s,
     )
     write_transcript(out / "transcript.json", meeting_id, result.duration_s, result.utterances)
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
+
+    if bundle:
+        from .output import bundle_dir, default_bundle_name
+
+        bundle_path = out / default_bundle_name(meta)
+        bundle_dir(out, bundle_path)
+        print(f"wrote {bundle_path.name}")
+
     reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
     return 0
