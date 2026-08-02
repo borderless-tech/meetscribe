@@ -288,14 +288,30 @@ def record_tracks(
         cmd = bounded
 
     proc = subprocess.Popen(cmd, **_popen_kwargs(metered))
+
+    # On Ctrl-C, immediately flip the meters to a "finalizing" state (rich.Live has its own
+    # refresh thread, so this shows even while the main thread waits for ffmpeg to finish writing
+    # the WAV headers) and THEN ask ffmpeg to stop cleanly.
+    meters_ref = {"m": None}
+
+    def _on_sigint(*_):
+        m = meters_ref["m"]
+        if m is not None:
+            try:
+                m.mark_stopping()
+            except Exception:
+                pass
+        stop_ffmpeg(proc)
+
     prev = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, lambda *_: stop_ffmpeg(proc))
+    signal.signal(signal.SIGINT, _on_sigint)
     try:
         if metered and proc.stdout is not None:
             # Drain + parse the astats side-channel on a daemon thread. The main thread stays in
             # proc.wait(), so the SIGINT handler can q-stop ffmpeg while stdout keeps draining
             # (a full pipe would otherwise wedge ffmpeg's shutdown).
             with reporter.meters({1: "mic", 2: "system"}) as meters:
+                meters_ref["m"] = meters
                 reader = threading.Thread(
                     target=_drive_meters, args=(proc.stdout, meters), daemon=True
                 )

@@ -86,6 +86,7 @@ def test_null_reporter_supports_no_meters_and_meters_is_noop():
     assert r.supports_meters() is False
     with r.meters({1: "mic", 2: "system"}) as m:
         m.update(1, -12.0)  # no error, no output
+        m.mark_stopping()  # no-op on the null reporter
 
 
 def test_fmt_duration_formats_hours_minutes_seconds():
@@ -108,7 +109,10 @@ def test_rich_reporter_tty_branches_execute():
     with r.meters({1: "mic", 2: "system"}) as m:
         m.update(1, -10.0)
         m.update(2, float("-inf"))
-    assert buf.getvalue() != ""  # something was rendered, no exception raised
+        m.mark_stopping()  # Ctrl-C → finalizing state
+    out = buf.getvalue()
+    assert out != ""  # something was rendered, no exception raised
+    assert "finalizing" in out  # the stopping state is shown
 
 
 def test_rich_reporter_summary_renders_speaker_table():

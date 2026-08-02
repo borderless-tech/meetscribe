@@ -51,6 +51,9 @@ class _NoopMeters:
     def update(self, channel: int, dbfs: float) -> None:
         pass
 
+    def mark_stopping(self) -> None:
+        pass
+
     def __enter__(self) -> "_NoopMeters":
         return self
 
@@ -209,13 +212,19 @@ class RichReporter:
 
         state = {ch: {"dbfs": float("-inf"), "active": time.monotonic()} for ch in labels}
         start = time.monotonic()
+        flags = {"stopping": False}
 
         def render():
             grid = Table.grid(padding=(0, 1))
             el = int(time.monotonic() - start)
-            grid.add_row(
-                Text(f"● recording {el // 60:02d}:{el % 60:02d}   (Ctrl-C to stop)", style="bold")
-            )
+            if flags["stopping"]:
+                grid.add_row(
+                    Text("⏹ recording stopped — finalizing…", style="bold yellow")
+                )
+            else:
+                grid.add_row(
+                    Text(f"● recording {el // 60:02d}:{el % 60:02d}   (Ctrl-C to stop)", style="bold")
+                )
             now = time.monotonic()
             for ch, label in labels.items():
                 st = state[ch]
@@ -245,6 +254,10 @@ class RichReporter:
                 st["dbfs"] = dbfs
                 if dbfs > -60.0:
                     st["active"] = time.monotonic()
+                live.update(render())
+
+            def mark_stopping(self) -> None:
+                flags["stopping"] = True
                 live.update(render())
 
         try:
