@@ -15,14 +15,30 @@ import numpy as np
 from . import __version__
 from .types import Utterance
 
+# Bumped whenever the on-disk artifact/meta shape changes (forward-compat lever).
+FORMAT_VERSION = 1
+
 # (id, vector of shape (dim,), speaker)
 Turn = tuple[str, np.ndarray, str]
 # (cluster_id, vector of shape (dim,))
 Cluster = tuple[str, np.ndarray]
 
 
-def build_meta(models: dict, embedding_dim: int, sample_rate: int = 16000) -> dict:
-    """Assemble meta.json. ``models`` supplies the model names + embedding hash."""
+def build_meta(
+    models: dict,
+    embedding_dim: int,
+    *,
+    meeting_id: str,
+    started_at: str,
+    ended_at: str,
+    duration_s: float,
+    sample_rate: int = 16000,
+) -> dict:
+    """Assemble meta.json. ``models`` supplies the model names + embedding hash.
+
+    ``started_at``/``ended_at`` are tz-aware ISO 8601 strings (with offset) — the
+    calendar-reconciliation match window.
+    """
     return {
         "embedding_model": models["embedding_model"],
         "embedding_model_sha256": models["embedding_model_sha256"],
@@ -31,6 +47,11 @@ def build_meta(models: dict, embedding_dim: int, sample_rate: int = 16000) -> di
         "segmentation_model": models["segmentation_model"],
         "sample_rate": sample_rate,
         "meetscribe_version": __version__,
+        "meeting_id": meeting_id,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_s": duration_s,
+        "format_version": FORMAT_VERSION,
     }
 
 

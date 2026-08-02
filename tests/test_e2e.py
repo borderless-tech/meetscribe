@@ -68,6 +68,10 @@ def test_full_pipeline_produces_valid_artifacts(tmp_path):
                 "segmentation_model": "pyannote-segmentation-3.0",
             },
             embedding_dim=res.dim,
+            meeting_id="e2e",
+            started_at="2026-08-02T14:03:11+02:00",
+            ended_at="2026-08-02T14:47:52+02:00",
+            duration_s=res.duration_s,
         ),
     )
 
