@@ -82,7 +82,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "record":
         from . import record
 
-        return record.run(out_dir=getattr(args, "out", None), reporter=reporter)
+        return record.run(
+            out_dir=getattr(args, "out", None),
+            bundle=getattr(args, "bundle", False),
+            reporter=reporter,
+        )
     if command == "process":
         from . import pipeline
 

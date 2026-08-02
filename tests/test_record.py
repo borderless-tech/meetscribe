@@ -229,3 +229,23 @@ def test_stop_ffmpeg_sends_q_not_kill():
     assert proc.stdin.written == b"q"
     assert proc.stdin.flushed
     assert not proc.killed
+
+
+# ---- run() threads the real capture start into the pipeline --------------------------
+
+def test_run_passes_started_at_and_bundle_to_pipeline(tmp_path, monkeypatch):
+    # record.run knows the real wall-clock meeting start; it must hand a tz-aware
+    # started_at (and the --bundle flag) to pipeline.run rather than let the pipeline
+    # fall back to the WAV mtime.
+    captured = {}
+    monkeypatch.setattr("meetscribe.record.record_tracks", lambda *a, **k: None)
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: captured.update(k) or 0)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), bundle=True) == 0
+
+    assert captured["bundle"] is True
+    assert captured["started_at"] is not None  # a tz-aware datetime
+    assert captured["started_at"].tzinfo is not None

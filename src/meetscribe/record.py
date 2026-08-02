@@ -324,7 +324,7 @@ def record_tracks(
         signal.signal(signal.SIGINT, prev)
 
 
-def run(out_dir: str | None = None, reporter=None) -> int:
+def run(out_dir: str | None = None, bundle: bool = False, reporter=None) -> int:
     from datetime import datetime, timezone
 
     root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
@@ -334,6 +334,7 @@ def run(out_dir: str | None = None, reporter=None) -> int:
     system_out = str(raw / "system.wav")
 
     print(f"Recording to {root} — press Ctrl-C to stop.")
+    started_at = datetime.now().astimezone()  # tz-aware wall-clock, real meeting start
     record_tracks(mic_out, system_out, reporter=reporter)
 
     for track in (mic_out, system_out):
@@ -343,4 +344,7 @@ def run(out_dir: str | None = None, reporter=None) -> int:
 
     from . import pipeline
 
-    return pipeline.run(audio=str(root), out_dir=str(root), reporter=reporter)
+    return pipeline.run(
+        audio=str(root), out_dir=str(root),
+        bundle=bundle, started_at=started_at, reporter=reporter,
+    )

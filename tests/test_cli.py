@@ -55,3 +55,16 @@ def test_process_parser_accepts_bundle():
 def test_record_parser_accepts_bundle():
     args = build_parser().parse_args(["record", "--bundle"])
     assert args.bundle is True
+
+
+def test_main_record_forwards_bundle_flag(monkeypatch):
+    # Guards the CLI->record.run wiring: `record --bundle` must actually reach
+    # record.run(bundle=True), not just parse into args and get dropped.
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["record", "--bundle"]) == 0
+    assert captured["bundle"] is True
