@@ -167,7 +167,9 @@ def _list_linux_sources() -> list[str]:
         return []
 
 
-def record_tracks(mic_out: str, system_out: str, duration: float | None = None) -> None:
+def record_tracks(
+    mic_out: str, system_out: str, duration: float | None = None, reporter=None
+) -> None:
     """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given."""
     system = platform.system()
     if system == "Darwin":
@@ -203,7 +205,7 @@ def record_tracks(mic_out: str, system_out: str, duration: float | None = None) 
         signal.signal(signal.SIGINT, prev)
 
 
-def run(out_dir: str | None = None) -> int:
+def run(out_dir: str | None = None, reporter=None) -> int:
     from datetime import datetime, timezone
 
     root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
@@ -213,7 +215,7 @@ def run(out_dir: str | None = None) -> int:
     system_out = str(raw / "system.wav")
 
     print(f"Recording to {root} — press Ctrl-C to stop.")
-    record_tracks(mic_out, system_out)
+    record_tracks(mic_out, system_out, reporter=reporter)
 
     for track in (mic_out, system_out):
         warning = warn_if_silent(track)
@@ -222,4 +224,4 @@ def run(out_dir: str | None = None) -> int:
 
     from . import pipeline
 
-    return pipeline.run(audio=str(root), out_dir=str(root))
+    return pipeline.run(audio=str(root), out_dir=str(root), reporter=reporter)

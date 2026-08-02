@@ -34,6 +34,13 @@ def test_record_out_flag():
     assert args.out == "/tmp/out"
 
 
+def test_quiet_and_verbose_flags():
+    args = build_parser().parse_args(["--quiet", "process", "x.wav"])
+    assert args.quiet is True and args.verbose is False
+    args = build_parser().parse_args(["-v", "doctor"])
+    assert args.verbose is True and args.quiet is False
+
+
 def test_version_exits_zero():
     with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(["--version"])

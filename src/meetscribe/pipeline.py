@@ -58,7 +58,11 @@ def process(
     mic_wav: str | None,
     system_wav: str | None,
     components: Components,
+    reporter=None,
 ) -> Result:
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
     mic_utts: list[Utterance] = []
     system_utts: list[Utterance] = []
     turns: list = []
@@ -148,7 +152,7 @@ def build_components(models_dir: str) -> Components:
     )
 
 
-def run(audio: str | None = None, out_dir: str | None = None) -> int:
+def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> int:
     import os
     from datetime import datetime, timezone
 
@@ -171,7 +175,7 @@ def run(audio: str | None = None, out_dir: str | None = None) -> int:
     meeting_id = out.name if out.name else f"{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
 
     components = build_components(models_dir)
-    result = process(mic_wav, system_wav, components)
+    result = process(mic_wav, system_wav, components, reporter=reporter)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
     meta = build_meta(
