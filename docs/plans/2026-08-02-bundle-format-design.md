@@ -1,6 +1,6 @@
 # meetscribe Upload Bundle (`.mscribe`) — Design
 
-Status: **design approved, not yet implemented.** Goal: turn the three loose output artifacts
+Status: **implemented** (branch `feat/mscribe-bundle`). Goal: turn the three loose output artifacts
 (`transcript.json`, `embeddings.npz`, `meta.json`) into a single self-contained file that a
 stateless HTTP sink (borderless-knowledge) can accept in one authenticated upload and ingest
 asynchronously into a transcript-note.
