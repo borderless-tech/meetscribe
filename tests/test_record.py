@@ -10,10 +10,13 @@ import numpy as np
 import pytest
 
 from meetscribe.record import (
+    _drive_meters,
+    _popen_kwargs,
     build_linux_ffmpeg_cmd,
     build_macos_ffmpeg_cmd,
     find_monitor_source,
     match_device,
+    parse_astats,
     parse_avfoundation_devices,
     parse_pw_sources,
     rms,
@@ -95,6 +98,92 @@ def test_warn_if_silent_flags_silent_wav(tmp_path):
         w.writeframes(np.zeros(16000, dtype="<i2").tobytes())
     msg = warn_if_silent(p)
     assert msg is not None and "silent" in msg.lower()
+
+
+## ---- astats metering ---------------------------------------------------------------
+
+def test_parse_astats_per_channel():
+    assert parse_astats("lavfi.astats.1.RMS_level=-29.537922") == (1, -29.537922)
+    assert parse_astats("lavfi.astats.2.RMS_level=-16.258925") == (2, -16.258925)
+
+
+def test_parse_astats_inf_is_negative_infinity():
+    assert parse_astats("lavfi.astats.1.RMS_level=-inf") == (1, float("-inf"))
+
+
+def test_parse_astats_non_matching_returns_none():
+    assert parse_astats("frame:0    pts:0       pts_time:0") is None
+    assert parse_astats("lavfi.astats.Overall.Peak_level=-3.0") is None
+
+
+def test_linux_metered_cmd_has_astats_amerge_and_two_wavs():
+    cmd = build_linux_ffmpeg_cmd("mic_src", "sink.monitor", "mic.wav", "sys.wav", metered=True)
+    j = " ".join(cmd)
+    assert "astats" in j and "amerge" in j and "ametadata" in j
+    assert j.count("pulse") == 2
+    assert "mic.wav" in cmd and "sys.wav" in cmd
+
+
+def test_macos_metered_cmd_has_astats_and_pan():
+    cmd = build_macos_ffmpeg_cmd(1, "mic.wav", "sys.wav", metered=True)
+    j = " ".join(cmd)
+    assert "astats" in j and "amerge" in j and "pan=" in j
+
+
+def test_non_metered_cmds_unchanged():
+    # default (metered=False) keeps the simple two-output command
+    assert build_linux_ffmpeg_cmd("m", "s", "a", "b").count("-map") == 2
+    assert "astats" not in " ".join(build_macos_ffmpeg_cmd(0, "a", "b"))
+
+
+def test_popen_kwargs_metered_keeps_stdin_binary():
+    import subprocess
+
+    # metered must NOT use text mode: stop_ffmpeg writes b"q" to stdin, and a text-mode
+    # stdin would raise TypeError inside the SIGINT handler (regression guard).
+    kw = _popen_kwargs(metered=True)
+    assert kw.get("text") in (None, False)
+    assert kw["stdin"] == subprocess.PIPE
+    assert kw["stdout"] == subprocess.PIPE
+    # non-metered: no stdout pipe needed
+    assert "stdout" not in _popen_kwargs(metered=False)
+
+
+def test_drive_meters_parses_bytes_and_updates_channels():
+    class RecMeters:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, ch, db):
+            self.updates.append((ch, db))
+
+    stream = [
+        b"frame:0    pts_time:0\n",
+        b"lavfi.astats.1.RMS_level=-20.0\n",
+        b"lavfi.astats.2.RMS_level=-10.0\n",
+        b"lavfi.astats.Overall.Peak_level=-3.0\n",  # ignored (not per-channel RMS)
+    ]
+    m = RecMeters()
+    _drive_meters(iter(stream), m)
+    assert m.updates == [(1, -20.0), (2, -10.0)]
+
+
+def test_stop_ffmpeg_tolerates_write_typeerror():
+    # defense-in-depth: a mode mismatch must not propagate out of the SIGINT handler.
+    class BadStdin:
+        def write(self, b):
+            raise TypeError("write() argument must be str, not bytes")
+
+        def flush(self):
+            pass
+
+    class Proc:
+        stdin = BadStdin()
+
+        def wait(self, timeout=None):
+            return 0
+
+    stop_ffmpeg(Proc())  # must not raise
 
 
 def test_stop_ffmpeg_sends_q_not_kill():

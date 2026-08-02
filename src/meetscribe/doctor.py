@@ -47,9 +47,14 @@ class Probe(Protocol):
     def checks(self) -> list[Check]: ...
 
 
-def run(probe: Probe | None = None) -> int:
+def run(probe: Probe | None = None, reporter=None) -> int:
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
     probe = probe or RealProbe()
-    checks = probe.checks()
+    # A spinner during the checks — the 1 s mic RMS test-capture otherwise looks frozen.
+    with reporter.stage("running preflight checks"):
+        checks = probe.checks()
     print(format_report(checks))
     return 0 if checks_pass(checks) else 1
 

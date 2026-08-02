@@ -51,19 +51,37 @@ def match_device(devices: list[tuple[int, str]], name: str) -> int:
     raise ValueError(f"audio device not found: {name}")
 
 
+# Extra filtergraph that taps the two mono streams and prints per-channel RMS (dBFS) to stdout —
+# channel .1 = mic, .2 = system — for the live meters. Reset per frame gives momentary levels.
+_METER_TAIL = (
+    "[mic]asplit=2[micout][mica];[sys]asplit=2[sysout][sysa];"
+    "[mica][sysa]amerge=inputs=2[an];"
+    "[an]astats=metadata=1:reset=1,ametadata=mode=print:file=-[anull]"
+)
+
+
 def build_macos_ffmpeg_cmd(
-    aggregate_index: int, mic_out: str, system_out: str
+    aggregate_index: int, mic_out: str, system_out: str, metered: bool = False
 ) -> list[str]:
     """One avfoundation input against the aggregate device, split by channel with ``pan``.
 
     Convention for the ``meetscribe`` aggregate (BlackHole 2ch + Mic): channels 0/1 are the
     system output (downmixed to mono), channel 2 is the microphone.
     """
+    split = "[0:a]pan=mono|c0=c2[mic];[0:a]pan=mono|c0=c0+c1[sys]"
+    if metered:
+        return [
+            "ffmpeg", "-y", "-hide_banner",
+            "-f", "avfoundation", "-i", f":{aggregate_index}",
+            "-filter_complex", f"{split};{_METER_TAIL}",
+            "-map", "[micout]", "-ar", "16000", "-ac", "1", mic_out,
+            "-map", "[sysout]", "-ar", "16000", "-ac", "1", system_out,
+            "-map", "[anull]", "-f", "null", "/dev/null",
+        ]
     return [
         "ffmpeg", "-y", "-hide_banner",
         "-f", "avfoundation", "-i", f":{aggregate_index}",
-        "-filter_complex",
-        "[0:a]pan=mono|c0=c2[mic];[0:a]pan=mono|c0=c0+c1[sys]",
+        "-filter_complex", split,
         "-map", "[mic]", "-ar", "16000", "-ac", "1", mic_out,
         "-map", "[sys]", "-ar", "16000", "-ac", "1", system_out,
     ]
@@ -91,9 +109,24 @@ def find_monitor_source(names: list[str]) -> str:
 
 
 def build_linux_ffmpeg_cmd(
-    mic_source: str, monitor_source: str, mic_out: str, system_out: str
+    mic_source: str, monitor_source: str, mic_out: str, system_out: str,
+    metered: bool = False,
 ) -> list[str]:
     """Two ``-f pulse`` inputs (mic + sink monitor) into two mono 16 kHz files."""
+    if metered:
+        split = (
+            "[0:a]aresample=16000,pan=mono|c0=c0[mic];"
+            "[1:a]aresample=16000,pan=mono|c0=c0[sys]"
+        )
+        return [
+            "ffmpeg", "-y", "-hide_banner",
+            "-f", "pulse", "-i", mic_source,
+            "-f", "pulse", "-i", monitor_source,
+            "-filter_complex", f"{split};{_METER_TAIL}",
+            "-map", "[micout]", "-ar", "16000", "-ac", "1", mic_out,
+            "-map", "[sysout]", "-ar", "16000", "-ac", "1", system_out,
+            "-map", "[anull]", "-f", "null", "/dev/null",
+        ]
     return [
         "ffmpeg", "-y", "-hide_banner",
         "-f", "pulse", "-i", mic_source,
@@ -104,6 +137,23 @@ def build_linux_ffmpeg_cmd(
 
 
 # ---- RMS / silence / graceful stop -----------------------------------------------------
+
+_ASTATS_RMS = re.compile(r"lavfi\.astats\.(\d+)\.RMS_level=(-?inf|-?\d+(?:\.\d+)?)")
+
+
+def parse_astats(line: str) -> tuple[int, float] | None:
+    """Parse one ffmpeg ``ametadata`` RMS line → ``(channel, dbfs)``; non-RMS lines → ``None``.
+
+    ffmpeg prints e.g. ``lavfi.astats.1.RMS_level=-29.53`` (channel 1 = mic, 2 = system);
+    silence is ``-inf``.
+    """
+    m = _ASTATS_RMS.search(line)
+    if not m:
+        return None
+    value = m.group(2)
+    dbfs = float("-inf") if value.endswith("inf") else float(value)
+    return int(m.group(1)), dbfs
+
 
 def rms(samples: np.ndarray) -> float:
     if len(samples) == 0:
@@ -119,12 +169,16 @@ def warn_if_silent(path: str | Path) -> str | None:
 
 
 def stop_ffmpeg(proc) -> None:
-    """Ask ffmpeg to quit cleanly by writing ``q`` to stdin (a hard kill corrupts WAV headers)."""
+    """Ask ffmpeg to quit cleanly by writing ``q`` to stdin (a hard kill corrupts WAV headers).
+
+    ffmpeg stdin is always opened in binary mode, so ``b"q"`` is correct. The broad except is
+    defence-in-depth: nothing this helper does may propagate out of the SIGINT handler.
+    """
     try:
         if proc.stdin is not None:
             proc.stdin.write(b"q")
             proc.stdin.flush()
-    except (BrokenPipeError, ValueError):
+    except (BrokenPipeError, ValueError, TypeError, OSError):
         pass
     try:
         proc.wait(timeout=10)
@@ -167,8 +221,47 @@ def _list_linux_sources() -> list[str]:
         return []
 
 
-def record_tracks(mic_out: str, system_out: str, duration: float | None = None) -> None:
-    """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given."""
+def _popen_kwargs(metered: bool) -> dict:
+    """Popen kwargs for the ffmpeg capture.
+
+    stdin is ALWAYS binary (never text) so stop_ffmpeg's ``b"q"`` is valid; stdout is a binary
+    pipe only when metering (the astats side-channel), decoded in :func:`_drive_meters`.
+    """
+    kwargs: dict = {"stdin": subprocess.PIPE}
+    if metered:
+        kwargs["stdout"] = subprocess.PIPE
+    return kwargs
+
+
+def _drive_meters(stream, meters) -> None:
+    """Parse ffmpeg's astats stdout (bytes or str lines) and drive the level meters.
+
+    Runs on a daemon thread so the main thread stays free to reap ffmpeg on Ctrl-C (and so the
+    pipe keeps draining while ffmpeg shuts down).
+    """
+    for raw in stream:
+        line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
+        parsed = parse_astats(line)
+        if parsed is not None:
+            meters.update(parsed[0], parsed[1])
+
+
+def record_tracks(
+    mic_out: str, system_out: str, duration: float | None = None, reporter=None
+) -> None:
+    """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given.
+
+    When ``reporter`` provides live meters (a TTY RichReporter), ffmpeg is launched with an
+    ``astats`` side-channel printing per-channel RMS to stdout, which a daemon reader thread
+    parses to drive the level meters while the main thread waits on (and cleanly stops) ffmpeg.
+    """
+    import threading
+
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+    metered = getattr(reporter, "supports_meters", lambda: False)() and duration is None
+
     system = platform.system()
     if system == "Darwin":
         listing = subprocess.run(
@@ -177,11 +270,11 @@ def record_tracks(mic_out: str, system_out: str, duration: float | None = None) 
             capture_output=True, text=True, timeout=10,
         ).stderr
         idx = match_device(parse_avfoundation_devices(listing), "meetscribe")
-        cmd = build_macos_ffmpeg_cmd(idx, mic_out, system_out)
+        cmd = build_macos_ffmpeg_cmd(idx, mic_out, system_out, metered=metered)
     else:
         sources = _list_linux_sources()
         monitor = find_monitor_source(sources)
-        cmd = build_linux_ffmpeg_cmd("default", monitor, mic_out, system_out)
+        cmd = build_linux_ffmpeg_cmd("default", monitor, mic_out, system_out, metered=metered)
 
     if duration is not None:
         # Bound EACH input by placing -t before every -i (a single leading -t would only
@@ -194,16 +287,28 @@ def record_tracks(mic_out: str, system_out: str, duration: float | None = None) 
             bounded.append(tok)
         cmd = bounded
 
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, **_popen_kwargs(metered))
     prev = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, lambda *_: stop_ffmpeg(proc))
     try:
-        proc.wait()
+        if metered and proc.stdout is not None:
+            # Drain + parse the astats side-channel on a daemon thread. The main thread stays in
+            # proc.wait(), so the SIGINT handler can q-stop ffmpeg while stdout keeps draining
+            # (a full pipe would otherwise wedge ffmpeg's shutdown).
+            with reporter.meters({1: "mic", 2: "system"}) as meters:
+                reader = threading.Thread(
+                    target=_drive_meters, args=(proc.stdout, meters), daemon=True
+                )
+                reader.start()
+                proc.wait()
+                reader.join(timeout=1.0)
+        else:
+            proc.wait()
     finally:
         signal.signal(signal.SIGINT, prev)
 
 
-def run(out_dir: str | None = None) -> int:
+def run(out_dir: str | None = None, reporter=None) -> int:
     from datetime import datetime, timezone
 
     root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
@@ -213,7 +318,7 @@ def run(out_dir: str | None = None) -> int:
     system_out = str(raw / "system.wav")
 
     print(f"Recording to {root} — press Ctrl-C to stop.")
-    record_tracks(mic_out, system_out)
+    record_tracks(mic_out, system_out, reporter=reporter)
 
     for track in (mic_out, system_out):
         warning = warn_if_silent(track)
@@ -222,4 +327,4 @@ def run(out_dir: str | None = None) -> int:
 
     from . import pipeline
 
-    return pipeline.run(audio=str(root), out_dir=str(root))
+    return pipeline.run(audio=str(root), out_dir=str(root), reporter=reporter)

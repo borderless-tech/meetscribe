@@ -21,9 +21,9 @@ Alles läuft offline auf CPU. Kein Cloud-Call, kein PyTorch, kein CUDA.
 ### Ziel-UX
 
 ```bash
-nix run github:<user>/meetscribe#doctor   # einmalig: Audio-Setup prüfen
-nix run github:<user>/meetscribe          # aufnehmen (Ctrl-C stoppt) + verarbeiten
-nix run github:<user>/meetscribe -- process path/to/audio.wav   # nur verarbeiten
+nix run github:borderless-tech/meetscribe#doctor   # einmalig: Audio-Setup prüfen
+nix run github:borderless-tech/meetscribe          # aufnehmen (Ctrl-C stoppt) + verarbeiten
+nix run github:borderless-tech/meetscribe -- process path/to/audio.wav   # nur verarbeiten
 ```
 
 Kein Clone, kein venv, kein pip, kein manueller Modell-Download.
@@ -339,7 +339,7 @@ gehört nach `/Library/Audio/Plug-Ins/HAL`, braucht root und einen `coreaudiod`-
 Aggregate Device anlegen. Deshalb muss `doctor` den User da sauber durchführen.
 
 ```
-$ nix run github:<user>/meetscribe#doctor
+$ nix run github:borderless-tech/meetscribe#doctor
 ✓ ffmpeg 7.x
 ✓ Modelle (parakeet-tdt-0.6b-v3, cam++, seg-3.0)
 ✗ BlackHole nicht gefunden

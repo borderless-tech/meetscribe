@@ -28,6 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
         "diarized transcript with speaker embeddings, fully offline on CPU.",
     )
     parser.add_argument("--version", action="version", version=f"meetscribe {__version__}")
+    parser.add_argument(
+        "--quiet", action="store_true", help="suppress the terminal UI (only errors)"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="show extra per-stage detail"
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -57,18 +63,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Bare invocation defaults to the record→process flow.
     command = args.command or "record"
 
+    from .progress import NullReporter, RichReporter
+
+    reporter = NullReporter() if args.quiet else RichReporter(verbose=args.verbose)
+
     if command == "doctor":
         from . import doctor
 
-        return doctor.run()
+        return doctor.run(reporter=reporter)
     if command == "record":
         from . import record
 
-        return record.run(out_dir=getattr(args, "out", None))
+        return record.run(out_dir=getattr(args, "out", None), reporter=reporter)
     if command == "process":
         from . import pipeline
 
-        return pipeline.run(audio=getattr(args, "audio", None), out_dir=getattr(args, "out", None))
+        return pipeline.run(
+            audio=getattr(args, "audio", None),
+            out_dir=getattr(args, "out", None),
+            reporter=reporter,
+        )
 
     parser.error(f"unknown command: {command}")
     return 2  # unreachable; parser.error exits

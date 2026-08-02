@@ -20,6 +20,7 @@ dependencies = [
     # (See docs/plans/2026-08-02-meetscribe-research.md §1 + build-time checklist #1/#2.)
     "sherpa-onnx==1.13.4",
     "sherpa-onnx-core==1.13.4",
+    "rich==14.2.0",
 ]
 
 [project.scripts]
