@@ -1,6 +1,17 @@
 {
   description = "meetscribe — offline dual-track meeting recorder + diarized transcriber (CPU-only)";
 
+  # Optional binary cache (what-we-build.md §9). Without it everything still works — the first
+  # `nix run` just builds locally instead of substituting.
+  # TODO(maintainer): create the cache (`cachix create meetscribe`) and replace the public key
+  # below with the one from `cachix generate-keypair` / the cache settings page.
+  nixConfig = {
+    extra-substituters = [ "https://meetscribe.cachix.org" ];
+    extra-trusted-public-keys = [
+      "meetscribe.cachix.org-1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
@@ -115,6 +126,9 @@
         doctorApp = pkgs.writeShellScript "meetscribe-doctor" ''
           exec ${meetscribe}/bin/meetscribe doctor "$@"
         '';
+
+        # Non-editable env with meetscribe + pytest, for the hermetic test check below.
+        testVenv = pythonSet.mkVirtualEnv "meetscribe-test-env" workspace.deps.all;
       in
       {
         packages.default = meetscribe;
@@ -129,6 +143,16 @@
           type = "app";
           program = "${doctorApp}";
         };
+
+        # `nix flake check` runs the full unit suite hermetically (the e2e test skips without
+        # MEETSCRIBE_MODELS; the record/audio tests never invoke ffmpeg). No network needed.
+        checks.tests = pkgs.runCommand "meetscribe-tests"
+          { nativeBuildInputs = [ testVenv ]; } ''
+          cp -r ${./tests} tests
+          cp ${./pyproject.toml} pyproject.toml
+          HOME=$TMPDIR python -m pytest tests -q
+          touch $out
+        '';
 
         devShells.default = pkgs.mkShell {
           packages = [
