@@ -58,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="also emit a single meeting-<id>.mscribe upload bundle",
     )
 
+    p_bundle = sub.add_parser("bundle", help="zip an artifact directory into one .mscribe")
+    p_bundle.add_argument(
+        "dir", help="directory holding transcript.json / embeddings.npz / meta.json"
+    )
+    p_bundle.add_argument(
+        "-o", "--out", default=None,
+        help="output path (default: ./meeting-<id>.mscribe)",
+    )
+
     sub.add_parser("doctor", help="check the audio setup is ready to record")
 
     return parser
@@ -96,6 +105,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle=getattr(args, "bundle", False),
             reporter=reporter,
         )
+    if command == "bundle":
+        import json
+        from pathlib import Path
+
+        from .output import bundle_dir, default_bundle_name
+
+        src = Path(args.dir)
+        meta = json.loads((src / "meta.json").read_text())
+        out = args.out or default_bundle_name(meta)
+        bundle_dir(src, out)
+        print(f"wrote {out}")
+        return 0
 
     parser.error(f"unknown command: {command}")
     return 2  # unreachable; parser.error exits
