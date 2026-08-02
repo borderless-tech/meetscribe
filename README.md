@@ -26,9 +26,9 @@ preinstalled — ffmpeg and all models come from the flake (exception: BlackHole
 below).
 
 ```bash
-nix run github:<user>/meetscribe#doctor              # check the audio setup first
-nix run github:<user>/meetscribe                     # record (Ctrl-C stops) + process
-nix run github:<user>/meetscribe -- process ./meeting-dir   # process an existing recording
+nix run github:borderless-tech/meetscribe#doctor              # check the audio setup first
+nix run github:borderless-tech/meetscribe                     # record (Ctrl-C stops) + process
+nix run github:borderless-tech/meetscribe -- process ./meeting-dir   # process an existing recording
 ```
 
 `process` accepts a directory containing `raw/mic.wav` + `raw/system.wav`, or a single `.wav`
