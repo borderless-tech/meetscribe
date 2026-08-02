@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from meetscribe.record import (
+    _drive_meters,
+    _popen_kwargs,
     build_linux_ffmpeg_cmd,
     build_macos_ffmpeg_cmd,
     find_monitor_source,
@@ -132,6 +134,56 @@ def test_non_metered_cmds_unchanged():
     # default (metered=False) keeps the simple two-output command
     assert build_linux_ffmpeg_cmd("m", "s", "a", "b").count("-map") == 2
     assert "astats" not in " ".join(build_macos_ffmpeg_cmd(0, "a", "b"))
+
+
+def test_popen_kwargs_metered_keeps_stdin_binary():
+    import subprocess
+
+    # metered must NOT use text mode: stop_ffmpeg writes b"q" to stdin, and a text-mode
+    # stdin would raise TypeError inside the SIGINT handler (regression guard).
+    kw = _popen_kwargs(metered=True)
+    assert kw.get("text") in (None, False)
+    assert kw["stdin"] == subprocess.PIPE
+    assert kw["stdout"] == subprocess.PIPE
+    # non-metered: no stdout pipe needed
+    assert "stdout" not in _popen_kwargs(metered=False)
+
+
+def test_drive_meters_parses_bytes_and_updates_channels():
+    class RecMeters:
+        def __init__(self):
+            self.updates = []
+
+        def update(self, ch, db):
+            self.updates.append((ch, db))
+
+    stream = [
+        b"frame:0    pts_time:0\n",
+        b"lavfi.astats.1.RMS_level=-20.0\n",
+        b"lavfi.astats.2.RMS_level=-10.0\n",
+        b"lavfi.astats.Overall.Peak_level=-3.0\n",  # ignored (not per-channel RMS)
+    ]
+    m = RecMeters()
+    _drive_meters(iter(stream), m)
+    assert m.updates == [(1, -20.0), (2, -10.0)]
+
+
+def test_stop_ffmpeg_tolerates_write_typeerror():
+    # defense-in-depth: a mode mismatch must not propagate out of the SIGINT handler.
+    class BadStdin:
+        def write(self, b):
+            raise TypeError("write() argument must be str, not bytes")
+
+        def flush(self):
+            pass
+
+    class Proc:
+        stdin = BadStdin()
+
+        def wait(self, timeout=None):
+            return 0
+
+    stop_ffmpeg(Proc())  # must not raise
 
 
 def test_stop_ffmpeg_sends_q_not_kill():

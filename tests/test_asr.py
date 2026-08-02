@@ -71,6 +71,29 @@ def test_transcribe_chunks_calls_on_advance_once_per_chunk():
     assert len(calls) == 2
 
 
+def test_transcribe_chunks_advances_even_on_silent_chunks():
+    # the progress bar counts VAD chunks, so on_advance must fire for silent chunks too,
+    # otherwise the bar stalls during silence.
+    class R:
+        def __init__(self):
+            self.i = 0
+
+        def recognize(self, samples):
+            self.i += 1
+            if self.i == 1:
+                return RawResult("hi", [f"{MARK}hi"], [0.0], [0.2])
+            return RawResult("", [], [], [])  # silent
+
+    chunks = [
+        Chunk(0.0, np.zeros(10, dtype=np.float32), 16000),
+        Chunk(1.0, np.zeros(10, dtype=np.float32), 16000),
+    ]
+    calls = []
+    segs = transcribe_chunks(R(), chunks, on_advance=lambda: calls.append(1))
+    assert len(calls) == 2  # advanced for BOTH chunks
+    assert len(segs) == 1   # only the non-silent chunk produced a segment
+
+
 def test_transcribe_skips_silent_chunk_with_no_words():
     class Silent:
         def recognize(self, samples):

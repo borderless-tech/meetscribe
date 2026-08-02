@@ -169,12 +169,16 @@ def warn_if_silent(path: str | Path) -> str | None:
 
 
 def stop_ffmpeg(proc) -> None:
-    """Ask ffmpeg to quit cleanly by writing ``q`` to stdin (a hard kill corrupts WAV headers)."""
+    """Ask ffmpeg to quit cleanly by writing ``q`` to stdin (a hard kill corrupts WAV headers).
+
+    ffmpeg stdin is always opened in binary mode, so ``b"q"`` is correct. The broad except is
+    defence-in-depth: nothing this helper does may propagate out of the SIGINT handler.
+    """
     try:
         if proc.stdin is not None:
             proc.stdin.write(b"q")
             proc.stdin.flush()
-    except (BrokenPipeError, ValueError):
+    except (BrokenPipeError, ValueError, TypeError, OSError):
         pass
     try:
         proc.wait(timeout=10)
@@ -217,15 +221,42 @@ def _list_linux_sources() -> list[str]:
         return []
 
 
+def _popen_kwargs(metered: bool) -> dict:
+    """Popen kwargs for the ffmpeg capture.
+
+    stdin is ALWAYS binary (never text) so stop_ffmpeg's ``b"q"`` is valid; stdout is a binary
+    pipe only when metering (the astats side-channel), decoded in :func:`_drive_meters`.
+    """
+    kwargs: dict = {"stdin": subprocess.PIPE}
+    if metered:
+        kwargs["stdout"] = subprocess.PIPE
+    return kwargs
+
+
+def _drive_meters(stream, meters) -> None:
+    """Parse ffmpeg's astats stdout (bytes or str lines) and drive the level meters.
+
+    Runs on a daemon thread so the main thread stays free to reap ffmpeg on Ctrl-C (and so the
+    pipe keeps draining while ffmpeg shuts down).
+    """
+    for raw in stream:
+        line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else raw
+        parsed = parse_astats(line)
+        if parsed is not None:
+            meters.update(parsed[0], parsed[1])
+
+
 def record_tracks(
     mic_out: str, system_out: str, duration: float | None = None, reporter=None
 ) -> None:
     """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given.
 
     When ``reporter`` provides live meters (a TTY RichReporter), ffmpeg is launched with an
-    ``astats`` side-channel printing per-channel RMS to stdout, which a reader thread parses to
-    drive the level meters.
+    ``astats`` side-channel printing per-channel RMS to stdout, which a daemon reader thread
+    parses to drive the level meters while the main thread waits on (and cleanly stops) ffmpeg.
     """
+    import threading
+
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
@@ -256,22 +287,23 @@ def record_tracks(
             bounded.append(tok)
         cmd = bounded
 
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE if metered else None,
-        text=True if metered else None,
-    )
+    proc = subprocess.Popen(cmd, **_popen_kwargs(metered))
     prev = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, lambda *_: stop_ffmpeg(proc))
     try:
         if metered and proc.stdout is not None:
+            # Drain + parse the astats side-channel on a daemon thread. The main thread stays in
+            # proc.wait(), so the SIGINT handler can q-stop ffmpeg while stdout keeps draining
+            # (a full pipe would otherwise wedge ffmpeg's shutdown).
             with reporter.meters({1: "mic", 2: "system"}) as meters:
-                for line in proc.stdout:  # channel .1 = mic, .2 = system
-                    parsed = parse_astats(line)
-                    if parsed is not None:
-                        meters.update(parsed[0], parsed[1])
-        proc.wait()
+                reader = threading.Thread(
+                    target=_drive_meters, args=(proc.stdout, meters), daemon=True
+                )
+                reader.start()
+                proc.wait()
+                reader.join(timeout=1.0)
+        else:
+            proc.wait()
     finally:
         signal.signal(signal.SIGINT, prev)
 
