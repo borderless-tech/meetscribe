@@ -1,0 +1,4 @@
+#!/bin/sh
+# Thin launcher; the Nix wrapper puts the runtime venv (which provides `python` and the
+# installed meetscribe package) plus ffmpeg on PATH and sets MEETSCRIBE_MODELS.
+exec python -m meetscribe "$@"

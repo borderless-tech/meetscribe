@@ -28,8 +28,9 @@
   };
 
   outputs =
-    { nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+    { self, nixpkgs, flake-utils, pyproject-nix, uv2nix, pyproject-build-systems, ... }:
+    let
+      perSystem = flake-utils.lib.eachDefaultSystem (system:
       let
         inherit (nixpkgs) lib;
         pkgs = nixpkgs.legacyPackages.${system};
@@ -101,13 +102,41 @@
 
         # deps.all includes the `dev` dependency-group (pytest); deps.default is runtime-only.
         devVenv = editablePythonSet.mkVirtualEnv "meetscribe-dev-env" workspace.deps.all;
+
+        # ---- Runtime artifacts -------------------------------------------------------
+        # Non-editable venv (runtime deps only, no pytest) that also installs meetscribe itself.
+        runtimeVenv = pythonSet.mkVirtualEnv "meetscribe-env" workspace.deps.default;
+        models = pkgs.callPackage ./nix/models.nix { };
+        meetscribe = pkgs.callPackage ./nix/package.nix {
+          venv = runtimeVenv;
+          ffmpeg = pkgs.ffmpeg;
+          inherit models;
+        };
+        doctorApp = pkgs.writeShellScript "meetscribe-doctor" ''
+          exec ${meetscribe}/bin/meetscribe doctor "$@"
+        '';
       in
       {
+        packages.default = meetscribe;
+        packages.meetscribe = meetscribe;
+        packages.models = models;
+
+        apps.default = {
+          type = "app";
+          program = "${meetscribe}/bin/meetscribe";
+        };
+        apps.doctor = {
+          type = "app";
+          program = "${doctorApp}";
+        };
+
         devShells.default = pkgs.mkShell {
           packages = [
             devVenv
             pkgs.uv
-            pkgs.ffmpeg-headless
+            # Full ffmpeg (NOT ffmpeg-headless): recording needs the pulse (Linux) and
+            # avfoundation (macOS) input demuxers, which the headless build omits.
+            pkgs.ffmpeg
           ];
           env = {
             # uv is present for lockfile maintenance only — never to sync/run inside the shell.
@@ -120,8 +149,13 @@
             export REPO_ROOT=$(git rev-parse --show-toplevel)
           '';
         };
-
-        # The runtime package (wrapper), apps, models, overlays and the Home-Manager module
-        # are added in chunks C7/C8. Kept out of C0 so this flake evaluates + builds today.
       });
+    in
+    perSystem // {
+      # System-independent outputs.
+      overlays.default = _final: prev: {
+        meetscribe = self.packages.${prev.stdenv.hostPlatform.system}.default;
+      };
+      homeManagerModules.default = import ./nix/module.nix self;
+    };
 }
