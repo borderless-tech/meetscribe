@@ -70,7 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "doctor":
         from . import doctor
 
-        return doctor.run()
+        return doctor.run(reporter=reporter)
     if command == "record":
         from . import record
 

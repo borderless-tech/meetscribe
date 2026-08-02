@@ -34,6 +34,32 @@ nix run github:borderless-tech/meetscribe -- process ./meeting-dir   # process a
 `process` accepts a directory containing `raw/mic.wav` + `raw/system.wav`, or a single `.wav`
 (treated as the system track and diarized).
 
+## Terminal output
+
+While recording, live level-meters show both tracks in real time — a dead track is obvious
+immediately, not after the meeting:
+
+```
+● recording 02:14   (Ctrl-C to stop)
+  mic     ▇▇▇▆▅▂▁▁▁▁▁▁  -18 dB
+  system  ▇▇▇▇▇▆▅▁▁▁▁▁   -9 dB
+```
+
+Processing shows staged progress (a real ETA bar over the ASR chunks) and a summary:
+
+```
+✓ transcribe (mic)      3.1s
+⠹ ASR (system)   ▕████████░░░░▏ 62/98   ~0:40 left
+...
+meeting  57m 12s · 41 segments · 3 speakers
+  me       23m   (mic)
+  spk_0    19m
+```
+
+The UI goes to **stderr** and auto-degrades to plain text when output is piped or not a TTY (so
+stdout / redirected logs stay clean). Flags: `--quiet` suppresses it, `--verbose` adds per-stage
+detail.
+
 ## ⚠️ Wear headphones
 
 v1 requires headphones. Without them the far side leaks from your speakers into the mic track
