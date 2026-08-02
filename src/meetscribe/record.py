@@ -71,7 +71,7 @@ def build_macos_ffmpeg_cmd(
     split = "[0:a]pan=mono|c0=c2[mic];[0:a]pan=mono|c0=c0+c1[sys]"
     if metered:
         return [
-            "ffmpeg", "-y", "-hide_banner",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
             "-f", "avfoundation", "-i", f":{aggregate_index}",
             "-filter_complex", f"{split};{_METER_TAIL}",
             "-map", "[micout]", "-ar", "16000", "-ac", "1", mic_out,
@@ -79,7 +79,7 @@ def build_macos_ffmpeg_cmd(
             "-map", "[anull]", "-f", "null", "/dev/null",
         ]
     return [
-        "ffmpeg", "-y", "-hide_banner",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "avfoundation", "-i", f":{aggregate_index}",
         "-filter_complex", split,
         "-map", "[mic]", "-ar", "16000", "-ac", "1", mic_out,
@@ -119,7 +119,7 @@ def build_linux_ffmpeg_cmd(
             "[1:a]aresample=16000,pan=mono|c0=c0[sys]"
         )
         return [
-            "ffmpeg", "-y", "-hide_banner",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
             "-f", "pulse", "-i", mic_source,
             "-f", "pulse", "-i", monitor_source,
             "-filter_complex", f"{split};{_METER_TAIL}",
@@ -128,7 +128,7 @@ def build_linux_ffmpeg_cmd(
             "-map", "[anull]", "-f", "null", "/dev/null",
         ]
     return [
-        "ffmpeg", "-y", "-hide_banner",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "pulse", "-i", mic_source,
         "-f", "pulse", "-i", monitor_source,
         "-map", "0:a", "-ar", "16000", "-ac", "1", mic_out,

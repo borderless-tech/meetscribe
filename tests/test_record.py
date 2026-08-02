@@ -130,6 +130,19 @@ def test_macos_metered_cmd_has_astats_and_pan():
     assert "astats" in j and "amerge" in j and "pan=" in j
 
 
+def test_record_cmds_suppress_ffmpeg_log_noise():
+    # ffmpeg's banner + astats per-frame report go to stderr, where the rich UI also renders;
+    # -loglevel error -nostats keeps them from interleaving (meter data is on stdout, unaffected).
+    for cmd in (
+        build_linux_ffmpeg_cmd("m", "s", "a", "b"),
+        build_linux_ffmpeg_cmd("m", "s", "a", "b", metered=True),
+        build_macos_ffmpeg_cmd(0, "a", "b"),
+        build_macos_ffmpeg_cmd(0, "a", "b", metered=True),
+    ):
+        assert "-loglevel" in cmd and "error" in cmd
+        assert "-nostats" in cmd
+
+
 def test_non_metered_cmds_unchanged():
     # default (metered=False) keeps the simple two-output command
     assert build_linux_ffmpeg_cmd("m", "s", "a", "b").count("-map") == 2

@@ -210,7 +210,10 @@ def run(audio: str | None = None, out_dir: str | None = None, reporter=None) -> 
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
-    components = build_components(models_dir)
+    # Loading the ~600 MB Parakeet model takes several seconds — show a spinner so the
+    # record→process transition isn't a silent gap.
+    with reporter.stage("loading models"):
+        components = build_components(models_dir)
     result = process(mic_wav, system_wav, components, reporter=reporter)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
