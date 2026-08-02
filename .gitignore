@@ -1,0 +1,22 @@
+# Nix
+result
+result-*
+.direnv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# meetscribe runtime artifacts
+/raw/
+/work/
+meetscribe-*/
+*.wav
+*.npz
+
+# editor
+.idea/
+.vscode/

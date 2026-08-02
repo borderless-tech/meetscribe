@@ -1,0 +1,40 @@
+"""CLI argument-parsing tests (pure, no side effects)."""
+
+import pytest
+
+from meetscribe.cli import build_parser
+
+
+def test_bare_invocation_has_no_command():
+    # Bare invocation parses cleanly; main() defaults it to "record".
+    args = build_parser().parse_args([])
+    assert args.command is None
+
+
+def test_process_takes_optional_audio_path():
+    args = build_parser().parse_args(["process", "foo.wav"])
+    assert args.command == "process"
+    assert args.audio == "foo.wav"
+
+
+def test_process_audio_is_optional():
+    args = build_parser().parse_args(["process"])
+    assert args.command == "process"
+    assert args.audio is None
+
+
+def test_doctor_command():
+    args = build_parser().parse_args(["doctor"])
+    assert args.command == "doctor"
+
+
+def test_record_out_flag():
+    args = build_parser().parse_args(["record", "-o", "/tmp/out"])
+    assert args.command == "record"
+    assert args.out == "/tmp/out"
+
+
+def test_version_exits_zero():
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(["--version"])
+    assert exc.value.code == 0
