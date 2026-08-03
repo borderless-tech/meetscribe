@@ -1,0 +1,16 @@
+[
+  {
+    "id": 30,
+    "type": "PipeWire:Interface:Metadata",
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      { "subject": 0, "key": "default.audio.sink", "value": { "name": "bluez_output.AC_80_0A_F3_FB_F1.1" } },
+      { "subject": 0, "key": "default.audio.source", "value": { "name": "alsa_input.pci-0000_00_1f.3.mic" } }
+    ]
+  },
+  {
+    "id": 110,
+    "type": "PipeWire:Interface:Node",
+    "info": { "props": { "media.class": "Audio/Sink", "node.name": "bluez_output.AC_80_0A_F3_FB_F1.1" } }
+  }
+]

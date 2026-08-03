@@ -101,7 +101,45 @@ def parse_pw_sources(text: str) -> list[str]:
     return names
 
 
-def find_monitor_source(names: list[str]) -> str:
+def parse_pw_default_sink(text: str) -> str | None:
+    """Extract the default sink's node name from ``pw-dump`` JSON, or ``None`` if absent.
+
+    The default routing lives in the ``default`` Metadata object under the ``default.audio.sink``
+    key, whose value is ``{"name": "<sink node.name>"}`` (older PipeWire emits a bare string).
+    """
+    import json
+
+    try:
+        objects = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    for obj in objects:
+        if not isinstance(obj, dict) or not str(obj.get("type", "")).endswith("Metadata"):
+            continue
+        for entry in obj.get("metadata") or []:
+            if entry.get("key") != "default.audio.sink":
+                continue
+            value = entry.get("value")
+            if isinstance(value, dict):
+                return value.get("name")
+            if isinstance(value, str):
+                return value
+    return None
+
+
+def find_monitor_source(names: list[str], default_sink: str | None = None) -> str:
+    """Pick the monitor source to capture system audio from.
+
+    Prefer the *default* sink's monitor (``<default_sink>.monitor``) — that is where apps route
+    their output, so it is where the meeting audio lands. Only when the default is unknown or
+    exposes no matching monitor do we fall back to the first monitor enumerated (best-effort).
+    Selecting the first monitor blindly records a silent, unused output (e.g. an idle HDMI port)
+    whenever the active sink — a Bluetooth headset, say — does not happen to sort first.
+    """
+    if default_sink is not None:
+        preferred = f"{default_sink}.monitor"
+        if preferred in names:
+            return preferred
     for name in names:
         if name.endswith(".monitor"):
             return name
@@ -221,6 +259,25 @@ def _list_linux_sources() -> list[str]:
         return []
 
 
+def _default_sink() -> str | None:
+    """Best-effort name of the default output sink (pactl, else pw-dump metadata)."""
+    try:
+        res = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True, text=True, timeout=5,
+        )
+        name = res.stdout.strip()
+        if name:
+            return name
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+    try:
+        res = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
+        return parse_pw_default_sink(res.stdout)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+
+
 def _popen_kwargs(metered: bool) -> dict:
     """Popen kwargs for the ffmpeg capture.
 
@@ -247,7 +304,8 @@ def _drive_meters(stream, meters) -> None:
 
 
 def record_tracks(
-    mic_out: str, system_out: str, duration: float | None = None, reporter=None
+    mic_out: str, system_out: str, duration: float | None = None, reporter=None,
+    system_source: str | None = None,
 ) -> None:
     """Record both tracks until SIGINT (Ctrl-C), or for ``duration`` seconds if given.
 
@@ -271,9 +329,13 @@ def record_tracks(
         ).stderr
         idx = match_device(parse_avfoundation_devices(listing), "meetscribe")
         cmd = build_macos_ffmpeg_cmd(idx, mic_out, system_out, metered=metered)
+    elif system_source is not None:
+        # Explicit escape hatch: use the given source verbatim, no enumeration needed.
+        cmd = build_linux_ffmpeg_cmd(
+            "default", system_source, mic_out, system_out, metered=metered
+        )
     else:
-        sources = _list_linux_sources()
-        monitor = find_monitor_source(sources)
+        monitor = find_monitor_source(_list_linux_sources(), _default_sink())
         cmd = build_linux_ffmpeg_cmd("default", monitor, mic_out, system_out, metered=metered)
 
     if duration is not None:
@@ -324,7 +386,10 @@ def record_tracks(
         signal.signal(signal.SIGINT, prev)
 
 
-def run(out_dir: str | None = None, bundle: bool = False, reporter=None) -> int:
+def run(
+    out_dir: str | None = None, bundle: bool = False, reporter=None,
+    system_source: str | None = None,
+) -> int:
     from datetime import datetime, timezone
 
     root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
@@ -335,7 +400,7 @@ def run(out_dir: str | None = None, bundle: bool = False, reporter=None) -> int:
 
     print(f"Recording to {root} — press Ctrl-C to stop.")
     started_at = datetime.now().astimezone()  # tz-aware wall-clock, real meeting start
-    record_tracks(mic_out, system_out, reporter=reporter)
+    record_tracks(mic_out, system_out, reporter=reporter, system_source=system_source)
 
     for track in (mic_out, system_out):
         warning = warn_if_silent(track)

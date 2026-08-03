@@ -18,6 +18,7 @@ from meetscribe.record import (
     match_device,
     parse_astats,
     parse_avfoundation_devices,
+    parse_pw_default_sink,
     parse_pw_sources,
     rms,
     stop_ffmpeg,
@@ -67,6 +68,42 @@ def test_parse_pw_sources_returns_names():
 def test_find_monitor_source_prefers_monitor():
     names = parse_pw_sources((FIX / "pactl_sources.txt").read_text())
     assert find_monitor_source(names).endswith(".monitor")
+
+
+def test_find_monitor_source_prefers_default_sink_monitor():
+    # Regression: the active output (a Bluetooth headset) sorts LAST among the enumerated
+    # monitors, while a silent unused HDMI output sorts first. meetscribe must tap the DEFAULT
+    # sink's monitor — not blindly the first monitor — or the system track records silence.
+    names = [
+        "alsa_output.hdmi3.monitor",     # first, but nothing plays here → silent
+        "alsa_output.hdmi2.monitor",
+        "alsa_input.builtin_mic",
+        "bluez_output.AC_80_0A_F3_FB_F1.1.monitor",  # the real output, sorts last
+    ]
+    got = find_monitor_source(names, default_sink="bluez_output.AC_80_0A_F3_FB_F1.1")
+    assert got == "bluez_output.AC_80_0A_F3_FB_F1.1.monitor"
+
+
+def test_find_monitor_source_without_default_returns_first_monitor():
+    # No default known → preserve the old best-effort behavior (first monitor wins).
+    names = ["alsa_output.hdmi3.monitor", "bluez_output.headset.monitor"]
+    assert find_monitor_source(names) == "alsa_output.hdmi3.monitor"
+
+
+def test_find_monitor_source_default_without_monitor_falls_back_to_first():
+    # Default sink is known but exposes no matching monitor → fall back to first monitor.
+    names = ["alsa_output.hdmi3.monitor", "alsa_output.headphones.monitor"]
+    assert find_monitor_source(names, default_sink="sink_without_monitor") \
+        == "alsa_output.hdmi3.monitor"
+
+
+def test_parse_pw_default_sink_reads_metadata():
+    text = (FIX / "pw_dump_default.json").read_text()
+    assert parse_pw_default_sink(text) == "bluez_output.AC_80_0A_F3_FB_F1.1"
+
+
+def test_parse_pw_default_sink_missing_returns_none():
+    assert parse_pw_default_sink("[]") is None
 
 
 def test_linux_cmd_has_two_pulse_inputs_and_two_outputs():
@@ -232,6 +269,56 @@ def test_stop_ffmpeg_sends_q_not_kill():
 
 
 # ---- run() threads the real capture start into the pipeline --------------------------
+
+def test_record_tracks_override_bypasses_enumeration(tmp_path, monkeypatch):
+    # --system-source is an explicit escape hatch: it must be used verbatim as the system
+    # input, without consulting (or needing) the sink/monitor enumeration at all.
+    import subprocess
+
+    from meetscribe import record
+
+    monkeypatch.setattr(record.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        record, "_list_linux_sources",
+        lambda: (_ for _ in ()).throw(AssertionError("enumeration must be skipped")),
+    )
+
+    captured = {}
+
+    class FakeProc:
+        stdin = None
+        stdout = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    record.record_tracks(
+        str(tmp_path / "mic.wav"), str(tmp_path / "sys.wav"),
+        duration=1.0, system_source="my_sink.monitor",
+    )
+    assert "my_sink.monitor" in captured["cmd"]
+
+
+def test_run_forwards_system_source_override(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "meetscribe.record.record_tracks",
+        lambda *a, **k: captured.update(k),
+    )
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: 0)
+
+    from meetscribe import record
+    record.run(out_dir=str(tmp_path / "m"), system_source="my_sink.monitor")
+    assert captured["system_source"] == "my_sink.monitor"
+
 
 def test_run_passes_started_at_and_bundle_to_pipeline(tmp_path, monkeypatch):
     # record.run knows the real wall-clock meeting start; it must hand a tz-aware

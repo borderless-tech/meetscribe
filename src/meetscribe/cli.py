@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--bundle", action="store_true",
         help="also emit a single meeting-<id>.mscribe upload bundle",
     )
+    p_record.add_argument(
+        "--system-source", default=None, metavar="NAME",
+        help="capture system audio from this exact source (e.g. a specific sink's .monitor); "
+             "overrides the default-sink auto-detection",
+    )
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
     p_process.add_argument("audio", nargs="?", help="path to an existing recording to process")
@@ -94,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return record.run(
             out_dir=getattr(args, "out", None),
             bundle=getattr(args, "bundle", False),
+            system_source=getattr(args, "system_source", None),
             reporter=reporter,
         )
     if command == "process":
