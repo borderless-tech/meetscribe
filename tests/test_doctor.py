@@ -1,6 +1,15 @@
 """Preflight checks: report formatting + exit code. Platform probes are injected."""
 
-from meetscribe.doctor import Check, checks_pass, format_report, linux_monitor_check, run
+import numpy as np
+
+from meetscribe.doctor import (
+    Check,
+    checks_pass,
+    format_report,
+    linux_monitor_check,
+    rms_after_warmup,
+    run,
+)
 
 
 def test_format_report_marks_ok_and_failures():
@@ -39,6 +48,30 @@ def test_linux_monitor_check_fails_when_no_monitor():
     check = linux_monitor_check(["alsa_input.builtin_mic"], default_sink=None)
     assert not check.ok
     assert check.hint is not None
+
+
+def test_rms_after_warmup_ignores_transition_silence():
+    # A Bluetooth headset emits digital silence for ~1s while WirePlumber switches A2DP→HFP.
+    # Measuring across the whole clip would read that as a dead mic; the warm-up window must be
+    # skipped so the real signal in the tail is what counts.
+    sr = 16000
+    silent_head = np.zeros(sr, dtype=np.float32)          # 1.0 s transition silence
+    voiced_tail = np.ones(sr * 2, dtype=np.float32)       # 2.0 s of signal
+    samples = np.concatenate([silent_head, voiced_tail])
+    assert rms_after_warmup(samples, sr, warmup_s=1.5) > 0.0
+
+
+def test_rms_after_warmup_zero_for_fully_silent_capture():
+    # A genuinely muted/absent mic stays silence even after the warm-up → still a failure.
+    sr = 16000
+    assert rms_after_warmup(np.zeros(sr * 3, dtype=np.float32), sr, warmup_s=1.5) == 0.0
+
+
+def test_rms_after_warmup_falls_back_when_clip_shorter_than_warmup():
+    # Never discard the entire clip: a short capture must still be measured, not read as silent.
+    sr = 16000
+    samples = np.ones(sr // 2, dtype=np.float32)          # 0.5 s, shorter than warm-up
+    assert rms_after_warmup(samples, sr, warmup_s=1.5) > 0.0
 
 
 def test_run_returns_zero_when_all_pass(capsys):
