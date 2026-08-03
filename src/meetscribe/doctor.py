@@ -43,6 +43,26 @@ def checks_pass(checks: list[Check]) -> bool:
     return all(c.ok for c in checks)
 
 
+def linux_monitor_check(sources: list[str], default_sink: str | None) -> Check:
+    """Report the exact monitor source ``record.py`` would capture system audio from.
+
+    Showing the *chosen* source (not merely "some monitor exists") makes a mis-selection —
+    e.g. tapping a silent HDMI monitor while audio plays to a Bluetooth headset — obvious in
+    the preflight, which is precisely the failure this surfaces.
+    """
+    from .record import find_monitor_source
+
+    try:
+        monitor = find_monitor_source(sources, default_sink)
+    except ValueError:
+        return Check(
+            "System-audio source",
+            False,
+            "start PipeWire; a <sink>.monitor source is required",
+        )
+    return Check(f"System-audio source → {monitor}", True)
+
+
 class Probe(Protocol):
     def checks(self) -> list[Check]: ...
 
@@ -95,26 +115,11 @@ class RealProbe:
         )
 
     def _linux_audio(self) -> list[Check]:
-        # A PipeWire monitor source is what we record the far side from.
-        has_monitor = False
-        try:
-            res = subprocess.run(
-                ["pactl", "list", "short", "sources"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            has_monitor = ".monitor" in res.stdout
-        except (FileNotFoundError, subprocess.SubprocessError):
-            # pactl may be absent; fall back to checking a running PipeWire.
-            has_monitor = shutil.which("pw-record") is not None
-        return [
-            Check(
-                "PipeWire monitor source",
-                has_monitor,
-                None if has_monitor else "start PipeWire; a <sink>.monitor source is required",
-            )
-        ]
+        # Report the exact source record.py would capture from — the default sink's monitor —
+        # so a mis-selection is visible here rather than discovered as a silent system track.
+        from .record import _default_sink, _list_linux_sources
+
+        return [linux_monitor_check(_list_linux_sources(), _default_sink())]
 
     def _macos_audio(self) -> list[Check]:
         blackhole = Path(

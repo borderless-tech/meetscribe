@@ -1,6 +1,6 @@
 """Preflight checks: report formatting + exit code. Platform probes are injected."""
 
-from meetscribe.doctor import Check, checks_pass, format_report, run
+from meetscribe.doctor import Check, checks_pass, format_report, linux_monitor_check, run
 
 
 def test_format_report_marks_ok_and_failures():
@@ -20,6 +20,25 @@ def test_checks_pass_true_when_all_ok():
 
 def test_checks_pass_false_on_any_failure():
     assert not checks_pass([Check("a", True), Check("b", False, "fix it")])
+
+
+def test_linux_monitor_check_shows_chosen_default_sink_monitor():
+    # doctor must display the SAME source record.py would tap — the default sink's monitor —
+    # so a mis-selection (e.g. a silent HDMI monitor) is obvious at a glance in the preflight.
+    sources = [
+        "alsa_output.hdmi3.monitor",
+        "alsa_input.builtin_mic",
+        "bluez_output.AC_80_0A_F3_FB_F1.1.monitor",
+    ]
+    check = linux_monitor_check(sources, default_sink="bluez_output.AC_80_0A_F3_FB_F1.1")
+    assert check.ok
+    assert "bluez_output.AC_80_0A_F3_FB_F1.1.monitor" in check.name
+
+
+def test_linux_monitor_check_fails_when_no_monitor():
+    check = linux_monitor_check(["alsa_input.builtin_mic"], default_sink=None)
+    assert not check.ok
+    assert check.hint is not None
 
 
 def test_run_returns_zero_when_all_pass(capsys):
