@@ -50,10 +50,13 @@ cluster).
 **Pipeline** (`pipeline.py::process`): each track is loaded to 16 kHz mono, VAD-chunked, and
 transcribed (Parakeet TDT, native word timestamps). The system track is additionally diarized;
 `align.py` assigns each word to the max-overlap diarization segment, then `merge.py` interleaves
-both tracks by timestamp. Embeddings are computed in a **second pass** over the same segments
+both tracks by timestamp. Embeddings are computed in a **second pass** over the diarization segments
 (sherpa's diarization API does not expose its internal vectors) — per-turn plus one per-cluster
-centroid (computed by concatenating a cluster's audio, not averaging vectors). `output.py` writes
-the artifacts.
+centroid (computed by concatenating a cluster's audio, not averaging vectors). **Invariant:
+embedding speakers == transcript speakers.** Only speakers that won at least one word are
+embedded (upload sinks reject vectors without a transcript segment), turn vectors skip
+sub-0.8 s segments, and centroids use all of a speaker's segments unfiltered so every
+transcript speaker has a vector. `output.py` writes the artifacts.
 
 **Two seams keep the core pure and testable:**
 - `Components` (a dataclass of `vad`/`recognizer`/`diarizer`/`embedder`) is injected into

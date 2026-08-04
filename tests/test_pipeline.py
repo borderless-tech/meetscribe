@@ -105,6 +105,94 @@ def test_process_both_tracks(tmp_path):
     assert res.duration_s == 1.0
 
 
+class ScriptedDiarizer:
+    """Diarizer returning a fixed list of (start, end, int_speaker) segments."""
+
+    def __init__(self, segs):
+        self._segs = segs
+
+    def segments(self, samples):
+        from dataclasses import dataclass
+
+        @dataclass
+        class S:
+            start: float
+            end: float
+            speaker: int
+
+        return [S(*t) for t in self._segs]
+
+
+class ScriptedRecognizer:
+    """Recognizer returning fixed word timestamps."""
+
+    def __init__(self, tokens, starts, durations):
+        self._raw = RawResult(
+            " ".join(tokens), [f"{MARK}{t}" for t in tokens], starts, durations
+        )
+
+    def recognize(self, samples):
+        return self._raw
+
+
+def _embedding_speakers(res):
+    return {t[2] for t in res.turns} | {c[0] for c in res.clusters}
+
+
+def test_wordless_diar_cluster_gets_no_embeddings(tmp_path):
+    """A diarization cluster that won no words must not appear in the embeddings.
+
+    Regression: meeting 2026-08-04 produced turn/cluster vectors for spk_N labels
+    with no transcript segment, which upload sinks reject."""
+    _write_wav(tmp_path / "system.wav", seconds=3.0)
+    # words span 0.0–1.0 s → all land on spk_0; spk_1 (2.0–3.0, ≥0.8 s) gets none
+    comps = Components(
+        FakeVad(),
+        FakeRecognizer(),
+        ScriptedDiarizer([(0.0, 1.0, 0), (2.0, 3.0, 1)]),
+        FakeEmbedder(),
+    )
+    res = process(None, str(tmp_path / "system.wav"), comps)
+
+    transcript_speakers = {u.speaker for u in res.utterances}
+    assert "spk_1" not in transcript_speakers  # sanity: no words → not in transcript
+    assert _embedding_speakers(res) == transcript_speakers
+
+
+def test_short_spoken_cluster_still_gets_centroid(tmp_path):
+    """A speaker whose diar segments are all <0.8 s but who won words must still
+    get a cluster centroid (concatenation supplies the audio); no turn vectors."""
+    _write_wav(tmp_path / "system.wav", seconds=1.0)
+    comps = Components(
+        FakeVad(),
+        FakeRecognizer(),
+        ScriptedDiarizer([(0.0, 0.5, 0)]),
+        FakeEmbedder(),
+    )
+    res = process(None, str(tmp_path / "system.wav"), comps)
+
+    assert "spk_0" in {u.speaker for u in res.utterances}  # sanity: it spoke
+    assert "spk_0" in {c[0] for c in res.clusters}
+    assert all(t[2] != "spk_0" for t in res.turns)  # sub-0.8 s: no turn vectors
+    assert _embedding_speakers(res) == {u.speaker for u in res.utterances}
+
+
+def test_short_mic_utterance_still_gets_me_centroid(tmp_path):
+    """Mic track: a <0.8 s utterance is in the transcript, so 'me' needs a centroid."""
+    _write_wav(tmp_path / "mic.wav", seconds=1.0)
+    comps = Components(
+        FakeVad(),
+        ScriptedRecognizer(["hi"], [0.0], [0.5]),
+        ScriptedDiarizer([]),
+        FakeEmbedder(),
+    )
+    res = process(str(tmp_path / "mic.wav"), None, comps)
+
+    assert {u.speaker for u in res.utterances} == {"me"}
+    assert "me" in {c[0] for c in res.clusters}
+    assert _embedding_speakers(res) == {"me"}
+
+
 class RecordingReporter:
     def __init__(self):
         self.stages = []

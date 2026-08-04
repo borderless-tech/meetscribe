@@ -80,14 +80,20 @@ def process(
             Utterance(s.start, s.end, "me", "mic", s.text, s.words) for s in segs
         ]
         # §2.6: embed the mic segments too → a clean "me" profile without clustering risk.
-        mic_diar = filter_short([DiarSegment(s.start, s.end, "me") for s in segs])
+        # Turn vectors only for segments long enough to embed alone; the centroid uses
+        # every segment (concatenation supplies the duration), so "me" has a vector
+        # whenever it is in the transcript.
+        me_segs = [DiarSegment(s.start, s.end, "me") for s in segs]
         with reporter.stage("embed (mic)"):
             turns += _prefix_turns(
-                embed_turns(components.embedder, samples, SAMPLE_RATE, mic_diar), "mic"
+                embed_turns(
+                    components.embedder, samples, SAMPLE_RATE, filter_short(me_segs)
+                ),
+                "mic",
             )
-            if mic_diar:
+            if me_segs:
                 clusters += cluster_centroids(
-                    components.embedder, samples, SAMPLE_RATE, {"me": mic_diar}
+                    components.embedder, samples, SAMPLE_RATE, {"me": me_segs}
                 )
 
     # ---- system track: everyone else, diarized -------------------------------------
@@ -101,13 +107,21 @@ def process(
         words = [w for s in segs for w in s.words]
         system_utts = assign_words_to_speakers(words, diar)
 
-        diar_f = filter_short(diar)
+        # Embed only speakers that made it into the transcript: a word-less cluster
+        # must not ship vectors (sinks reject embedding speakers without a transcript
+        # segment), and every transcript speaker must get a centroid — so centroids
+        # use all of a speaker's segments, unfiltered.
+        spoken = {u.speaker for u in system_utts}
+        diar_spoken = [s for s in diar if s.speaker in spoken]
         with reporter.stage("embed (system)"):
             turns += _prefix_turns(
-                embed_turns(components.embedder, samples, SAMPLE_RATE, diar_f), "sys"
+                embed_turns(
+                    components.embedder, samples, SAMPLE_RATE, filter_short(diar_spoken)
+                ),
+                "sys",
             )
             clusters += cluster_centroids(
-                components.embedder, samples, SAMPLE_RATE, _group_by_speaker(diar_f)
+                components.embedder, samples, SAMPLE_RATE, _group_by_speaker(diar_spoken)
             )
 
     utterances = merge_tracks(mic_utts, system_utts)
