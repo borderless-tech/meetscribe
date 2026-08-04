@@ -66,3 +66,22 @@ def test_cluster_centroids_concatenate_audio_then_embed_once():
     # embed called ONCE with the concatenated audio (16000 samples), not twice-averaged
     assert ext.received_lengths == [16000]
     assert cents[0][1].shape == (DIM,)
+
+
+def test_embed_turns_reports_progress_per_segment():
+    wav = np.ones(32000, dtype=np.float32)
+    segs = [DiarSegment(0.0, 1.0, "spk_0"), DiarSegment(1.0, 2.0, "spk_1")]
+    calls = []
+    embed_turns(FakeExtractor(), wav, 16000, segs, on_advance=lambda: calls.append(1))
+    assert len(calls) == 2
+
+
+def test_cluster_centroids_report_progress_per_cluster():
+    wav = np.ones(48000, dtype=np.float32)
+    clusters = {
+        "spk_0": [DiarSegment(0.0, 0.5, "spk_0")],
+        "spk_1": [DiarSegment(1.0, 1.5, "spk_1")],
+    }
+    calls = []
+    cluster_centroids(FakeExtractor(), wav, 16000, clusters, on_advance=lambda: calls.append(1))
+    assert len(calls) == 2

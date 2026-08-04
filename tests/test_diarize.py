@@ -27,7 +27,7 @@ def test_to_diar_segments_maps_int_ids_to_labels():
 
 def test_run_uses_backend_and_returns_labelled_segments():
     class FakeDiarizer:
-        def segments(self, samples):
+        def segments(self, samples, on_progress=None):
             return [RawSeg(0.0, 1.0, 2), RawSeg(1.0, 2.0, 2)]
 
     out = run(FakeDiarizer(), np.zeros(16000, dtype=np.float32))
@@ -36,3 +36,21 @@ def test_run_uses_backend_and_returns_labelled_segments():
 
 def test_empty():
     assert to_diar_segments([]) == []
+
+
+def test_run_forwards_progress_callback():
+    class FakeDiarizer:
+        def segments(self, samples, on_progress=None):
+            if on_progress is not None:
+                on_progress(1, 2)
+                on_progress(2, 2)
+            return [RawSeg(0.0, 1.0, 0)]
+
+    calls = []
+    out = run(
+        FakeDiarizer(),
+        np.zeros(16000, dtype=np.float32),
+        on_progress=lambda done, total: calls.append((done, total)),
+    )
+    assert calls == [(1, 2), (2, 2)]
+    assert [s.speaker for s in out] == ["spk_0"]

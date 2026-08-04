@@ -61,7 +61,7 @@ class FakeRecognizer:
 
 
 class FakeDiarizer:
-    def segments(self, samples):
+    def segments(self, samples, on_progress=None):
         from dataclasses import dataclass
 
         @dataclass
@@ -70,6 +70,8 @@ class FakeDiarizer:
             end: float
             speaker: int
 
+        if on_progress is not None:
+            on_progress(1, 1)
         return [S(0.0, 1.0, 0)]
 
 
@@ -111,7 +113,7 @@ class ScriptedDiarizer:
     def __init__(self, segs):
         self._segs = segs
 
-    def segments(self, samples):
+    def segments(self, samples, on_progress=None):
         from dataclasses import dataclass
 
         @dataclass
@@ -196,6 +198,7 @@ def test_short_mic_utterance_still_gets_me_centroid(tmp_path):
 class RecordingReporter:
     def __init__(self):
         self.stages = []
+        self.tracks = []
         self.advances = 0
 
     def stage(self, label):
@@ -205,6 +208,7 @@ class RecordingReporter:
         return contextlib.nullcontext()
 
     def track(self, label, total):
+        self.tracks.append(label)
         outer = self
 
         class T:
@@ -234,6 +238,21 @@ def test_process_reports_stages_and_asr_progress(tmp_path):
     assert any("transcribe" in s for s in rep.stages)
     assert any("diarize" in s for s in rep.stages)
     assert rep.advances >= 1  # ASR chunk progress advanced
+
+
+def test_process_reports_diarize_and_embed_progress(tmp_path):
+    # The long CPU stages (diarization, embedding) must drive progress bars, not
+    # sit silent behind a spinner for minutes on a real meeting.
+    _write_wav(tmp_path / "mic.wav")
+    _write_wav(tmp_path / "system.wav")
+    rep = RecordingReporter()
+    process(str(tmp_path / "mic.wav"), str(tmp_path / "system.wav"), _components(), reporter=rep)
+
+    assert any("diarization" in label for label in rep.tracks)
+    assert any("embedding (mic)" in label for label in rep.tracks)
+    assert any("embedding (system)" in label for label in rep.tracks)
+    # ASR (2 chunks) + diarization percent + 2×(turn + centroid) embeds
+    assert rep.advances >= 7
 
 
 def test_process_system_only(tmp_path):

@@ -51,12 +51,15 @@ def embed_turns(
     wav: np.ndarray,
     rate: int,
     segments: Sequence[DiarSegment],
+    on_advance=None,
 ) -> list[Turn]:
     _check_dim(extractor)
     turns: list[Turn] = []
     for i, seg in enumerate(segments):
         vec = extractor.embed(slice_audio(wav, rate, seg.start, seg.end))
         turns.append((f"turn_{i}", np.asarray(vec, dtype=np.float32), seg.speaker))
+        if on_advance is not None:
+            on_advance()
     return turns
 
 
@@ -65,6 +68,7 @@ def cluster_centroids(
     wav: np.ndarray,
     rate: int,
     segments_by_cluster: Mapping[str, Sequence[DiarSegment]],
+    on_advance=None,
 ) -> list[Centroid]:
     _check_dim(extractor)
     centroids: list[Centroid] = []
@@ -75,6 +79,8 @@ def cluster_centroids(
         )
         vec = extractor.embed(concatenated)
         centroids.append((cluster_id, np.asarray(vec, dtype=np.float32)))
+        if on_advance is not None:
+            on_advance()
     return centroids
 
 

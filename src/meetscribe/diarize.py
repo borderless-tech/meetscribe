@@ -22,15 +22,18 @@ class _RawSeg(Protocol):
 
 
 class Diarizer(Protocol):
-    def segments(self, samples: np.ndarray) -> Sequence[_RawSeg]: ...
+    def segments(self, samples: np.ndarray, on_progress=None) -> Sequence[_RawSeg]: ...
 
 
 def to_diar_segments(raw: Sequence[_RawSeg]) -> list[DiarSegment]:
     return [DiarSegment(s.start, s.end, f"spk_{s.speaker}") for s in raw]
 
 
-def run(diarizer: Diarizer, samples: np.ndarray) -> list[DiarSegment]:
-    return to_diar_segments(diarizer.segments(samples))
+def run(
+    diarizer: Diarizer, samples: np.ndarray, on_progress=None
+) -> list[DiarSegment]:
+    """``on_progress(processed_chunks, total_chunks)`` is called as the backend advances."""
+    return to_diar_segments(diarizer.segments(samples, on_progress=on_progress))
 
 
 class OfflineDiarizer:
@@ -67,8 +70,15 @@ class OfflineDiarizer:
         )
         self._sd = sherpa_onnx.OfflineSpeakerDiarization(config)
 
-    def segments(self, samples: np.ndarray):
+    def segments(self, samples: np.ndarray, on_progress=None):
+        callback = None
+        if on_progress is not None:
+
+            def callback(processed: int, total: int) -> int:
+                on_progress(processed, total)
+                return 0  # non-zero would abort the diarization
+
         result = self._sd.process(
-            np.asarray(samples, dtype=np.float32), callback=None
+            np.asarray(samples, dtype=np.float32), callback=callback
         ).sort_by_start_time()
         return list(result)

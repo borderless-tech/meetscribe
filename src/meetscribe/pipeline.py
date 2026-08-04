@@ -85,23 +85,40 @@ def process(
         # whenever it is in the transcript.
         me_segs = [DiarSegment(s.start, s.end, "me") for s in segs]
         with reporter.stage("embed (mic)"):
-            turns += _prefix_turns(
-                embed_turns(
-                    components.embedder, samples, SAMPLE_RATE, filter_short(me_segs)
-                ),
-                "mic",
-            )
-            if me_segs:
-                clusters += cluster_centroids(
-                    components.embedder, samples, SAMPLE_RATE, {"me": me_segs}
+            me_long = filter_short(me_segs)
+            total = len(me_long) + (1 if me_segs else 0)
+            with reporter.track("embedding (mic)", total=total) as bar:
+                turns += _prefix_turns(
+                    embed_turns(
+                        components.embedder, samples, SAMPLE_RATE, me_long,
+                        on_advance=bar.advance,
+                    ),
+                    "mic",
                 )
+                if me_segs:
+                    clusters += cluster_centroids(
+                        components.embedder, samples, SAMPLE_RATE, {"me": me_segs},
+                        on_advance=bar.advance,
+                    )
 
     # ---- system track: everyone else, diarized -------------------------------------
     if system_wav:
         samples, _ = load_wav_f32(system_wav)
         duration = max(duration, len(samples) / SAMPLE_RATE)
         with reporter.stage("diarize (system)"):
-            diar = diarize_run(components.diarizer, samples)
+            # sherpa reports (processed_chunks, total_chunks); map to a 0–100 bar.
+            with reporter.track("diarization (system)", total=100) as bar:
+                done = {"pct": 0}
+
+                def _on_diar_progress(processed, total):
+                    pct = min(100, int(processed * 100 / total)) if total else 100
+                    if pct > done["pct"]:
+                        bar.advance(pct - done["pct"])
+                        done["pct"] = pct
+
+                diar = diarize_run(
+                    components.diarizer, samples, on_progress=_on_diar_progress
+                )
         with reporter.stage("transcribe (system)"):
             segs = _transcribe(components, samples, reporter, "ASR (system)")
         words = [w for s in segs for w in s.words]
@@ -114,15 +131,22 @@ def process(
         spoken = {u.speaker for u in system_utts}
         diar_spoken = [s for s in diar if s.speaker in spoken]
         with reporter.stage("embed (system)"):
-            turns += _prefix_turns(
-                embed_turns(
-                    components.embedder, samples, SAMPLE_RATE, filter_short(diar_spoken)
-                ),
-                "sys",
-            )
-            clusters += cluster_centroids(
-                components.embedder, samples, SAMPLE_RATE, _group_by_speaker(diar_spoken)
-            )
+            sys_long = filter_short(diar_spoken)
+            groups = _group_by_speaker(diar_spoken)
+            with reporter.track(
+                "embedding (system)", total=len(sys_long) + len(groups)
+            ) as bar:
+                turns += _prefix_turns(
+                    embed_turns(
+                        components.embedder, samples, SAMPLE_RATE, sys_long,
+                        on_advance=bar.advance,
+                    ),
+                    "sys",
+                )
+                clusters += cluster_centroids(
+                    components.embedder, samples, SAMPLE_RATE, groups,
+                    on_advance=bar.advance,
+                )
 
     utterances = merge_tracks(mic_utts, system_utts)
     duration = max([duration] + [u.end for u in utterances])
