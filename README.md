@@ -34,6 +34,11 @@ nix run github:borderless-tech/meetscribe -- process ./meeting-dir   # process a
 `process` accepts a directory containing `raw/mic.wav` + `raw/system.wav`, or a single `.wav`
 (treated as the system track and diarized).
 
+Diarization clusters by similarity threshold by default. Telling it the speaker count instead
+is far more robust: after a recording stops, meetscribe asks how many people were in the
+meeting; `process` takes the same number as `--speakers N`. Count yourself in both cases —
+meetscribe subtracts you before diarizing, since your own voice lives on the mic track.
+
 ## Terminal output
 
 While recording, live level-meters show both tracks in real time — a dead track is obvious

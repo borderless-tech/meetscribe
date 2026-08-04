@@ -1,7 +1,9 @@
 """Speaker diarization on the system track via sherpa-onnx OfflineSpeakerDiarization.
 
 Only the int-id → ``spk_N`` mapping is pure/tested; the sherpa diarizer sits behind a protocol.
-Clustering uses ``num_clusters=-1`` + a threshold (agglomerative, no fixed K — see §12).
+Clustering defaults to ``num_clusters=-1`` + a threshold (agglomerative, no fixed K — see §12);
+a known speaker count (``num_clusters > 0``) forces exactly that many clusters and makes
+sherpa ignore the threshold.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ class OfflineDiarizer:
         threshold: float = 0.5,
         min_duration_on: float = 0.3,
         min_duration_off: float = 0.5,
+        num_clusters: int = -1,
     ) -> None:
         import sherpa_onnx
 
@@ -56,7 +59,7 @@ class OfflineDiarizer:
                 provider="cpu",
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
-                num_clusters=-1,
+                num_clusters=num_clusters,
                 threshold=threshold,
             ),
             min_duration_on=min_duration_on,

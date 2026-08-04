@@ -62,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--bundle", action="store_true",
         help="also emit a single meeting-<id>.mscribe upload bundle",
     )
+    p_process.add_argument(
+        "--speakers", type=int, default=None, metavar="N",
+        help="number of people in the meeting, including you — same question the "
+             "record flow asks (default: automatic threshold clustering)",
+    )
 
     p_bundle = sub.add_parser("bundle", help="zip an artifact directory into one .mscribe")
     p_bundle.add_argument(
@@ -105,11 +110,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "process":
         from . import pipeline
 
+        from .record import speakers_from_count
+
+        speakers = getattr(args, "speakers", None)
         return pipeline.run(
             audio=getattr(args, "audio", None),
             out_dir=getattr(args, "out", None),
             bundle=getattr(args, "bundle", False),
             reporter=reporter,
+            num_speakers=-1 if speakers is None else speakers_from_count(speakers),
         )
     if command == "bundle":
         import json

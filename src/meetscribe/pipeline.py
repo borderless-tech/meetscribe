@@ -183,7 +183,9 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def build_components(models_dir: str) -> Components:
+def build_components(models_dir: str, num_speakers: int = -1) -> Components:
+    """Wire the real sherpa models. ``num_speakers`` is the expected speaker count on
+    the system track (everyone except the user); -1 means threshold clustering."""
     from .asr import ParakeetRecognizer
     from .diarize import OfflineDiarizer
     from .embed import SpeakerEmbedder
@@ -194,7 +196,9 @@ def build_components(models_dir: str) -> Components:
     return Components(
         vad=SileroVad(str(m / "vad" / "silero_vad.onnx")),
         recognizer=ParakeetRecognizer(str(m / "asr")),
-        diarizer=OfflineDiarizer(str(m / "seg" / "model.int8.onnx"), spk),
+        diarizer=OfflineDiarizer(
+            str(m / "seg" / "model.int8.onnx"), spk, num_clusters=num_speakers
+        ),
         embedder=SpeakerEmbedder(spk),
     )
 
@@ -221,6 +225,7 @@ def run(
     bundle: bool = False,
     started_at=None,
     reporter=None,
+    num_speakers: int = -1,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -249,7 +254,7 @@ def run(
     # Loading the ~600 MB Parakeet model takes several seconds — show a spinner so the
     # record→process transition isn't a silent gap.
     with reporter.stage("loading models"):
-        components = build_components(models_dir)
+        components = build_components(models_dir, num_speakers)
     result = process(mic_wav, system_wav, components, reporter=reporter)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")

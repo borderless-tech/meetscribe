@@ -12,6 +12,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -386,6 +387,40 @@ def record_tracks(
         signal.signal(signal.SIGINT, prev)
 
 
+def _stdin_is_tty() -> bool:
+    return sys.stdin.isatty()
+
+
+def speakers_from_count(n: int) -> int:
+    """People in the meeting (including the user) → system-track cluster count.
+
+    The user counts themselves but lives on the mic track, so subtract 1; a count
+    of ≤1 (or nonsense) means automatic clustering (-1). Single source of the
+    semantic shared by the post-recording prompt and ``process --speakers``."""
+    return n - 1 if n >= 2 else -1
+
+
+def participants_to_speakers(answer: str) -> int:
+    """Map a 'how many people were in the meeting?' answer to a cluster count."""
+    try:
+        n = int(answer.strip())
+    except ValueError:
+        return -1
+    return speakers_from_count(n)
+
+
+def ask_participants(input_fn=input) -> int:
+    """Post-recording prompt for the participant count → system-track speaker count.
+
+    Any way of declining (empty answer, EOF, Ctrl-C) falls back to automatic
+    clustering, so the question can never block a script or abort processing."""
+    try:
+        answer = input_fn("How many people were in the meeting, including you? (Enter to skip) ")
+    except (EOFError, KeyboardInterrupt):
+        return -1
+    return participants_to_speakers(answer)
+
+
 def run(
     out_dir: str | None = None, bundle: bool = False, reporter=None,
     system_source: str | None = None,
@@ -407,9 +442,12 @@ def run(
         if warning:
             print(f"⚠ {warning}")
 
+    num_speakers = ask_participants() if _stdin_is_tty() else -1
+
     from . import pipeline
 
     return pipeline.run(
         audio=str(root), out_dir=str(root),
         bundle=bundle, started_at=started_at, reporter=reporter,
+        num_speakers=num_speakers,
     )

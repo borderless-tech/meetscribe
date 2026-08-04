@@ -146,3 +146,39 @@ def test_bundle_command_honours_explicit_out(tmp_path):
 
     assert main(["bundle", str(src), "-o", str(out)]) == 0
     assert out.exists()
+
+
+# ---- process --speakers --------------------------------------------------------------
+
+def test_process_parser_accepts_speakers():
+    from meetscribe.cli import build_parser
+
+    args = build_parser().parse_args(["process", "x", "--speakers", "4"])
+    assert args.speakers == 4
+
+
+def test_process_speakers_defaults_to_none():
+    from meetscribe.cli import build_parser
+
+    args = build_parser().parse_args(["process", "x"])
+    assert args.speakers is None
+
+
+def test_main_process_forwards_speakers(monkeypatch):
+    # `--speakers N` means people in the meeting including the user — the same
+    # semantic as the post-recording prompt — so the diarizer gets N-1; without
+    # the flag (or with just the user) the pipeline gets -1 (automatic clustering).
+    from meetscribe import pipeline
+    from meetscribe.cli import main
+
+    captured = {}
+    monkeypatch.setattr(pipeline, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["process", "x", "--speakers", "4"]) == 0
+    assert captured["num_speakers"] == 3
+
+    assert main(["process", "x"]) == 0
+    assert captured["num_speakers"] == -1
+
+    assert main(["process", "x", "--speakers", "1"]) == 0
+    assert captured["num_speakers"] == -1

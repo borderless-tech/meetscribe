@@ -35,8 +35,8 @@ Run the app itself (models + ffmpeg are wired in by the flake wrapper):
 
 ```bash
 nix run .#doctor                  # preflight audio-setup checks — run this first
-nix run .                         # record (Ctrl-C stops) + process
-nix run . -- process ./meeting-dir [--bundle]
+nix run .                         # record (Ctrl-C stops) + process (asks participant count)
+nix run . -- process ./meeting-dir [--bundle] [--speakers N]   # N = people incl. the user
 ```
 
 ## Architecture

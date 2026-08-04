@@ -336,3 +336,73 @@ def test_run_passes_started_at_and_bundle_to_pipeline(tmp_path, monkeypatch):
     assert captured["bundle"] is True
     assert captured["started_at"] is not None  # a tz-aware datetime
     assert captured["started_at"].tzinfo is not None
+
+
+# ---- post-recording participant prompt -----------------------------------------------
+
+def test_participants_to_speakers_subtracts_the_user():
+    from meetscribe.record import participants_to_speakers
+
+    assert participants_to_speakers("5") == 4
+    assert participants_to_speakers(" 2 ") == 1
+
+
+def test_participants_to_speakers_blank_or_invalid_means_automatic():
+    from meetscribe.record import participants_to_speakers
+
+    assert participants_to_speakers("") == -1
+    assert participants_to_speakers("abc") == -1
+    # 1 participant = only the user → nothing to force on the system track
+    assert participants_to_speakers("1") == -1
+    assert participants_to_speakers("0") == -1
+    assert participants_to_speakers("-3") == -1
+
+
+def test_ask_participants_maps_answer():
+    from meetscribe.record import ask_participants
+
+    assert ask_participants(input_fn=lambda prompt: "4") == 3
+
+
+def test_ask_participants_eof_or_interrupt_skips():
+    from meetscribe.record import ask_participants
+
+    def eof(prompt):
+        raise EOFError
+
+    def interrupt(prompt):
+        raise KeyboardInterrupt
+
+    assert ask_participants(input_fn=eof) == -1
+    assert ask_participants(input_fn=interrupt) == -1
+
+
+def test_run_forwards_participant_answer_to_pipeline(tmp_path, monkeypatch):
+    # After recording stops, run() asks for the participant count and hands the
+    # derived speaker count to pipeline.run.
+    captured = {}
+    monkeypatch.setattr("meetscribe.record.record_tracks", lambda *a, **k: None)
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    monkeypatch.setattr("meetscribe.record.ask_participants", lambda: 3)
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: captured.update(k) or 0)
+
+    from meetscribe import record
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO())  # not a tty
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: True)
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["num_speakers"] == 3
+
+
+def test_run_skips_prompt_without_tty(tmp_path, monkeypatch):
+    # Non-interactive stdin (scripts, CI): never block on input(); use automatic mode.
+    captured = {}
+    monkeypatch.setattr("meetscribe.record.record_tracks", lambda *a, **k: None)
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: False)
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: captured.update(k) or 0)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["num_speakers"] == -1

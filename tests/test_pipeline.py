@@ -279,7 +279,9 @@ def test_run_with_bundle_writes_mscribe(tmp_path, monkeypatch):
     _write_wav(rec / "raw" / "system.wav")
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
-    monkeypatch.setattr(pipeline, "build_components", lambda models_dir: _components())
+    monkeypatch.setattr(
+        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+    )
 
     out = tmp_path / "out"
     assert pipeline.run(audio=str(rec), out_dir=str(out), bundle=True) == 0
@@ -299,8 +301,33 @@ def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
     _write_wav(rec / "raw" / "system.wav")
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
-    monkeypatch.setattr(pipeline, "build_components", lambda models_dir: _components())
+    monkeypatch.setattr(
+        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+    )
 
     out = tmp_path / "out"
     assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
     assert not list(out.glob("*.mscribe"))
+
+
+def test_run_forwards_num_speakers_to_build_components(tmp_path, monkeypatch):
+    # `process --speakers N` must reach the diarizer: run() hands num_speakers to
+    # build_components (which passes it to OfflineDiarizer as num_clusters).
+    from meetscribe import pipeline
+
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "system.wav")
+
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    captured = {}
+
+    def fake_build(models_dir, num_speakers=-1):
+        captured["num_speakers"] = num_speakers
+        return _components()
+
+    monkeypatch.setattr(pipeline, "build_components", fake_build)
+
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), num_speakers=4) == 0
+    assert captured["num_speakers"] == 4
