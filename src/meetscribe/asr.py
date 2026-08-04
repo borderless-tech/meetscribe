@@ -1,9 +1,11 @@
 """ASR via sherpa-onnx Parakeet-TDT-v3, with word reconstruction from subword tokens.
 
 The recognizer returns per-token text/timestamps/durations. ``result.words`` is usually empty for
-subword models, so words are rebuilt here from the SentencePiece word-boundary marker ``▁``. The
-recognizer itself sits behind the :class:`Recognizer` protocol so the grouping logic is unit-tested
-with a fake; the real :class:`ParakeetRecognizer` is exercised by the end-to-end smoke test.
+subword models, so words are rebuilt here from the word-boundary marker: the raw SentencePiece
+``▁``, or a plain leading space — sherpa-onnx renders Parakeet-TDT v3 pieces as ``' Al'``,
+``'les'``, ``' hat'``. The recognizer itself sits behind the :class:`Recognizer` protocol so the
+grouping logic is unit-tested with a fake; the real :class:`ParakeetRecognizer` is exercised by
+the end-to-end smoke test.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import numpy as np
 from .types import Segment, Word
 from .vad import Chunk
 
-WORD_MARKER = "▁"  # ▁ SentencePiece space marker
+WORD_MARKERS = ("▁", " ")  # SentencePiece marker, or sherpa's plain-space rendering of it
 
 
 @dataclass
@@ -36,7 +38,7 @@ def tokens_to_words(
     timestamps: Sequence[float],
     durations: Sequence[float],
 ) -> list[Word]:
-    """Group subword tokens into words on the ``▁`` boundary marker.
+    """Group subword tokens into words on the ``▁``/leading-space boundary marker.
 
     A word's start is its first token's timestamp; its end is the last token's timestamp plus that
     token's duration.
@@ -54,9 +56,9 @@ def tokens_to_words(
             have = False
 
     for tok, ts, dur in zip(tokens, timestamps, durations):
-        if tok.startswith(WORD_MARKER) or not have:
+        if tok.startswith(WORD_MARKERS) or not have:
             flush()
-            cur_text = tok.lstrip(WORD_MARKER)
+            cur_text = tok.lstrip("▁ ")
             cur_start = ts
             cur_end = ts + dur
             have = True

@@ -22,6 +22,20 @@ def test_tokens_to_words_groups_on_boundary_marker():
     assert words[1].start == 0.5 and words[1].end == 0.9  # 0.5 + 0.4
 
 
+def test_tokens_to_words_groups_on_space_prefix():
+    # The real sherpa-onnx Parakeet-TDT v3 emits space-prefixed pieces (' Al', 'les',
+    # ' hat'), NOT ▁-prefixed ones. Without splitting on the space prefix, a whole VAD
+    # chunk collapses into one "word" and diarization alignment degrades to chunk level
+    # (observed on the 2026-08-04 meeting: 16 tokens → 1 word).
+    tokens = [" Al", "les", " hat", " ein", " En", "de", ","]
+    ts = [0.0, 0.1, 0.3, 0.5, 0.7, 0.8, 0.9]
+    dur = [0.1] * 7
+    words = tokens_to_words(tokens, ts, dur)
+    assert [w.w for w in words] == ["Alles", "hat", "ein", "Ende,"]
+    assert words[0].start == 0.0 and words[0].end == 0.2
+    assert words[-1].start == 0.7 and words[-1].end == 1.0
+
+
 def test_single_word_multiple_pieces():
     words = tokens_to_words([f"{MARK}un", "believ", "able"], [0.0, 0.1, 0.2], [0.1, 0.1, 0.3])
     assert len(words) == 1

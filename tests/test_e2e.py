@@ -50,6 +50,14 @@ def test_full_pipeline_produces_valid_artifacts(tmp_path):
     assert any(u.speaker == "me" for u in res.utterances)
     assert any(u.speaker.startswith("spk_") for u in res.utterances)
 
+    # word timestamps are per WORD, not one blob per VAD chunk: the real sherpa
+    # tokens are space-prefixed (' Al', 'les'), which the ▁-only splitter missed —
+    # both test clips are full sentences, so several single words must come out.
+    for track in ("mic", "system"):
+        words = [w for u in res.utterances if u.track == track for w in u.words]
+        assert len(words) >= 5, f"{track}: chunk-level words, got only {len(words)}"
+        assert all(" " not in w.w for w in words), f"{track}: multi-word 'word' entries"
+
     # embeddings: per-turn + per-cluster, all 192-dim
     assert res.dim == 192
     assert res.turns and all(t[1].shape == (192,) for t in res.turns)
