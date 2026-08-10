@@ -63,9 +63,9 @@ class SileroVad:
         sample_rate: int = 16000,
         window_size: int = 512,
         threshold: float = 0.5,
-        min_silence_duration: float = 0.25,
+        min_silence_duration: float = 0.7,
         min_speech_duration: float = 0.25,
-        max_speech_duration: float = 20.0,
+        max_speech_duration: float = 30.0,
     ) -> None:
         import sherpa_onnx
 

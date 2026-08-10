@@ -22,3 +22,42 @@ def merge_tracks(
     ]
     tagged.sort(key=lambda t: (t[0], t[1]))
     return [u for _, _, u in tagged]
+
+
+def coalesce_utterances(
+    utterances: list[Utterance], max_gap: float = 2.0
+) -> list[Utterance]:
+    """Merge consecutive utterances of the same speaker+track into one paragraph.
+
+    The input must be time-ordered (``merge_tracks`` output). Because it is ordered,
+    two same-speaker utterances are only adjacent in the list when *no other speaker
+    started between them* — so merging adjacent runs can never reorder the
+    conversation (unlike widening the VAD silence window, which lets a speaker's
+    segment swallow others' turns). A gap wider than ``max_gap`` seconds starts a new
+    utterance, so genuine turn breaks are kept.
+    """
+    if not utterances:
+        return []
+
+    out: list[Utterance] = []
+    group: list[Utterance] = [utterances[0]]
+
+    def flush() -> None:
+        if len(group) == 1:
+            out.append(group[0])
+            return
+        first, last = group[0], group[-1]
+        text = " ".join(u.text.strip() for u in group if u.text.strip())
+        words = tuple(w for u in group for w in u.words)
+        out.append(replace(first, end=last.end, text=text, words=words))
+
+    for u in utterances[1:]:
+        prev = group[-1]
+        same_speaker = u.speaker == prev.speaker and u.track == prev.track
+        if same_speaker and (u.start - prev.end) <= max_gap:
+            group.append(u)
+        else:
+            flush()
+            group = [u]
+    flush()
+    return out

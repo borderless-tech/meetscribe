@@ -19,7 +19,7 @@ from .asr import transcribe_chunks
 from .audio import load_wav_f32
 from .diarize import run as diarize_run
 from .embed import EMBEDDING_DIM, cluster_centroids, embed_turns, filter_short, slice_audio
-from .merge import merge_tracks
+from .merge import coalesce_utterances, merge_tracks
 from .output import build_meta, write_embeddings, write_meta, write_transcript
 from .types import DiarSegment, Utterance
 
@@ -148,7 +148,7 @@ def process(
                     on_advance=bar.advance,
                 )
 
-    utterances = merge_tracks(mic_utts, system_utts)
+    utterances = coalesce_utterances(merge_tracks(mic_utts, system_utts))
     duration = max([duration] + [u.end for u in utterances])
     return Result(utterances, turns, clusters, dim, duration)
 

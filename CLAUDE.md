@@ -50,7 +50,12 @@ cluster).
 **Pipeline** (`pipeline.py::process`): each track is loaded to 16 kHz mono, VAD-chunked, and
 transcribed (Parakeet TDT, native word timestamps). The system track is additionally diarized;
 `align.py` assigns each word to the max-overlap diarization segment, then `merge.py` interleaves
-both tracks by timestamp. Embeddings are computed in a **second pass** over the diarization segments
+both tracks by timestamp and coalesces consecutive same-speaker utterances into paragraphs
+(`coalesce_utterances`, order-safe because the list is time-sorted, so a different speaker always
+breaks a run — unlike widening the VAD window, which would let one speaker swallow others' turns).
+VAD chunks speech with a 0.7 s silence gap (not 0.25 s) so the recognizer sees longer,
+context-rich windows; short chunks decoded cold were the main source of word errors and spurious
+English on backchannels. Embeddings are computed in a **second pass** over the diarization segments
 (sherpa's diarization API does not expose its internal vectors) — per-turn plus one per-cluster
 centroid (computed by concatenating a cluster's audio, not averaging vectors). **Invariant:
 embedding speakers == transcript speakers.** Only speakers that won at least one word are
