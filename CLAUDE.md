@@ -36,7 +36,14 @@ Run the app itself (models + ffmpeg are wired in by the flake wrapper):
 ```bash
 nix run .#doctor                  # preflight audio-setup checks — run this first
 nix run .                         # record (Ctrl-C stops) + process (asks participant count)
-nix run . -- process ./meeting-dir [--bundle] [--speakers N]   # N = people incl. the user
+nix run . -- process ./meeting-dir [--bundle] [--speakers N] [--no-cleanup]   # N = people incl. the user
+nix run . -- clean ./meeting-dir  # re-run LLM cleanup on an existing transcript → ./meeting-dir-cleanup/
+
+# The LLM transcript-cleanup pass (§ below) is default-on but needs the opt-in models-llm output.
+# The default `nix run .` lacks the ~4.7 GB GGUF, so cleanup gracefully no-ops (raw transcript).
+# For actual cleanup use the meetscribe-llm variant (bundles the GGUF + llama-server):
+nix run .#meetscribe-llm -- process ./meeting-dir
+nix build .#models-llm            # build just the LLM model tree (MEETSCRIBE_MODELS target)
 ```
 
 ## Architecture
@@ -63,9 +70,23 @@ embedded (upload sinks reject vectors without a transcript segment), turn vector
 sub-0.8 s segments, and centroids use all of a speaker's segments unfiltered so every
 transcript speaker has a vector. `output.py` writes the artifacts.
 
+A final **LLM cleanup stage** (`cleanup.py`, default-on, disable with `--no-cleanup`) rewrites
+only the **system-track** `text` — fixing garbled proper nouns from context + a persistent
+glossary (`glossary.py`, `~/.config/meetscribe/glossary.txt`; the record flow optionally prompts
+for participant names and appends them). The mic (`me`) track is the clean user audio and passes
+through untouched, and **per-word timings are never touched** — only `text` changes, with the
+verbatim ASR text kept in `raw_text`. Rationale (see `docs/plans/2026-08-12-transcript-cleanup-*`):
+transcript-quality is capped by the mixed, VoIP-compressed system downmix, not the ASR model, so
+the lever is a text layer. The real cleaner (`ManagedLlamaCleaner`) drives a managed `llama-server`
+subprocess (Qwen2.5-7B GGUF, `llama.py`) over loopback HTTP; anti-hallucination guards keep raw
+text on empty/runaway/collapse output, so the worst case degrades per-segment to raw ASR.
+`meetscribe clean <dir>` re-runs cleanup on an existing transcript non-destructively into
+`<dir>-cleanup/`.
+
 **Two seams keep the core pure and testable:**
-- `Components` (a dataclass of `vad`/`recognizer`/`diarizer`/`embedder`) is injected into
-  `process()`. Unit tests pass fakes; `build_components()` wires the real sherpa models. This is
+- `Components` (a dataclass of `vad`/`recognizer`/`diarizer`/`embedder`/`cleaner`) is injected into
+  `process()`. Unit tests pass fakes (`cleaner` defaults to `NullCleaner`); `build_components()`
+  wires the real sherpa models (and, when the opt-in GGUF is present, the LLM cleaner). This is
   why the suite needs no models and runs in milliseconds.
 - A `Reporter` protocol (`progress.py`) is injected for all terminal UI. `NullReporter` is the
   default arg everywhere, so pipeline/record logic stays UI-free and tests stay `rich`-free;
@@ -80,11 +101,14 @@ stdin (a hard kill corrupts WAV headers).
 ## Outputs
 
 Three artifacts (`output.py`), plus an optional single-file bundle:
-- `transcript.json` — segments with per-word timestamps, `speaker` (`me`/`spk_N`), `track`.
+- `transcript.json` — segments with per-word timestamps, `speaker` (`me`/`spk_N`), `track`, the
+  (possibly cleaned) `text`, and the verbatim `raw_text`; plus a top-level `cleaned` bool.
+  `read_transcript` is the inverse of `write_transcript` (used by `clean <dir>`).
 - `embeddings.npz` — `turn_vectors` / `cluster_vectors` (`float32`), plus id/speaker str arrays.
 - `meta.json` — model names + the embedding model's SHA-256, `embedding_dim`, timestamps,
-  `format_version`. **Not optional:** vectors from different models are incomparable, so the model
-  identity must travel with the vectors (and later into the DB).
+  `cleaned` + (when cleanup ran) `cleanup_model` (name/SHA-256/params), `format_version` (now `2`:
+  adds `raw_text`/`cleaned`/`cleanup_model`). **Not optional:** vectors/text from different models
+  are incomparable, so the model identity must travel with the artifact (and later into the DB).
 - `meeting-<id>.mscribe` (via `--bundle` or the `meetscribe bundle <dir>` subcommand) — a plain
   zip of the three files above, for one atomic authenticated upload to a stateless sink. See
   `docs/plans/2026-08-02-bundle-format-design.md`. `bundle_dir` / `default_bundle_name` in
