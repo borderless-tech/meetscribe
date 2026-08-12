@@ -116,3 +116,41 @@ class LlamaCleaner:
                 kept_raw += 1
             prev = out[-1]
         return CleanResult(texts=out, cleaned=cleaned, kept_raw=kept_raw, active=True)
+
+
+class ManagedLlamaCleaner:
+    """Real cleaner: spins up a ``llama-server`` for the duration of the pass, delegates the
+    per-segment work to :class:`LlamaCleaner`, and tears the server down. If the server can't
+    start (binary/model/port unavailable) it degrades gracefully — a `warn` plus the raw text,
+    marked inactive so meta stays ``cleaned:false``. ``model_info`` (name/sha/params) is read
+    by the pipeline into meta.json when the pass actually runs."""
+
+    def __init__(self, model_path: str, model_info: dict | None = None, threads: int = 4,
+                 _server=None, _client=None) -> None:
+        self.model_path = model_path
+        self.model_info = model_info
+        self.threads = threads
+        self._server = _server
+        self._client = _client
+
+    def clean(self, texts: list[str], glossary: list[str], reporter) -> CleanResult:
+        try:
+            server_cm = self._server() if self._server else self._default_server()
+            with server_cm as server:
+                make_client = self._client or (lambda url: self._default_client(url))
+                client = make_client(server.base_url)
+                return LlamaCleaner(client).clean(texts, glossary, reporter)
+        except Exception as exc:
+            if reporter is not None:
+                reporter.warn(f"cleanup skipped: llama-server unavailable ({exc})")
+            return CleanResult(texts=list(texts), cleaned=0, kept_raw=0, active=False)
+
+    def _default_server(self):
+        from .llama import LlamaServer
+
+        return LlamaServer(self.model_path, threads=self.threads)
+
+    def _default_client(self, base_url: str):
+        from .llama import LlamaClient
+
+        return LlamaClient(base_url)

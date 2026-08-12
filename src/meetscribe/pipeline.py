@@ -256,16 +256,32 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def build_components(models_dir: str, num_speakers: int = -1) -> Components:
+def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = True) -> Components:
     """Wire the real sherpa models. ``num_speakers`` is the expected speaker count on
-    the system track (everyone except the user); -1 means threshold clustering."""
+    the system track (everyone except the user); -1 means threshold clustering.
+
+    ``cleanup`` wires the LLM cleaner when the GGUF is present (a separate, opt-in flake
+    output); if it's absent the cleaner degrades to a no-op at clean() time (warn + raw text),
+    so a machine without the LLM model simply produces an uncleaned transcript."""
     from .asr import ParakeetRecognizer
+    from .cleanup import ManagedLlamaCleaner, NullCleaner
     from .diarize import OfflineDiarizer
     from .embed import SpeakerEmbedder
     from .vad import SileroVad
 
     m = Path(models_dir)
     spk = str(m / "spk" / "model.onnx")
+    cleaner = NullCleaner()
+    if cleanup:
+        gguf = m / "llm" / "model.gguf"
+        model_info = None
+        if gguf.exists():
+            model_info = {
+                "name": "Qwen2.5-7B-Instruct-Q4_K_M",
+                "sha256": _sha256(str(gguf)),
+                "temperature": 0.0,
+            }
+        cleaner = ManagedLlamaCleaner(str(gguf), model_info)
     return Components(
         vad=SileroVad(str(m / "vad" / "silero_vad.onnx")),
         recognizer=ParakeetRecognizer(str(m / "asr")),
@@ -273,6 +289,7 @@ def build_components(models_dir: str, num_speakers: int = -1) -> Components:
             str(m / "seg" / "model.int8.onnx"), spk, num_clusters=num_speakers
         ),
         embedder=SpeakerEmbedder(spk),
+        cleaner=cleaner,
     )
 
 

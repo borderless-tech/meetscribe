@@ -370,7 +370,7 @@ def test_run_with_bundle_writes_mscribe(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
     monkeypatch.setattr(
-        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+        pipeline, "build_components", lambda models_dir, num_speakers=-1, cleanup=True: _components()
     )
 
     out = tmp_path / "out"
@@ -392,7 +392,7 @@ def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
     monkeypatch.setattr(
-        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+        pipeline, "build_components", lambda models_dir, num_speakers=-1, cleanup=True: _components()
     )
 
     out = tmp_path / "out"
@@ -417,7 +417,7 @@ def test_clean_existing_writes_cleanup_dir_nondestructively(tmp_path, monkeypatc
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
     monkeypatch.setattr(
         pipeline, "build_components",
-        lambda models_dir, num_speakers=-1: Components(
+        lambda models_dir, num_speakers=-1, cleanup=True: Components(
             FakeVad(), FakeRecognizer(), FakeDiarizer(), FakeEmbedder(), UpperCleaner()
         ),
     )

@@ -2,6 +2,7 @@
 
 from meetscribe.cleanup import (
     LlamaCleaner,
+    ManagedLlamaCleaner,
     NullCleaner,
     accept_candidate,
     build_prompt,
@@ -108,3 +109,36 @@ def test_llama_cleaner_survives_client_error():
     assert res.texts == ["keep me"]
     assert res.kept_raw == 1 and res.cleaned == 0
     assert res.active is True
+
+
+# ---- ManagedLlamaCleaner (server lifecycle mocked) ----------------------------------
+
+class _FakeServer:
+    base_url = "http://127.0.0.1:0"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *e):
+        return False
+
+
+def test_managed_cleaner_delegates_on_success():
+    cleaner = ManagedLlamaCleaner(
+        "m.gguf", model_info={"name": "q"},
+        _server=lambda: _FakeServer(),
+        _client=lambda url: FakeClient({"borderles": "Borderless"}),
+    )
+    res = cleaner.clean(["borderles"], ["Borderless"], None)
+    assert res.texts == ["Borderless"] and res.active is True
+
+
+def test_managed_cleaner_falls_back_when_server_unavailable():
+    def boom():
+        raise RuntimeError("llama-server not found")
+
+    rep = RecordingReporter()
+    res = ManagedLlamaCleaner("missing.gguf", _server=boom).clean(["keep"], [], rep)
+    assert res.texts == ["keep"]          # raw text preserved
+    assert res.active is False            # → meta stays cleaned:false
+    assert rep.warns and "skipped" in rep.warns[0]
