@@ -84,15 +84,66 @@ def test_write_transcript_matches_schema(tmp_path):
     assert data["meeting_id"] == "2026-08-02T14-30-00"
     assert data["duration_s"] == 3412.5
     assert len(data["segments"]) == 2
+    assert data["cleaned"] is False  # default: no cleanup pass ran
     seg = data["segments"][0]
     assert seg == {
         "start": 12.4, "end": 18.9, "speaker": "me", "track": "mic",
         "text": "hello there",
+        "raw_text": "hello there",  # falls back to text when unset
         "words": [
             {"w": "hello", "start": 12.4, "end": 12.7},
             {"w": "there", "start": 12.8, "end": 18.9},
         ],
     }
+
+
+def test_write_transcript_cleaned_flag_and_raw_text(tmp_path):
+    from meetscribe.types import Utterance, Word
+
+    u = Utterance(0.0, 1.0, "spk_0", "system", "Borderless GmbH",
+                  (Word("borderlestern", 0.0, 0.5), Word("gmbh", 0.5, 1.0)),
+                  raw_text="borderlestern gmbh")
+    p = tmp_path / "t.json"
+    write_transcript(p, meeting_id="m", duration_s=1.0, utterances=[u], cleaned=True)
+    data = json.loads(p.read_text())
+    assert data["cleaned"] is True
+    assert data["segments"][0]["text"] == "Borderless GmbH"
+    assert data["segments"][0]["raw_text"] == "borderlestern gmbh"
+
+
+def test_read_transcript_round_trips(tmp_path):
+    from meetscribe.output import read_transcript
+    from meetscribe.types import Utterance, Word
+
+    # raw_text is given explicitly on both (write normalizes an unset "" to text, so the
+    # exact round-trip is over already-normalized utterances).
+    utts = [
+        Utterance(12.4, 18.9, "me", "mic", "hello there",
+                  (Word("hello", 12.4, 12.7), Word("there", 12.8, 18.9)),
+                  raw_text="hello there"),
+        Utterance(19.0, 20.0, "spk_0", "system", "Borderless",
+                  (Word("borderles", 19.0, 20.0),), raw_text="borderles"),
+    ]
+    p = tmp_path / "t.json"
+    write_transcript(p, meeting_id="M1", duration_s=3412.5, utterances=utts, cleaned=True)
+    meeting_id, duration_s, got = read_transcript(p)
+    assert meeting_id == "M1" and duration_s == 3412.5
+    assert got == utts  # words, timings, raw_text all reconstructed exactly
+
+
+def test_read_transcript_v1_backcompat_raw_text_defaults_to_text(tmp_path):
+    # A v1 transcript (no raw_text/cleaned) reads with raw_text == text.
+    import json as _json
+    from meetscribe.output import read_transcript
+
+    p = tmp_path / "old.json"
+    p.write_text(_json.dumps({
+        "meeting_id": "old", "duration_s": 2.0,
+        "segments": [{"start": 0.0, "end": 1.0, "speaker": "spk_0", "track": "system",
+                      "text": "hi", "words": [{"w": "hi", "start": 0.0, "end": 1.0}]}],
+    }))
+    _, _, got = read_transcript(p)
+    assert got[0].text == "hi" and got[0].raw_text == "hi"
 
 
 def test_write_embeddings_shapes_and_dtypes(tmp_path):

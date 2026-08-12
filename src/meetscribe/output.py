@@ -14,10 +14,11 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .types import Utterance
+from .types import Utterance, Word
 
 # Bumped whenever the on-disk artifact/meta shape changes (forward-compat lever).
-FORMAT_VERSION = 1
+# v2 adds per-segment ``raw_text`` and the top-level ``cleaned`` flag.
+FORMAT_VERSION = 2
 
 # (id, vector of shape (dim,), speaker)
 Turn = tuple[str, np.ndarray, str]
@@ -71,8 +72,22 @@ def _utterance_to_dict(u: Utterance) -> dict:
         "speaker": u.speaker,
         "track": u.track,
         "text": u.text,
+        "raw_text": u.raw_text or u.text,  # fallback: raw == text when no cleanup ran
         "words": [{"w": w.w, "start": w.start, "end": w.end} for w in u.words],
     }
+
+
+def _dict_to_utterance(seg: dict) -> Utterance:
+    return Utterance(
+        start=seg["start"],
+        end=seg["end"],
+        speaker=seg["speaker"],
+        track=seg["track"],
+        text=seg["text"],
+        words=tuple(Word(w["w"], w["start"], w["end"]) for w in seg["words"]),
+        # v1 back-compat: no raw_text → equals text. v2: preserve the original raw_text.
+        raw_text=seg.get("raw_text", seg["text"]),
+    )
 
 
 def write_transcript(
@@ -80,13 +95,23 @@ def write_transcript(
     meeting_id: str,
     duration_s: float,
     utterances: Sequence[Utterance],
+    cleaned: bool = False,
 ) -> None:
     doc = {
         "meeting_id": meeting_id,
         "duration_s": duration_s,
+        "cleaned": cleaned,
         "segments": [_utterance_to_dict(u) for u in utterances],
     }
     Path(path).write_text(json.dumps(doc, indent=2))
+
+
+def read_transcript(path: str | Path) -> tuple[str, float, list[Utterance]]:
+    """Inverse of :func:`write_transcript`: rebuild ``(meeting_id, duration_s, utterances)``
+    with words/timings/raw_text reconstructed exactly. Used by the ``clean`` retrofit path."""
+    doc = json.loads(Path(path).read_text())
+    utts = [_dict_to_utterance(seg) for seg in doc["segments"]]
+    return doc["meeting_id"], doc["duration_s"], utts
 
 
 def _stack(vectors: Sequence[np.ndarray], dim: int) -> np.ndarray:
