@@ -342,8 +342,13 @@ def run(
         started_at=started_iso,
         ended_at=ended_iso,
         duration_s=result.duration_s,
+        cleaned=result.cleaned,
+        cleanup_model=result.cleanup_model,
     )
-    write_transcript(out / "transcript.json", meeting_id, result.duration_s, result.utterances)
+    write_transcript(
+        out / "transcript.json", meeting_id, result.duration_s, result.utterances,
+        cleaned=result.cleaned,
+    )
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
 

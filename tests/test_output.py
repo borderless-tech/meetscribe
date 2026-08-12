@@ -49,6 +49,19 @@ def test_build_meta_has_all_required_keys():
     assert meta["meetscribe_version"] == __version__
 
 
+def test_build_meta_defaults_to_uncleaned():
+    meta = build_meta(MODELS, embedding_dim=DIM, **BUNDLE_FIELDS)
+    assert meta["cleaned"] is False
+    assert "cleanup_model" not in meta
+
+
+def test_build_meta_records_cleanup_identity():
+    cm = {"name": "Qwen2.5-7B-Instruct-Q4_K_M", "sha256": "abc123", "temp": 0.0}
+    meta = build_meta(MODELS, embedding_dim=DIM, cleaned=True, cleanup_model=cm, **BUNDLE_FIELDS)
+    assert meta["cleaned"] is True
+    assert meta["cleanup_model"] == cm
+
+
 def test_build_meta_includes_bundle_fields():
     meta = build_meta(
         MODELS,

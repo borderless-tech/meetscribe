@@ -35,13 +35,17 @@ def build_meta(
     ended_at: str,
     duration_s: float,
     sample_rate: int = 16000,
+    cleaned: bool = False,
+    cleanup_model: dict | None = None,
 ) -> dict:
     """Assemble meta.json. ``models`` supplies the model names + embedding hash.
 
     ``started_at``/``ended_at`` are tz-aware ISO 8601 strings (with offset) — the
-    calendar-reconciliation match window.
+    calendar-reconciliation match window. ``cleanup_model`` (name + SHA-256 + params) travels
+    with the artifact when the LLM cleanup ran — text cleaned by different models isn't
+    equivalent, same rule as the embedding model identity.
     """
-    return {
+    meta = {
         "embedding_model": models["embedding_model"],
         "embedding_model_sha256": models["embedding_model_sha256"],
         "embedding_dim": embedding_dim,
@@ -53,8 +57,12 @@ def build_meta(
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_s": duration_s,
+        "cleaned": cleaned,
         "format_version": FORMAT_VERSION,
     }
+    if cleanup_model is not None:
+        meta["cleanup_model"] = cleanup_model
+    return meta
 
 
 def default_bundle_name(meta: dict) -> str:
