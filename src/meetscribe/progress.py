@@ -31,6 +31,7 @@ class Reporter(Protocol):
     def stage(self, label: str) -> ContextManager[None]: ...
     def track(self, label: str, total: int) -> TrackHandle: ...
     def info(self, msg: str) -> None: ...
+    def warn(self, msg: str) -> None: ...
     def summary(self, summary: Summary) -> None: ...
 
 
@@ -71,6 +72,9 @@ class NullReporter:
         return _NullTrack()
 
     def info(self, msg: str) -> None:
+        pass
+
+    def warn(self, msg: str) -> None:
         pass
 
     def summary(self, summary: Summary) -> None:
@@ -183,6 +187,11 @@ class RichReporter:
     def info(self, msg: str) -> None:
         if self.verbose:
             self.console.print(f"[dim]{msg}[/dim]")
+
+    def warn(self, msg: str) -> None:
+        # Always shown (unlike info): a dropped speaker changes how the transcript
+        # should be read, so it must surface even without --verbose.
+        self.console.print(f"[yellow]⚠ {msg}[/yellow]")
 
     def summary(self, summary: Summary) -> None:
         from rich.table import Table

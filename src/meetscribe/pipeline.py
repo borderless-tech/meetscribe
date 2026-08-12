@@ -129,6 +129,18 @@ def process(
         # segment), and every transcript speaker must get a centroid — so centroids
         # use all of a speaker's segments, unfiltered.
         spoken = {u.speaker for u in system_utts}
+        # A forced/auto cluster that wins no words vanishes from the transcript
+        # silently — which reads as "--speakers N was ignored". Name the dropped
+        # clusters so a low count is explainable (someone barely spoke) rather than
+        # mysterious. (This can be legitimate; it is a heads-up, not an error.)
+        clusters_found = {s.speaker for s in diar}
+        dropped = sorted(clusters_found - spoken)
+        if dropped:
+            reporter.warn(
+                f"diarization formed {len(clusters_found)} speaker(s) but "
+                f"{len(dropped)} produced no transcribed words and were dropped: "
+                f"{', '.join(dropped)}"
+            )
         diar_spoken = [s for s in diar if s.speaker in spoken]
         with reporter.stage("embed (system)"):
             sys_long = filter_short(diar_spoken)

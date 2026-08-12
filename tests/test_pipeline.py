@@ -200,6 +200,7 @@ class RecordingReporter:
         self.stages = []
         self.tracks = []
         self.advances = 0
+        self.warns = []
 
     def stage(self, label):
         self.stages.append(label)
@@ -225,6 +226,9 @@ class RecordingReporter:
 
     def info(self, msg):
         pass
+
+    def warn(self, msg):
+        self.warns.append(msg)
 
     def summary(self, s):
         pass
@@ -253,6 +257,36 @@ def test_process_reports_diarize_and_embed_progress(tmp_path):
     assert any("embedding (system)" in label for label in rep.tracks)
     # ASR (2 chunks) + diarization percent + 2×(turn + centroid) embeds
     assert rep.advances >= 7
+
+
+def test_process_warns_on_dropped_cluster(tmp_path):
+    """A diarization cluster that wins no words vanishes from the transcript with no
+    trace. When it does, process() must warn — otherwise `--speakers 4` silently
+    yielding 2 transcript speakers looks like the count was ignored.
+
+    Regression: meeting 2026-08-12 forced 3 clusters (spk_0/1/2); spk_0 caught 2 s of
+    audio, won 0 words, and disappeared with no warning."""
+    _write_wav(tmp_path / "system.wav", seconds=3.0)
+    # words span 0.0–1.0 s → all land on spk_0; spk_1 (2.0–3.0) wins nothing → dropped
+    comps = Components(
+        FakeVad(),
+        FakeRecognizer(),
+        ScriptedDiarizer([(0.0, 1.0, 0), (2.0, 3.0, 1)]),
+        FakeEmbedder(),
+    )
+    rep = RecordingReporter()
+    res = process(None, str(tmp_path / "system.wav"), comps, reporter=rep)
+
+    assert "spk_1" not in {u.speaker for u in res.utterances}  # sanity: dropped
+    assert any("spk_1" in w for w in rep.warns), rep.warns
+
+
+def test_process_no_warning_when_all_clusters_spoke(tmp_path):
+    """No spurious warning when every diarized cluster wins words."""
+    _write_wav(tmp_path / "system.wav")
+    rep = RecordingReporter()
+    process(None, str(tmp_path / "system.wav"), _components(), reporter=rep)
+    assert rep.warns == []
 
 
 def test_process_system_only(tmp_path):
