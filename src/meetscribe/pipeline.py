@@ -32,6 +32,13 @@ class Components:
     recognizer: object  # .recognize(samples) -> RawResult
     diarizer: object  # .segments(samples) -> raw segs
     embedder: object  # .dim ; .embed(samples) -> vector
+    cleaner: object = None  # .clean(texts, glossary, reporter) -> CleanResult; None → NullCleaner
+
+    def __post_init__(self):
+        if self.cleaner is None:
+            from .cleanup import NullCleaner
+
+            self.cleaner = NullCleaner()
 
 
 @dataclass
@@ -41,6 +48,8 @@ class Result:
     clusters: list
     dim: int
     duration_s: float
+    cleaned: bool = False
+    cleanup_model: dict | None = None
 
 
 def _group_by_speaker(segments: list[DiarSegment]) -> dict[str, list[DiarSegment]]:
@@ -59,10 +68,12 @@ def process(
     system_wav: str | None,
     components: Components,
     reporter=None,
+    glossary: list[str] | None = None,
 ) -> Result:
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
+    glossary = glossary or []
     mic_utts: list[Utterance] = []
     system_utts: list[Utterance] = []
     turns: list = []
@@ -162,7 +173,31 @@ def process(
 
     utterances = coalesce_utterances(merge_tracks(mic_utts, system_utts))
     duration = max([duration] + [u.end for u in utterances])
-    return Result(utterances, turns, clusters, dim, duration)
+
+    # ---- cleanup (llm): rewrite only system-track text -----------------------------
+    # The mic track is the user's clean audio; only the degraded system downmix is worth
+    # cleaning (and risking paraphrase over). raw_text preserves the original ASR text.
+    from dataclasses import replace
+
+    sys_idx = [i for i, u in enumerate(utterances) if u.track == "system"]
+    cleaned = False
+    cleanup_model = None
+    if sys_idx:
+        with reporter.stage("cleanup (llm)"):
+            res = components.cleaner.clean(
+                [utterances[i].text for i in sys_idx], glossary, reporter
+            )
+        for j, i in enumerate(sys_idx):
+            u = utterances[i]
+            utterances[i] = replace(u, text=res.texts[j], raw_text=u.text)
+        cleaned = res.active
+        if res.active:
+            cleanup_model = getattr(components.cleaner, "model_info", None)
+            reporter.info(
+                f"cleaned {res.cleaned}/{len(sys_idx)} system segments "
+                f"({res.kept_raw} kept raw)"
+            )
+    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model)
 
 
 def _transcribe(components, samples, reporter, label):
