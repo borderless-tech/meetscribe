@@ -164,6 +164,31 @@ def test_process_speakers_defaults_to_none():
     assert args.speakers is None
 
 
+def test_main_process_forwards_cleanup_flag(monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.cli import main
+
+    captured = {}
+    monkeypatch.setattr(pipeline, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["process", "x"]) == 0
+    assert captured["cleanup"] is True  # default: cleanup on
+
+    assert main(["process", "x", "--no-cleanup"]) == 0
+    assert captured["cleanup"] is False
+
+
+def test_main_clean_dispatches_to_clean_existing(monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.cli import main
+
+    captured = {}
+    monkeypatch.setattr(pipeline, "clean_existing", lambda **k: captured.update(k) or 0)
+
+    assert main(["clean", "some/dir"]) == 0
+    assert captured["audio_dir"] == "some/dir"
+
+
 def test_main_process_forwards_speakers(monkeypatch):
     # `--speakers N` means people in the meeting including the user — the same
     # semantic as the post-recording prompt — so the diarizer gets N-1; without

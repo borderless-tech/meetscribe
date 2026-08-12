@@ -400,6 +400,42 @@ def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
     assert not list(out.glob("*.mscribe"))
 
 
+def test_clean_existing_writes_cleanup_dir_nondestructively(tmp_path, monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.output import write_meta, write_transcript
+    from meetscribe.types import Utterance, Word
+
+    src = tmp_path / "meeting"
+    src.mkdir()
+    utts = [Utterance(0.0, 1.0, "spk_0", "system", "hello world",
+                      (Word("hello", 0.0, 0.5), Word("world", 0.5, 1.0)))]
+    write_transcript(src / "transcript.json", "M", 1.0, utts)
+    (src / "embeddings.npz").write_bytes(b"NPZ")
+    write_meta(src / "meta.json", {"meeting_id": "M", "format_version": 2, "cleaned": False})
+    original = (src / "transcript.json").read_text()
+
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(
+        pipeline, "build_components",
+        lambda models_dir, num_speakers=-1: Components(
+            FakeVad(), FakeRecognizer(), FakeDiarizer(), FakeEmbedder(), UpperCleaner()
+        ),
+    )
+
+    assert pipeline.clean_existing(audio_dir=str(src)) == 0
+
+    out = tmp_path / "meeting-cleanup"
+    assert out.is_dir()
+    import json
+    doc = json.loads((out / "transcript.json").read_text())
+    assert doc["cleaned"] is True
+    assert doc["segments"][0]["text"] == "HELLO WORLD"          # cleaned
+    assert doc["segments"][0]["raw_text"] == "hello world"       # original preserved
+    assert (out / "embeddings.npz").read_bytes() == b"NPZ"       # copied verbatim
+    assert json.loads((out / "meta.json").read_text())["cleaned"] is True
+    assert (src / "transcript.json").read_text() == original     # ORIGINAL untouched
+
+
 def test_run_forwards_num_speakers_to_build_components(tmp_path, monkeypatch):
     # `process --speakers N` must reach the diarizer: run() hands num_speakers to
     # build_components (which passes it to OfflineDiarizer as num_clusters).

@@ -173,31 +173,33 @@ def process(
 
     utterances = coalesce_utterances(merge_tracks(mic_utts, system_utts))
     duration = max([duration] + [u.end for u in utterances])
+    utterances, cleaned, cleanup_model = apply_cleanup(
+        utterances, components.cleaner, glossary, reporter
+    )
+    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model)
 
-    # ---- cleanup (llm): rewrite only system-track text -----------------------------
-    # The mic track is the user's clean audio; only the degraded system downmix is worth
-    # cleaning (and risking paraphrase over). raw_text preserves the original ASR text.
+
+def apply_cleanup(utterances, cleaner, glossary, reporter):
+    """Rewrite only system-track ``text`` via the cleaner, stashing the original in
+    ``raw_text``; timings untouched. The mic ('me') track is the clean user audio and passes
+    through. Returns ``(utterances, cleaned, cleanup_model)``. Shared by ``process()`` and the
+    ``clean`` retrofit path."""
     from dataclasses import replace
 
     sys_idx = [i for i, u in enumerate(utterances) if u.track == "system"]
-    cleaned = False
-    cleanup_model = None
-    if sys_idx:
-        with reporter.stage("cleanup (llm)"):
-            res = components.cleaner.clean(
-                [utterances[i].text for i in sys_idx], glossary, reporter
-            )
-        for j, i in enumerate(sys_idx):
-            u = utterances[i]
-            utterances[i] = replace(u, text=res.texts[j], raw_text=u.text)
-        cleaned = res.active
-        if res.active:
-            cleanup_model = getattr(components.cleaner, "model_info", None)
-            reporter.info(
-                f"cleaned {res.cleaned}/{len(sys_idx)} system segments "
-                f"({res.kept_raw} kept raw)"
-            )
-    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model)
+    if not sys_idx:
+        return utterances, False, None
+    with reporter.stage("cleanup (llm)"):
+        res = cleaner.clean([utterances[i].text for i in sys_idx], glossary, reporter)
+    for j, i in enumerate(sys_idx):
+        u = utterances[i]
+        utterances[i] = replace(u, text=res.texts[j], raw_text=u.text)
+    if not res.active:
+        return utterances, False, None
+    reporter.info(
+        f"cleaned {res.cleaned}/{len(sys_idx)} system segments ({res.kept_raw} kept raw)"
+    )
+    return utterances, True, getattr(cleaner, "model_info", None)
 
 
 def _transcribe(components, samples, reporter, label):
@@ -297,6 +299,7 @@ def run(
     started_at=None,
     reporter=None,
     num_speakers: int = -1,
+    cleanup: bool = True,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -319,6 +322,7 @@ def run(
     out.mkdir(parents=True, exist_ok=True)
     meeting_id = out.name if out.name else f"{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
 
+    from . import glossary as glossary_mod
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
@@ -326,7 +330,12 @@ def run(
     # record→process transition isn't a silent gap.
     with reporter.stage("loading models"):
         components = build_components(models_dir, num_speakers)
-    result = process(mic_wav, system_wav, components, reporter=reporter)
+    if not cleanup:  # --no-cleanup: force the no-op cleaner regardless of what was built
+        from .cleanup import NullCleaner
+
+        components.cleaner = NullCleaner()
+    glossary = glossary_mod.load(glossary_mod.default_path())
+    result = process(mic_wav, system_wav, components, reporter=reporter, glossary=glossary)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
     started_iso, ended_iso = _window(started_at, result.duration_s, mic_wav, system_wav)
@@ -361,4 +370,53 @@ def run(
 
     reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
+    return 0
+
+
+def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) -> int:
+    """Run the LLM cleanup over an EXISTING transcript, non-destructively.
+
+    Reads ``<dir>/transcript.json`` (no audio, no re-ASR), cleans the system-track text, and
+    writes ``<dir>-cleanup/`` with the cleaned transcript + copied embeddings + updated meta.
+    The original directory is never modified — this is the A/B tool for old meetings."""
+    import json
+    import os
+    import shutil
+
+    from . import glossary as glossary_mod
+    from .output import read_transcript, write_meta, write_transcript
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+    src = Path(audio_dir)
+    transcript = src / "transcript.json"
+    if not transcript.exists():
+        print(f"no transcript.json found in {src}")
+        return 2
+
+    models_dir = os.environ.get("MEETSCRIBE_MODELS")
+    if not models_dir:
+        print("MEETSCRIBE_MODELS is not set — run via `nix run` or the wrapper")
+        return 2
+
+    meeting_id, duration_s, utterances = read_transcript(transcript)
+    with reporter.stage("loading models"):
+        components = build_components(models_dir, -1)
+    glossary = glossary_mod.load(glossary_mod.default_path())
+    utterances, cleaned, cleanup_model = apply_cleanup(
+        list(utterances), components.cleaner, glossary, reporter
+    )
+
+    out = Path(out_dir) if out_dir else src.parent / f"{src.name}-cleanup"
+    out.mkdir(parents=True, exist_ok=True)
+    write_transcript(out / "transcript.json", meeting_id, duration_s, utterances, cleaned=cleaned)
+    if (src / "embeddings.npz").exists():  # unaffected by text cleanup → copy verbatim
+        shutil.copy(src / "embeddings.npz", out / "embeddings.npz")
+    meta = json.loads((src / "meta.json").read_text()) if (src / "meta.json").exists() else {}
+    meta["cleaned"] = cleaned
+    if cleanup_model is not None:
+        meta["cleanup_model"] = cleanup_model
+    write_meta(out / "meta.json", meta)
+
+    print(f"wrote cleaned transcript to {out}")
     return 0
