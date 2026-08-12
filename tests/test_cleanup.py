@@ -1,0 +1,110 @@
+"""LLM cleanup orchestration + anti-hallucination guards (no real model)."""
+
+from meetscribe.cleanup import (
+    LlamaCleaner,
+    NullCleaner,
+    accept_candidate,
+    build_prompt,
+)
+
+
+# ---- accept_candidate (pure guard) --------------------------------------------------
+
+def test_accept_good_correction():
+    assert accept_candidate("Borderlestern GmbH", "Borderless GmbH")
+
+
+def test_reject_empty_candidate():
+    assert not accept_candidate("Borderless GmbH", "")
+    assert not accept_candidate("Borderless GmbH", "   ")
+
+
+def test_reject_empty_input():
+    # No input to correct → never inject LLM text.
+    assert not accept_candidate("", "anything")
+
+
+def test_reject_runaway_over_3x():
+    assert not accept_candidate("hi there", "ha " * 40)
+
+
+def test_reject_collapse_only_for_long_inputs():
+    long = "this is a genuinely long original sentence with plenty of words here"  # >40 chars
+    assert not accept_candidate(long, "a")                       # <0.3× → collapse, rejected
+    # short backchannel legitimately collapses: "uh the the" -> "the"
+    assert accept_candidate("uh the the", "the")                 # input <=40 chars → allowed
+
+
+# ---- prompt construction ------------------------------------------------------------
+
+def test_build_prompt_includes_glossary_context_and_current():
+    p = build_prompt(["Borderless", "Georg"], prev="hello there", current="borderles stuff")
+    assert "Borderless" in p and "Georg" in p
+    assert "hello there" in p          # previous-segment context
+    assert "borderles stuff" in p      # the text to fix
+
+
+# ---- NullCleaner --------------------------------------------------------------------
+
+def test_null_cleaner_is_identity_and_inactive():
+    res = NullCleaner().clean(["a", "b"], [], None)
+    assert res.texts == ["a", "b"]
+    assert res.active is False
+    assert res.cleaned == 0 and res.kept_raw == 0
+
+
+# ---- LlamaCleaner (fake client) -----------------------------------------------------
+
+class FakeClient:
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.calls = []
+
+    def complete(self, prompt):
+        self.calls.append(prompt)
+        for key, val in self.mapping.items():
+            if key in prompt:
+                return val
+        return "UNMATCHED"
+
+
+class RecordingReporter:
+    def __init__(self):
+        self.warns = []
+
+    def warn(self, msg):
+        self.warns.append(msg)
+
+
+def test_llama_cleaner_applies_good_keeps_guarded():
+    client = FakeClient({"Borderlestern": "Borderless.", "runaway": "na " * 99})
+    rep = RecordingReporter()
+    res = LlamaCleaner(client).clean(
+        ["Borderlestern", "runaway text that is quite long here"], ["Borderless"], rep
+    )
+    assert res.texts[0] == "Borderless."                              # applied
+    assert res.texts[1] == "runaway text that is quite long here"     # guard kept raw
+    assert res.cleaned == 1 and res.kept_raw == 1
+    assert res.active is True
+    assert rep.warns  # a guard trip was surfaced
+
+
+def test_llama_cleaner_passes_glossary_and_context():
+    # seg one maps to itself → the cleaned previous line ("seg one") is the context for seg two
+    client = FakeClient({"seg one": "seg one", "seg-two": "cleaned two"})
+    LlamaCleaner(client).clean(["seg one", "seg-two"], ["Borderless", "Georg"], None)
+    p = client.calls[1]
+    assert "Borderless" in p and "Georg" in p
+    assert "seg one" in p and "seg-two" in p  # prior (cleaned) line as context + current
+
+
+def test_llama_cleaner_survives_client_error():
+    class Boom:
+        def complete(self, prompt):
+            raise RuntimeError("server died")
+
+    rep = RecordingReporter()
+    res = LlamaCleaner(Boom()).clean(["keep me"], [], rep)
+    assert res.texts == ["keep me"]
+    assert res.kept_raw == 1 and res.cleaned == 0
+    assert res.active is True
