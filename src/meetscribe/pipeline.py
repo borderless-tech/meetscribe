@@ -274,14 +274,15 @@ def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = Tr
     cleaner = NullCleaner()
     if cleanup:
         gguf = m / "llm" / "model.gguf"
-        model_info = None
-        if gguf.exists():
-            model_info = {
-                "name": "Qwen2.5-7B-Instruct-Q4_K_M",
-                "sha256": _sha256(str(gguf)),
-                "temperature": 0.0,
-            }
-        cleaner = ManagedLlamaCleaner(str(gguf), model_info)
+        if gguf.exists():  # opt-in models-llm output; absent → stay a no-op (uncleaned)
+            cleaner = ManagedLlamaCleaner(
+                str(gguf),
+                {
+                    "name": "Qwen2.5-7B-Instruct-Q4_K_M",
+                    "sha256": _sha256(str(gguf)),
+                    "temperature": 0.0,
+                },
+            )
     return Components(
         vad=SileroVad(str(m / "vad" / "silero_vad.onnx")),
         recognizer=ParakeetRecognizer(str(m / "asr")),

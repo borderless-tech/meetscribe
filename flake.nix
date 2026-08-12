@@ -117,6 +117,16 @@
           ffmpeg = pkgs.ffmpeg;
           inherit models;
         };
+        # Opt-in LLM variant: models + the cleanup GGUF, with llama-server on PATH. Kept a
+        # separate output so the default closure and CI stay lean (see nix/models.nix); a
+        # machine without it just produces an uncleaned transcript (graceful fallback).
+        modelsLlm = pkgs.callPackage ./nix/models.nix { withLlm = true; };
+        meetscribeLlm = pkgs.callPackage ./nix/package.nix {
+          venv = runtimeVenv;
+          ffmpeg = pkgs.ffmpeg;
+          models = modelsLlm;
+          inherit (pkgs) llama-cpp;
+        };
         doctorApp = pkgs.writeShellScript "meetscribe-doctor" ''
           exec ${meetscribe}/bin/meetscribe doctor "$@"
         '';
@@ -128,10 +138,16 @@
         packages.default = meetscribe;
         packages.meetscribe = meetscribe;
         packages.models = models;
+        packages.models-llm = modelsLlm;
+        packages.meetscribe-llm = meetscribeLlm;
 
         apps.default = {
           type = "app";
           program = "${meetscribe}/bin/meetscribe";
+        };
+        apps.meetscribe-llm = {
+          type = "app";
+          program = "${meetscribeLlm}/bin/meetscribe";
         };
         apps.doctor = {
           type = "app";
