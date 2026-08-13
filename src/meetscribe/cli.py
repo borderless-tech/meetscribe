@@ -51,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="capture system audio from this exact source (e.g. a specific sink's .monitor); "
              "overrides the default-sink auto-detection",
     )
+    p_record.add_argument(
+        "--no-cleanup", action="store_true",
+        help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
+    )
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
     p_process.add_argument("audio", nargs="?", help="path to an existing recording to process")
@@ -67,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="number of people in the meeting, including you — same question the "
              "record flow asks (default: automatic threshold clustering)",
     )
+    p_process.add_argument(
+        "--no-cleanup", action="store_true",
+        help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
+    )
 
     p_bundle = sub.add_parser("bundle", help="zip an artifact directory into one .mscribe")
     p_bundle.add_argument(
@@ -75,6 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_bundle.add_argument(
         "-o", "--out", default=None,
         help="output path (default: ./meeting-<id>.mscribe)",
+    )
+
+    p_clean = sub.add_parser(
+        "clean", help="re-run LLM cleanup on an existing transcript (non-destructive)"
+    )
+    p_clean.add_argument("dir", help="directory holding transcript.json")
+    p_clean.add_argument(
+        "-o", "--out", default=None,
+        help="output directory (default: <dir>-cleanup)",
     )
 
     sub.add_parser("doctor", help="check the audio setup is ready to record")
@@ -106,6 +123,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle=getattr(args, "bundle", False),
             system_source=getattr(args, "system_source", None),
             reporter=reporter,
+            cleanup=not getattr(args, "no_cleanup", False),
         )
     if command == "process":
         from . import pipeline
@@ -119,6 +137,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle=getattr(args, "bundle", False),
             reporter=reporter,
             num_speakers=-1 if speakers is None else speakers_from_count(speakers),
+            cleanup=not getattr(args, "no_cleanup", False),
+        )
+    if command == "clean":
+        from . import pipeline
+
+        return pipeline.clean_existing(
+            audio_dir=args.dir, out_dir=getattr(args, "out", None), reporter=reporter,
         )
     if command == "bundle":
         import json

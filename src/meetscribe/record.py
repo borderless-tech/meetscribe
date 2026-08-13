@@ -409,6 +409,27 @@ def participants_to_speakers(answer: str) -> int:
     return speakers_from_count(n)
 
 
+def ask_participant_names(count: int, input_fn=input) -> list[str]:
+    """Optionally collect participant names — spelling hints appended to the glossary.
+
+    Only prompts when ``count`` >= 2 (a known meeting size). Each entry is optional; a blank
+    line stops early, and at most ``count`` names are collected. Any decline (blank/EOF/Ctrl-C)
+    never blocks — returns whatever was entered so far. Callers append the result to the
+    persistent glossary; names are flat spelling hints, never mapped to ``spk_N``."""
+    if count < 2:
+        return []
+    names: list[str] = []
+    for _ in range(count):
+        try:
+            ans = input_fn("Name of a participant? (Enter to skip) ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not ans:
+            break
+        names.append(ans)
+    return names
+
+
 def ask_participants(input_fn=input) -> int:
     """Post-recording prompt for the participant count → system-track speaker count.
 
@@ -423,7 +444,7 @@ def ask_participants(input_fn=input) -> int:
 
 def run(
     out_dir: str | None = None, bundle: bool = False, reporter=None,
-    system_source: str | None = None,
+    system_source: str | None = None, cleanup: bool = True,
 ) -> int:
     from datetime import datetime, timezone
 
@@ -443,11 +464,17 @@ def run(
             print(f"⚠ {warning}")
 
     num_speakers = ask_participants() if _stdin_is_tty() else -1
+    if _stdin_is_tty() and num_speakers >= 2:
+        # Optional spelling hints for the cleanup glossary; TTY-gated, never blocks.
+        from . import glossary
+
+        names = ask_participant_names(num_speakers)
+        glossary.append(glossary.default_path(), names)
 
     from . import pipeline
 
     return pipeline.run(
         audio=str(root), out_dir=str(root),
         bundle=bundle, started_at=started_at, reporter=reporter,
-        num_speakers=num_speakers,
+        num_speakers=num_speakers, cleanup=cleanup,
     )

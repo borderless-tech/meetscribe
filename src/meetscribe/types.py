@@ -33,7 +33,13 @@ class DiarSegment:
 
 @dataclass(frozen=True)
 class Utterance:
-    """A final, merged unit written to transcript.json."""
+    """A final, merged unit written to transcript.json.
+
+    ``text`` is the human-readable form (possibly LLM-cleaned); ``raw_text`` is the verbatim
+    ASR text. They are equal until the cleanup stage runs — which is the *only* place
+    ``raw_text`` is ever set (never at align/mic construction or in coalesce). When unset it
+    defaults to "" and serialization/read falls back to ``text``.
+    """
 
     start: float
     end: float
@@ -41,3 +47,4 @@ class Utterance:
     track: str  # "mic" | "system"
     text: str
     words: tuple[Word, ...]
+    raw_text: str = ""

@@ -394,6 +394,40 @@ def test_run_forwards_participant_answer_to_pipeline(tmp_path, monkeypatch):
     assert captured["num_speakers"] == 3
 
 
+def test_ask_names_collects_until_blank():
+    from meetscribe.record import ask_participant_names
+
+    answers = iter(["Georg", "Christian", ""])
+    assert ask_participant_names(4, input_fn=lambda _: next(answers)) == ["Georg", "Christian"]
+
+
+def test_ask_names_skipped_when_count_below_two():
+    from meetscribe.record import ask_participant_names
+
+    assert ask_participant_names(1, input_fn=lambda _: "x") == []
+
+
+def test_ask_names_stops_at_count():
+    from meetscribe.record import ask_participant_names
+
+    # count=2 → at most 2 prompts even if the user keeps typing
+    assert ask_participant_names(2, input_fn=lambda _: "X") == ["X", "X"]
+
+
+def test_ask_names_eof_keeps_prior():
+    from meetscribe.record import ask_participant_names
+
+    calls = {"n": 0}
+
+    def boom(_):
+        if calls["n"] == 0:
+            calls["n"] += 1
+            return "Georg"
+        raise EOFError
+
+    assert ask_participant_names(3, input_fn=boom) == ["Georg"]
+
+
 def test_run_skips_prompt_without_tty(tmp_path, monkeypatch):
     # Non-interactive stdin (scripts, CI): never block on input(); use automatic mode.
     captured = {}

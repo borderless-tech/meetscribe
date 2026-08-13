@@ -9,7 +9,7 @@ sherpa models (the end-to-end smoke test) or fakes.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +32,13 @@ class Components:
     recognizer: object  # .recognize(samples) -> RawResult
     diarizer: object  # .segments(samples) -> raw segs
     embedder: object  # .dim ; .embed(samples) -> vector
+    cleaner: object = None  # .clean(texts, glossary, reporter) -> CleanResult; None → NullCleaner
+
+    def __post_init__(self):
+        if self.cleaner is None:
+            from .cleanup import NullCleaner
+
+            self.cleaner = NullCleaner()
 
 
 @dataclass
@@ -41,6 +48,9 @@ class Result:
     clusters: list
     dim: int
     duration_s: float
+    cleaned: bool = False
+    cleanup_model: dict | None = None
+    suggestions: list = field(default_factory=list)
 
 
 def _group_by_speaker(segments: list[DiarSegment]) -> dict[str, list[DiarSegment]]:
@@ -59,10 +69,12 @@ def process(
     system_wav: str | None,
     components: Components,
     reporter=None,
+    glossary: list[str] | None = None,
 ) -> Result:
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
+    glossary = glossary or []
     mic_utts: list[Utterance] = []
     system_utts: list[Utterance] = []
     turns: list = []
@@ -162,7 +174,30 @@ def process(
 
     utterances = coalesce_utterances(merge_tracks(mic_utts, system_utts))
     duration = max([duration] + [u.end for u in utterances])
-    return Result(utterances, turns, clusters, dim, duration)
+    utterances, cleaned, cleanup_model, suggestions = apply_cleanup(
+        utterances, components.cleaner, glossary, reporter
+    )
+    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model, suggestions)
+
+
+def apply_cleanup(utterances, cleaner, glossary, reporter):
+    """Repair only system-track utterances via the cleaner (echo-collapse + guarded span
+    repair), which stashes the original in ``raw_text``; timings untouched. The mic ('me')
+    track is the clean user audio and passes through. Returns ``(utterances, cleaned,
+    cleanup_model)``. Shared by ``process()`` and the ``clean`` retrofit path."""
+    sys_idx = [i for i, u in enumerate(utterances) if u.track == "system"]
+    if not sys_idx:
+        return utterances, False, None, []
+    with reporter.stage("cleanup (repair)"):
+        res = cleaner.clean([utterances[i] for i in sys_idx], glossary, reporter)
+    for j, i in enumerate(sys_idx):
+        utterances[i] = res.utterances[j]
+    suggestions = list(getattr(res, "suggestions", []))
+    for s in suggestions:  # remap local (system-list) segment index → transcript segment index
+        s["segment"] = sys_idx[s["segment"]]
+    if not res.active:
+        return utterances, False, None, suggestions
+    return utterances, True, getattr(cleaner, "model_info", None), suggestions
 
 
 def _transcribe(components, samples, reporter, label):
@@ -219,16 +254,38 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def build_components(models_dir: str, num_speakers: int = -1) -> Components:
+def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = True) -> Components:
     """Wire the real sherpa models. ``num_speakers`` is the expected speaker count on
-    the system track (everyone except the user); -1 means threshold clustering."""
+    the system track (everyone except the user); -1 means threshold clustering.
+
+    ``cleanup`` wires the LLM cleaner when the GGUF is present (a separate, opt-in flake
+    output); if it's absent the cleaner degrades to a no-op at clean() time (warn + raw text),
+    so a machine without the LLM model simply produces an uncleaned transcript."""
     from .asr import ParakeetRecognizer
+    from .cleanup import ManagedSuggestCleaner, NullCleaner
     from .diarize import OfflineDiarizer
     from .embed import SpeakerEmbedder
     from .vad import SileroVad
 
     m = Path(models_dir)
     spk = str(m / "spk" / "model.onnx")
+    cleaner = NullCleaner()
+    if cleanup:
+        # hunspell (dicts under hunspell/, in the models-llm output) drives echo-collapse +
+        # broken-word flagging + suggestions; the LLM (llm/model.gguf) adds a contextual
+        # candidate when present. Broken words are suggested for review, never auto-applied.
+        dic = m / "hunspell"
+        gguf = m / "llm" / "model.gguf"
+        if dic.is_dir():
+            cleaner = ManagedSuggestCleaner(
+                str(gguf), str(dic),
+                model_info=(
+                    {"name": "Qwen2.5-7B-Instruct-Q4_K_M", "sha256": _sha256(str(gguf)),
+                     "temperature": 0.0}
+                    if gguf.exists() else None
+                ),
+                use_llm=gguf.exists(),
+            )
     return Components(
         vad=SileroVad(str(m / "vad" / "silero_vad.onnx")),
         recognizer=ParakeetRecognizer(str(m / "asr")),
@@ -236,6 +293,7 @@ def build_components(models_dir: str, num_speakers: int = -1) -> Components:
             str(m / "seg" / "model.int8.onnx"), spk, num_clusters=num_speakers
         ),
         embedder=SpeakerEmbedder(spk),
+        cleaner=cleaner,
     )
 
 
@@ -262,6 +320,7 @@ def run(
     started_at=None,
     reporter=None,
     num_speakers: int = -1,
+    cleanup: bool = True,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -284,6 +343,7 @@ def run(
     out.mkdir(parents=True, exist_ok=True)
     meeting_id = out.name if out.name else f"{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
 
+    from . import glossary as glossary_mod
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
@@ -291,7 +351,12 @@ def run(
     # record→process transition isn't a silent gap.
     with reporter.stage("loading models"):
         components = build_components(models_dir, num_speakers)
-    result = process(mic_wav, system_wav, components, reporter=reporter)
+    if not cleanup:  # --no-cleanup: force the no-op cleaner regardless of what was built
+        from .cleanup import NullCleaner
+
+        components.cleaner = NullCleaner()
+    glossary = glossary_mod.effective()
+    result = process(mic_wav, system_wav, components, reporter=reporter, glossary=glossary)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
     started_iso, ended_iso = _window(started_at, result.duration_s, mic_wav, system_wav)
@@ -307,8 +372,13 @@ def run(
         started_at=started_iso,
         ended_at=ended_iso,
         duration_s=result.duration_s,
+        cleaned=result.cleaned,
+        cleanup_model=result.cleanup_model,
     )
-    write_transcript(out / "transcript.json", meeting_id, result.duration_s, result.utterances)
+    write_transcript(
+        out / "transcript.json", meeting_id, result.duration_s, result.utterances,
+        cleaned=result.cleaned, suggestions=result.suggestions,
+    )
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
 
@@ -321,4 +391,54 @@ def run(
 
     reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
+    return 0
+
+
+def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) -> int:
+    """Run the LLM cleanup over an EXISTING transcript, non-destructively.
+
+    Reads ``<dir>/transcript.json`` (no audio, no re-ASR), cleans the system-track text, and
+    writes ``<dir>-cleanup/`` with the cleaned transcript + copied embeddings + updated meta.
+    The original directory is never modified — this is the A/B tool for old meetings."""
+    import json
+    import os
+    import shutil
+
+    from . import glossary as glossary_mod
+    from .output import read_transcript, write_meta, write_transcript
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+    src = Path(audio_dir)
+    transcript = src / "transcript.json"
+    if not transcript.exists():
+        print(f"no transcript.json found in {src}")
+        return 2
+
+    models_dir = os.environ.get("MEETSCRIBE_MODELS")
+    if not models_dir:
+        print("MEETSCRIBE_MODELS is not set — run via `nix run` or the wrapper")
+        return 2
+
+    meeting_id, duration_s, utterances = read_transcript(transcript)
+    with reporter.stage("loading models"):
+        components = build_components(models_dir, -1)
+    glossary = glossary_mod.effective()
+    utterances, cleaned, cleanup_model, suggestions = apply_cleanup(
+        list(utterances), components.cleaner, glossary, reporter
+    )
+
+    out = Path(out_dir) if out_dir else src.parent / f"{src.name}-cleanup"
+    out.mkdir(parents=True, exist_ok=True)
+    write_transcript(out / "transcript.json", meeting_id, duration_s, utterances,
+                     cleaned=cleaned, suggestions=suggestions)
+    if (src / "embeddings.npz").exists():  # unaffected by text cleanup → copy verbatim
+        shutil.copy(src / "embeddings.npz", out / "embeddings.npz")
+    meta = json.loads((src / "meta.json").read_text()) if (src / "meta.json").exists() else {}
+    meta["cleaned"] = cleaned
+    if cleanup_model is not None:
+        meta["cleanup_model"] = cleanup_model
+    write_meta(out / "meta.json", meta)
+
+    print(f"wrote cleaned transcript to {out}")
     return 0

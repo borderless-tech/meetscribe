@@ -289,6 +289,46 @@ def test_process_no_warning_when_all_clusters_spoke(tmp_path):
     assert rep.warns == []
 
 
+class UpperCleaner:
+    """Fake cleaner: uppercases each utterance's text (stashing raw_text), reports active."""
+
+    model_info = {"name": "fake-llm", "sha256": "deadbeef"}
+
+    def clean(self, utterances, glossary, reporter):
+        from dataclasses import replace
+
+        from meetscribe.cleanup import RepairResult
+
+        out = [replace(u, text=u.text.upper(), raw_text=u.text) for u in utterances]
+        return RepairResult(out, fixed=len(out), echoes=0, active=True)
+
+
+def test_process_cleans_system_track_only(tmp_path):
+    """Cleanup rewrites system-track text (the degraded downmix), sets raw_text to the
+    original, and leaves the mic ('me') track untouched. Timings are never touched."""
+    _write_wav(tmp_path / "mic.wav")
+    _write_wav(tmp_path / "system.wav")
+    comps = Components(FakeVad(), FakeRecognizer(), FakeDiarizer(), FakeEmbedder(), UpperCleaner())
+    res = process(str(tmp_path / "mic.wav"), str(tmp_path / "system.wav"), comps)
+
+    by_track = {u.track: u for u in res.utterances}
+    assert by_track["system"].text == "HELLO WORLD"        # cleaned
+    assert by_track["system"].raw_text == "hello world"     # original preserved
+    assert by_track["mic"].text == "hello world"            # mic NOT cleaned
+    # words verbatim on both tracks
+    assert by_track["system"].words[0].w == "hello"
+    assert res.cleaned is True
+    assert res.cleanup_model == {"name": "fake-llm", "sha256": "deadbeef"}
+
+
+def test_process_nullcleaner_leaves_text_and_marks_uncleaned(tmp_path):
+    _write_wav(tmp_path / "system.wav")
+    res = process(None, str(tmp_path / "system.wav"), _components())  # default NullCleaner
+    assert res.utterances[0].text == "hello world"
+    assert res.cleaned is False
+    assert res.cleanup_model is None
+
+
 def test_process_system_only(tmp_path):
     _write_wav(tmp_path / "system.wav")
     res = process(None, str(tmp_path / "system.wav"), _components())
@@ -333,7 +373,7 @@ def test_run_with_bundle_writes_mscribe(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
     monkeypatch.setattr(
-        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+        pipeline, "build_components", lambda models_dir, num_speakers=-1, cleanup=True: _components()
     )
 
     out = tmp_path / "out"
@@ -355,12 +395,48 @@ def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
     monkeypatch.setattr(
-        pipeline, "build_components", lambda models_dir, num_speakers=-1: _components()
+        pipeline, "build_components", lambda models_dir, num_speakers=-1, cleanup=True: _components()
     )
 
     out = tmp_path / "out"
     assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
     assert not list(out.glob("*.mscribe"))
+
+
+def test_clean_existing_writes_cleanup_dir_nondestructively(tmp_path, monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.output import write_meta, write_transcript
+    from meetscribe.types import Utterance, Word
+
+    src = tmp_path / "meeting"
+    src.mkdir()
+    utts = [Utterance(0.0, 1.0, "spk_0", "system", "hello world",
+                      (Word("hello", 0.0, 0.5), Word("world", 0.5, 1.0)))]
+    write_transcript(src / "transcript.json", "M", 1.0, utts)
+    (src / "embeddings.npz").write_bytes(b"NPZ")
+    write_meta(src / "meta.json", {"meeting_id": "M", "format_version": 2, "cleaned": False})
+    original = (src / "transcript.json").read_text()
+
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(
+        pipeline, "build_components",
+        lambda models_dir, num_speakers=-1, cleanup=True: Components(
+            FakeVad(), FakeRecognizer(), FakeDiarizer(), FakeEmbedder(), UpperCleaner()
+        ),
+    )
+
+    assert pipeline.clean_existing(audio_dir=str(src)) == 0
+
+    out = tmp_path / "meeting-cleanup"
+    assert out.is_dir()
+    import json
+    doc = json.loads((out / "transcript.json").read_text())
+    assert doc["cleaned"] is True
+    assert doc["segments"][0]["text"] == "HELLO WORLD"          # cleaned
+    assert doc["segments"][0]["raw_text"] == "hello world"       # original preserved
+    assert (out / "embeddings.npz").read_bytes() == b"NPZ"       # copied verbatim
+    assert json.loads((out / "meta.json").read_text())["cleaned"] is True
+    assert (src / "transcript.json").read_text() == original     # ORIGINAL untouched
 
 
 def test_run_forwards_num_speakers_to_build_components(tmp_path, monkeypatch):

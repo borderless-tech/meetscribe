@@ -1,7 +1,10 @@
 # The shippable meetscribe wrapper (what-we-build.md §7.3). Beyond Nix itself the user needs
 # nothing preinstalled (except BlackHole on macOS): ffmpeg and the pinned models come from the
 # store, wired in via makeWrapper.
-{ lib, stdenv, makeWrapper, ffmpeg, venv, models }:
+# ``llama-cpp`` + ``hunspell`` are optional: only the ``meetscribe-llm`` variant (paired with a
+# models dir carrying llm/model.gguf + hunspell/) puts ``llama-server`` and ``hunspell`` on PATH
+# for the transcript-cleanup pass.
+{ lib, stdenv, makeWrapper, ffmpeg, venv, models, llama-cpp ? null, hunspell ? null }:
 
 stdenv.mkDerivation {
   pname = "meetscribe";
@@ -15,7 +18,9 @@ stdenv.mkDerivation {
     runHook preInstall
     install -Dm755 meetscribe $out/bin/meetscribe
     wrapProgram $out/bin/meetscribe \
-      --prefix PATH : ${lib.makeBinPath [ venv ffmpeg ]} \
+      --prefix PATH : ${lib.makeBinPath ([ venv ffmpeg ]
+        ++ lib.optional (llama-cpp != null) llama-cpp
+        ++ lib.optional (hunspell != null) hunspell)} \
       --set MEETSCRIBE_MODELS ${models}
     runHook postInstall
   '';

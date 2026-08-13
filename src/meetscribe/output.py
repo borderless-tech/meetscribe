@@ -14,10 +14,11 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
-from .types import Utterance
+from .types import Utterance, Word
 
 # Bumped whenever the on-disk artifact/meta shape changes (forward-compat lever).
-FORMAT_VERSION = 1
+# v2 adds per-segment ``raw_text`` and the top-level ``cleaned`` flag.
+FORMAT_VERSION = 2
 
 # (id, vector of shape (dim,), speaker)
 Turn = tuple[str, np.ndarray, str]
@@ -34,13 +35,17 @@ def build_meta(
     ended_at: str,
     duration_s: float,
     sample_rate: int = 16000,
+    cleaned: bool = False,
+    cleanup_model: dict | None = None,
 ) -> dict:
     """Assemble meta.json. ``models`` supplies the model names + embedding hash.
 
     ``started_at``/``ended_at`` are tz-aware ISO 8601 strings (with offset) — the
-    calendar-reconciliation match window.
+    calendar-reconciliation match window. ``cleanup_model`` (name + SHA-256 + params) travels
+    with the artifact when the LLM cleanup ran — text cleaned by different models isn't
+    equivalent, same rule as the embedding model identity.
     """
-    return {
+    meta = {
         "embedding_model": models["embedding_model"],
         "embedding_model_sha256": models["embedding_model_sha256"],
         "embedding_dim": embedding_dim,
@@ -52,8 +57,12 @@ def build_meta(
         "started_at": started_at,
         "ended_at": ended_at,
         "duration_s": duration_s,
+        "cleaned": cleaned,
         "format_version": FORMAT_VERSION,
     }
+    if cleanup_model is not None:
+        meta["cleanup_model"] = cleanup_model
+    return meta
 
 
 def default_bundle_name(meta: dict) -> str:
@@ -71,8 +80,22 @@ def _utterance_to_dict(u: Utterance) -> dict:
         "speaker": u.speaker,
         "track": u.track,
         "text": u.text,
+        "raw_text": u.raw_text or u.text,  # fallback: raw == text when no cleanup ran
         "words": [{"w": w.w, "start": w.start, "end": w.end} for w in u.words],
     }
+
+
+def _dict_to_utterance(seg: dict) -> Utterance:
+    return Utterance(
+        start=seg["start"],
+        end=seg["end"],
+        speaker=seg["speaker"],
+        track=seg["track"],
+        text=seg["text"],
+        words=tuple(Word(w["w"], w["start"], w["end"]) for w in seg["words"]),
+        # v1 back-compat: no raw_text → equals text. v2: preserve the original raw_text.
+        raw_text=seg.get("raw_text", seg["text"]),
+    )
 
 
 def write_transcript(
@@ -80,13 +103,27 @@ def write_transcript(
     meeting_id: str,
     duration_s: float,
     utterances: Sequence[Utterance],
+    cleaned: bool = False,
+    suggestions: Sequence[dict] | None = None,
 ) -> None:
     doc = {
         "meeting_id": meeting_id,
         "duration_s": duration_s,
+        "cleaned": cleaned,
+        # broken-word correction candidates for human review (borderless-knowledge); the
+        # transcript text is left raw — these are suggestions, not applied edits.
+        "suggestions": list(suggestions) if suggestions else [],
         "segments": [_utterance_to_dict(u) for u in utterances],
     }
-    Path(path).write_text(json.dumps(doc, indent=2))
+    Path(path).write_text(json.dumps(doc, indent=2, ensure_ascii=False))
+
+
+def read_transcript(path: str | Path) -> tuple[str, float, list[Utterance]]:
+    """Inverse of :func:`write_transcript`: rebuild ``(meeting_id, duration_s, utterances)``
+    with words/timings/raw_text reconstructed exactly. Used by the ``clean`` retrofit path."""
+    doc = json.loads(Path(path).read_text())
+    utts = [_dict_to_utterance(seg) for seg in doc["segments"]]
+    return doc["meeting_id"], doc["duration_s"], utts
 
 
 def _stack(vectors: Sequence[np.ndarray], dim: int) -> np.ndarray:
