@@ -29,6 +29,30 @@ def load(path: str | Path) -> list[str]:
     return out
 
 
+def base() -> list[str]:
+    """The shipped base glossary (common tech/office vocabulary)."""
+    from .glossary_base import BASE_TERMS
+
+    return list(BASE_TERMS)
+
+
+def effective(path: str | Path | None = None) -> list[str]:
+    """Base glossary ∪ the user's persistent glossary (case-insensitive dedup, base first).
+
+    This is what the flagger should use — the base list pre-empts common tech/office false
+    positives, the user file adds org/meeting-specific names.
+    """
+    user = load(path if path is not None else default_path())
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in base() + user:
+        k = t.casefold()
+        if k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out
+
+
 def append(path: str | Path, terms: list[str]) -> list[str]:
     """Append ``terms`` (case-insensitive dedup vs existing) and return the merged list."""
     p = Path(path)

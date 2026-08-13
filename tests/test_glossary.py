@@ -36,3 +36,18 @@ def test_append_empty_terms_is_noop(tmp_path):
 def test_default_path_honours_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert glossary.default_path() == tmp_path / "meetscribe" / "glossary.txt"
+
+
+def test_base_has_tech_and_officetalk_terms():
+    b = glossary.base()
+    for term in ["HubSpot", "Teams", "committen", "Onboarding", "PwC"]:
+        assert term in b
+
+
+def test_effective_merges_base_and_user_dedup(tmp_path):
+    p = tmp_path / "g.txt"
+    p.write_text("Borderless\nhubspot\n")  # 'hubspot' already in base (case-insensitive)
+    eff = glossary.effective(p)
+    assert "Borderless" in eff and "HubSpot" in eff
+    lowered = [t.lower() for t in eff]
+    assert lowered.count("hubspot") == 1  # not duplicated despite differing case

@@ -33,6 +33,18 @@ let
     url = "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/8911e8a47f92bac19d6f5c64a2e2095bd2f7d031/Qwen2.5-7B-Instruct-Q4_K_M.gguf";
     hash = "sha256-Zbj82Sr2tP76k1xiXRrCfqKdy27hRYnFWo8RXOqqFCM=";
   };
+  # German dictionary for the broken-word flagger. Frami/igerman98 (from the LibreOffice
+  # dictionaries repo, pinned by commit) — far better at compounds than nixpkgs' j3e de_DE
+  # (measured ~18% fewer false flags on real audio). en_US still comes from nixpkgs.
+  framiRev = "f2ff99058268502bdcf4cad25c1ca2935ad8aa7d";
+  framiAff = fetchurl {
+    url = "https://raw.githubusercontent.com/LibreOffice/dictionaries/${framiRev}/de/de_DE_frami.aff";
+    hash = "sha256-ZGvzMzrGnCPp15RTPuUkHW91XDWej+EKZI+HYTdD1ZQ=";
+  };
+  framiDic = fetchurl {
+    url = "https://raw.githubusercontent.com/LibreOffice/dictionaries/${framiRev}/de/de_DE_frami.dic";
+    hash = "sha256-TKPJWLDlVFkQmZvCRvZohAv47ePfjl5nkNBe3VpYbDg=";
+  };
 in
 # Assemble the layout the Python code expects under $MEETSCRIBE_MODELS:
 #   asr/{encoder,decoder,joiner}.int8.onnx + tokens.txt   (Parakeet-TDT)
@@ -48,9 +60,10 @@ runCommand "meetscribe-models${lib.optionalString withLlm "-llm"}" { } ''
   ${lib.optionalString withLlm ''
     mkdir -p $out/llm $out/hunspell
     cp ${llm} $out/llm/model.gguf
-    # de_DE + en_US dictionaries for the bilingual broken-word flagger (lexicon.py);
-    # DICPATH points here at runtime.
-    cp ${hunspellDicts.de_DE}/share/hunspell/* $out/hunspell/
+    # de (Frami/igerman98) + en_US dictionaries for the bilingual broken-word flagger
+    # (lexicon.py); DICPATH points here at runtime.
+    cp ${framiAff} $out/hunspell/de_DE.aff
+    cp ${framiDic} $out/hunspell/de_DE.dic
     cp ${hunspellDicts.en_US}/share/hunspell/* $out/hunspell/
   ''}
 ''

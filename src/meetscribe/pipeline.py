@@ -355,7 +355,7 @@ def run(
         from .cleanup import NullCleaner
 
         components.cleaner = NullCleaner()
-    glossary = glossary_mod.load(glossary_mod.default_path())
+    glossary = glossary_mod.effective()
     result = process(mic_wav, system_wav, components, reporter=reporter, glossary=glossary)
 
     spk_model = str(Path(models_dir) / "spk" / "model.onnx")
@@ -423,7 +423,7 @@ def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) ->
     meeting_id, duration_s, utterances = read_transcript(transcript)
     with reporter.stage("loading models"):
         components = build_components(models_dir, -1)
-    glossary = glossary_mod.load(glossary_mod.default_path())
+    glossary = glossary_mod.effective()
     utterances, cleaned, cleanup_model, suggestions = apply_cleanup(
         list(utterances), components.cleaner, glossary, reporter
     )
