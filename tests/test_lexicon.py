@@ -7,8 +7,8 @@ def _lex(de=(), en=(), glossary=()):
     de_set = {w.lower() for w in de}
     en_set = {w.lower() for w in en}
     return Lexicon(
-        spell_de=lambda w: w.lower() in de_set,
-        spell_en=lambda w: w.lower() in en_set,
+        spell_de=lambda ws: {w for w in ws if w.lower() in de_set},
+        spell_en=lambda ws: {w for w in ws if w.lower() in en_set},
         glossary=list(glossary),
     )
 

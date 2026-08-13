@@ -20,7 +20,8 @@ def _utt(text, words, track="system"):
 
 def _lex(known, glossary=()):
     kn = {w.lower() for w in known}
-    return Lexicon(spell_de=lambda w: w.lower() in kn, spell_en=lambda w: False, glossary=list(glossary))
+    return Lexicon(spell_de=lambda ws: {w for w in ws if w.lower() in kn},
+                   spell_en=lambda ws: set(), glossary=list(glossary))
 
 
 class FakeClient:
@@ -117,7 +118,7 @@ def test_collapses_echoes():
 
 def test_suggest_mode_flags_and_offers_candidates_without_applying():
     lex = _lex(known=["sagt", "bitte"])  # "Halllo" is broken
-    suggest_fn = lambda w: ["Hallo", "Hallöchen"] if w == "Halllo" else []
+    suggest_fn = lambda ws: {w: ["Hallo", "Hallöchen"] for w in ws if w == "Halllo"}
     client = FakeClient({"Halllo": "Hallo"})
     u = _utt("sagt Halllo bitte",
              [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
@@ -135,7 +136,7 @@ def test_suggest_mode_flags_and_offers_candidates_without_applying():
 def test_suggest_mode_collapses_echoes_and_skips_clean_words():
     lex = _lex(known=["und", "ja"])
     u = _utt("und und ja", [Word("und", 0.0, 0.1), Word("und", 0.1, 0.2), Word("ja", 0.3, 0.5)])
-    res = SuggestCleaner(lambda w: [], lex).clean([u], [], None)
+    res = SuggestCleaner(lambda ws: {}, lex).clean([u], [], None)
     assert res.echoes == 1 and res.suggestions == []
     assert [w.w for w in res.utterances[0].words] == ["und", "ja"]
 

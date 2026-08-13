@@ -2,9 +2,10 @@
 spell-checker and absent from the glossary.
 
 Bilingual because meetings mix German and English: a de-only checker over-flags valid
-English (``LinkedIn``, ``meeting``) as errors. The spell-checkers are injected callables
-(``word -> bool``) so unit tests need no hunspell binary — mirroring how the LLM boundary
-is injected elsewhere. Pure/deterministic; stdlib only.
+English (``LinkedIn``, ``meeting``). The spell-checkers are injected **batch** callables
+(``list[str] -> set[str]`` returning the known subset) so one hunspell call covers a whole
+utterance instead of a subprocess per word, and so unit tests need no hunspell binary.
+Pure/deterministic; stdlib only.
 """
 
 from __future__ import annotations
@@ -17,104 +18,103 @@ from typing import Callable, Iterable
 # ("Hallo,") is the same lexical item as the bare word.
 _STRIP = ".,;:!?…\"'`´()[]{}«»„“”‚‘’-–—"
 
-# Below this length a token is too ambiguous to judge (function words, initials); skipping
-# them keeps the flag list to genuinely suspect content words.
+# Below this length a token is too ambiguous to judge (function words, initials).
 _MIN_LEN = 3
+
+BatchCheck = Callable[[list[str]], "set[str]"]
+
+
+def _norm(word: str) -> str:
+    return word.strip().strip(_STRIP)
+
+
+def _wordlike(norm: str) -> bool:
+    """A token worth judging: long enough, has letters, and is a plain word (letters +
+    optional interior hyphen/apostrophe). Skips numbers, symbols, and ASR junk like
+    ``M<unk>A`` / ``KI-Use`` mixes that no dictionary could sensibly correct."""
+    if len(norm) < _MIN_LEN or not any(c.isalpha() for c in norm):
+        return False
+    return all(c.isalpha() or c in "-'" for c in norm)
 
 
 class Lexicon:
-    """Bilingual dictionary check backed by two injected spell-checkers + a glossary.
+    """Bilingual dictionary check backed by two injected batch spell-checkers + a glossary.
 
-    ``spell_de`` / ``spell_en`` are callables ``word -> bool``. ``glossary`` is a list of
-    domain names (people, products) that no general dictionary knows; matched
-    case-insensitively.
+    ``spell_de`` / ``spell_en`` are callables ``list[str] -> set[str]`` (the known subset).
+    ``glossary`` is domain names (people, products) no general dictionary knows — matched
+    case-insensitively, and the main lever for flag precision (fewer false flags on names).
     """
 
-    def __init__(
-        self,
-        spell_de: Callable[[str], bool],
-        spell_en: Callable[[str], bool],
-        glossary: Iterable[str],
-    ) -> None:
+    def __init__(self, spell_de: BatchCheck, spell_en: BatchCheck, glossary: Iterable[str]) -> None:
         self._spell_de = spell_de
         self._spell_en = spell_en
         self._glossary = {g.lower() for g in glossary}
 
     def is_known(self, word: str) -> bool:
-        """True if either dictionary accepts the (punctuation-stripped) token or it is in
-        the glossary (case-insensitive)."""
-        norm = word.strip().strip(_STRIP)
+        """True if either dictionary accepts the (stripped) token or it is in the glossary."""
+        norm = _norm(word)
         if not norm:
-            return True  # nothing lexical left to judge
+            return True
         if norm.lower() in self._glossary:
             return True
-        return self._spell_de(norm) or self._spell_en(norm)
+        return bool(self._spell_de([norm]) or self._spell_en([norm]))
 
     def flag_broken(self, words: list[str]) -> list[int]:
-        """Indices of wordlike tokens that no dictionary/glossary recognises.
-
-        Skips pure punctuation, pure numbers, and tokens shorter than ``_MIN_LEN``: those
-        are not the transcription errors we hunt for and only add noise.
-        """
-        broken: list[int] = []
-        for i, word in enumerate(words):
-            norm = word.strip().strip(_STRIP)
-            if len(norm) < _MIN_LEN:
-                continue
-            if not any(c.isalpha() for c in norm):  # pure numbers / symbols
-                continue
-            if not self.is_known(word):
-                broken.append(i)
-        return broken
+        """Indices of wordlike tokens that no dictionary/glossary recognises. Batches the
+        spell lookups (one call per language for the whole list)."""
+        candidates = [(i, _norm(w)) for i, w in enumerate(words)]
+        candidates = [(i, n) for i, n in candidates if _wordlike(n)]
+        ask = [n for _, n in candidates]
+        known = self._spell_de(ask) | self._spell_en(ask)
+        return [i for i, n in candidates if n not in known and n.lower() not in self._glossary]
 
 
 def build_hunspell_lexicon(dicpath: str, glossary: Iterable[str]) -> Lexicon:
-    """Wire a real ``Lexicon`` backed by the ``hunspell`` CLI (de_DE + en_US).
+    """Wire a real ``Lexicon`` backed by the ``hunspell`` CLI (de_DE + en_US), batched.
 
-    Each checker shells out to ``hunspell -d <lang> -l`` with ``DICPATH=<dicpath>`` in the
-    environment; ``-l`` lists the *misspelled* words on stdin, so a word is *known* exactly
-    when that output is empty. Not unit-tested (like the real LLM path elsewhere) — it needs
-    the hunspell binary and the dictionary files on disk.
+    Each checker shells out ONCE per call to ``hunspell -d <lang> -l`` (``DICPATH=<dicpath>``);
+    ``-l`` lists the misspelled words, so the known subset is ``input − misspelled``. Not
+    unit-tested (needs the binary + dictionaries), like the real LLM path elsewhere.
     """
     env = {**os.environ, "DICPATH": dicpath}
 
-    def _checker(lang: str) -> Callable[[str], bool]:
-        def check(word: str) -> bool:
+    def _checker(lang: str) -> BatchCheck:
+        def check(words: list[str]) -> set[str]:
+            if not words:
+                return set()
             res = subprocess.run(
                 ["hunspell", "-d", lang, "-l"],
-                input=word,
-                capture_output=True,
-                text=True,
-                env=env,
+                input="\n".join(words), capture_output=True, text=True, env=env,
             )
-            return res.stdout.strip() == ""
+            misspelled = set(res.stdout.split())
+            return set(words) - misspelled
 
         return check
 
-    return Lexicon(
-        spell_de=_checker("de_DE"),
-        spell_en=_checker("en_US"),
-        glossary=glossary,
-    )
+    return Lexicon(_checker("de_DE"), _checker("en_US"), glossary)
 
 
-def build_hunspell_suggester(dicpath: str) -> Callable[[str], list[str]]:
-    """A word -> sound-alike-candidates function via ``hunspell -a`` (de_DE + en_US).
+def build_hunspell_suggester(dicpath: str) -> Callable[[list[str]], "dict[str, list[str]]"]:
+    """A ``list[str] -> {word: candidates}`` function via one ``hunspell -a`` call (de+en).
 
-    hunspell's ``-a`` (ispell pipe) mode prints ``& <word> <n> <off>: c1, c2, …`` with its
-    ranked correction candidates for a misspelled word. We return that list — free, instant,
-    affix-expanded, bilingual. Not unit-tested (needs the binary + dictionaries), like above.
+    hunspell's ``-a`` (ispell pipe) mode prints ``& <word> <n> <off>: c1, c2, …`` per
+    misspelled input word with its ranked corrections — free, instant, affix-expanded,
+    bilingual. Batched (all words in one call). Not unit-tested (needs the binary + dicts).
     """
     env = {**os.environ, "DICPATH": dicpath}
 
-    def suggest(word: str) -> list[str]:
+    def suggest(words: list[str]) -> dict[str, list[str]]:
+        if not words:
+            return {}
         res = subprocess.run(
             ["hunspell", "-d", "de_DE,en_US", "-a"],
-            input=word, capture_output=True, text=True, env=env,
+            input="\n".join(words), capture_output=True, text=True, env=env,
         )
+        out: dict[str, list[str]] = {}
         for line in res.stdout.splitlines():
             if line.startswith("& ") and ":" in line:
-                return [c.strip() for c in line.split(":", 1)[1].split(",") if c.strip()]
-        return []
+                word = line.split()[1]
+                out[word] = [c.strip() for c in line.split(":", 1)[1].split(",") if c.strip()]
+        return out
 
     return suggest

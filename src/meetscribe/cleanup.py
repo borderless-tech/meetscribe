@@ -197,13 +197,15 @@ class SuggestCleaner:
         for seg, u in enumerate(utterances):
             words, removed = collapse_echoes(list(u.words), self._max_gap)
             total_echo += removed
-            for j in self._lex.flag_broken([w.w for w in words]):
+            flagged = self._lex.flag_broken([w.w for w in words])
+            hun_map = self._suggest([words[j].w for j in flagged]) if flagged else {}
+            for j in flagged:
                 w = words[j]
                 llm = None
                 if self._client is not None:
                     llm = _first_word(self._client.complete(
                         build_span_prompt(words, j, glossary), max_tokens=_SPAN_MAX_TOKENS))
-                cand = gather_candidates(w.w, self._suggest(w.w), llm, self._max)
+                cand = gather_candidates(w.w, hun_map.get(w.w, []), llm, self._max)
                 if cand.candidates:
                     suggestions.append({
                         "segment": seg, "word_index": j, "start": w.start, "end": w.end,
