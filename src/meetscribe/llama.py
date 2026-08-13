@@ -117,12 +117,12 @@ class LlamaClient:
         self.timeout = timeout
         self._post = _post or self._http_post
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str, max_tokens: int | None = None) -> str:
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
             "seed": self.seed,
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
         data = self._post(f"{self.base_url}/v1/chat/completions", payload)
         return data["choices"][0]["message"]["content"]

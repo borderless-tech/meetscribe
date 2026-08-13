@@ -37,6 +37,20 @@ def test_client_complete_parses_chat_response():
     assert seen["payload"]["temperature"] == 0.0  # deterministic
 
 
+def test_client_max_tokens_override():
+    seen = {}
+
+    def post(url, payload):
+        seen["payload"] = payload
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    client = LlamaClient("http://127.0.0.1:9999", max_tokens=512, _post=post)
+    client.complete("hi", max_tokens=64)          # per-call override
+    assert seen["payload"]["max_tokens"] == 64
+    client.complete("hi")                          # falls back to the default
+    assert seen["payload"]["max_tokens"] == 512
+
+
 def test_server_terminates_on_exception():
     class FakeProc:
         def __init__(self):

@@ -6,7 +6,23 @@ from meetscribe.cleanup import (
     NullCleaner,
     accept_candidate,
     build_prompt,
+    token_budget,
 )
+
+
+# ---- token_budget (per-segment generation cap) --------------------------------------
+
+def test_token_budget_floor_for_short_text():
+    assert token_budget("") == 64
+    assert token_budget("uh the the") == 64
+
+
+def test_token_budget_proportional_for_medium_text():
+    assert token_budget("x" * 400) == 216  # len//2 + 16
+
+
+def test_token_budget_capped_for_long_text():
+    assert token_budget("x" * 4000) == 512  # never exceeds the old flat default
 
 
 # ---- accept_candidate (pure guard) --------------------------------------------------
@@ -60,9 +76,11 @@ class FakeClient:
     def __init__(self, mapping):
         self.mapping = mapping
         self.calls = []
+        self.budgets = []
 
-    def complete(self, prompt):
+    def complete(self, prompt, max_tokens=None):
         self.calls.append(prompt)
+        self.budgets.append(max_tokens)
         for key, val in self.mapping.items():
             if key in prompt:
                 return val
@@ -99,9 +117,18 @@ def test_llama_cleaner_passes_glossary_and_context():
     assert "seg one" in p and "seg-two" in p  # prior (cleaned) line as context + current
 
 
+def test_llama_cleaner_caps_tokens_per_segment():
+    # Each segment requests only ~its own length of generation, not a flat 512 → the
+    # long tail of slow CPU calls collapses.
+    client = FakeClient({})
+    LlamaCleaner(client).clean(["short one", "x" * 400], [], None)
+    assert client.budgets == [token_budget("short one"), token_budget("x" * 400)]
+    assert client.budgets[0] == 64 and client.budgets[1] == 216
+
+
 def test_llama_cleaner_survives_client_error():
     class Boom:
-        def complete(self, prompt):
+        def complete(self, prompt, max_tokens=None):
             raise RuntimeError("server died")
 
     rep = RecordingReporter()

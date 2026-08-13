@@ -26,7 +26,16 @@ _MIN_LEN_FOR_COLLAPSE = 40
 
 
 class LlamaClient(Protocol):
-    def complete(self, prompt: str) -> str: ...
+    def complete(self, prompt: str, max_tokens: int | None = None) -> str: ...
+
+
+def token_budget(text: str) -> int:
+    """Per-segment generation cap ≈ twice the input's token estimate (~4 chars/token), with a
+    floor for short backchannels and a ceiling. A cleaned segment is ~as long as its input, so
+    capping generation to just above it — instead of a flat 512 — collapses the slow-call tail
+    on CPU without truncating legitimate corrections."""
+    est = len(text) // 2 + 16  # (len/4 tokens) * 2 + margin
+    return max(64, min(est, 512))
 
 
 @dataclass
@@ -100,7 +109,9 @@ class LlamaCleaner:
         for text in texts:
             candidate: str | None = None
             try:
-                candidate = self._client.complete(build_prompt(glossary, prev, text))
+                candidate = self._client.complete(
+                    build_prompt(glossary, prev, text), max_tokens=token_budget(text)
+                )
             except Exception as exc:  # server died / timeout → keep raw, don't abort the run
                 if reporter is not None and not warned:
                     reporter.warn(f"cleanup: LLM call failed ({exc}); keeping raw text")
