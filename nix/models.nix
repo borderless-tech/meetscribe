@@ -7,7 +7,7 @@
 # ``withLlm`` adds the transcript-cleanup GGUF under ``llm/model.gguf``. It is a SEPARATE,
 # opt-in output (``packages.models-llm`` / ``meetscribe-llm``) so the default closure and CI
 # stay lean — a machine without it just produces an uncleaned transcript (graceful fallback).
-{ lib, fetchurl, runCommand, withLlm ? false }:
+{ lib, fetchurl, runCommand, hunspellDicts, withLlm ? false }:
 
 let
   asr = fetchurl {
@@ -46,7 +46,11 @@ runCommand "meetscribe-models${lib.optionalString withLlm "-llm"}" { } ''
   cp ${speaker} $out/spk/model.onnx
   cp ${vad}     $out/vad/silero_vad.onnx
   ${lib.optionalString withLlm ''
-    mkdir -p $out/llm
+    mkdir -p $out/llm $out/hunspell
     cp ${llm} $out/llm/model.gguf
+    # de_DE + en_US dictionaries for the bilingual broken-word flagger (lexicon.py);
+    # DICPATH points here at runtime.
+    cp ${hunspellDicts.de_DE}/share/hunspell/* $out/hunspell/
+    cp ${hunspellDicts.en_US}/share/hunspell/* $out/hunspell/
   ''}
 ''

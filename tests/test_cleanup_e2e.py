@@ -12,18 +12,20 @@ import shutil
 import pytest
 
 MODELS = os.environ.get("MEETSCRIBE_MODELS")
-_HAS_LLM = (
+_HAS = (
     bool(MODELS)
     and os.path.exists(os.path.join(MODELS or "", "llm", "model.gguf"))
+    and os.path.isdir(os.path.join(MODELS or "", "hunspell"))
     and shutil.which("llama-server") is not None
+    and shutil.which("hunspell") is not None
 )
 
 pytestmark = pytest.mark.skipif(
-    not _HAS_LLM, reason="cleanup GGUF / llama-server not available (models-llm output)"
+    not _HAS, reason="models-llm (gguf+hunspell) / llama-server / hunspell not available"
 )
 
 
-def test_cleanup_corrects_garbled_term_and_preserves_timings():
+def test_cleanup_repairs_garbled_span_and_preserves_timings():
     from meetscribe.pipeline import apply_cleanup, build_components
     from meetscribe.progress import NullReporter
     from meetscribe.types import Utterance, Word
@@ -39,6 +41,8 @@ def test_cleanup_corrects_garbled_term_and_preserves_timings():
 
     assert cleaned is True
     assert model and model["name"].startswith("Qwen2.5")
-    assert utts[0].words == words                       # timings byte-identical
     assert utts[0].raw_text == "wir arbeiten bei Borderles"  # original preserved
-    assert "Borderless" in utts[0].text                 # garbled term corrected via glossary
+    assert "Borderless" in utts[0].text                      # garble repaired via glossary
+    # only the flagged word's TEXT changed; its timestamps (and the others) are intact
+    assert utts[0].words[3].start == 1.2 and utts[0].words[3].end == 2.0
+    assert [w.w for w in utts[0].words[:3]] == ["wir", "arbeiten", "bei"]

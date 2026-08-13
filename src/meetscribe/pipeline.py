@@ -180,25 +180,19 @@ def process(
 
 
 def apply_cleanup(utterances, cleaner, glossary, reporter):
-    """Rewrite only system-track ``text`` via the cleaner, stashing the original in
-    ``raw_text``; timings untouched. The mic ('me') track is the clean user audio and passes
-    through. Returns ``(utterances, cleaned, cleanup_model)``. Shared by ``process()`` and the
-    ``clean`` retrofit path."""
-    from dataclasses import replace
-
+    """Repair only system-track utterances via the cleaner (echo-collapse + guarded span
+    repair), which stashes the original in ``raw_text``; timings untouched. The mic ('me')
+    track is the clean user audio and passes through. Returns ``(utterances, cleaned,
+    cleanup_model)``. Shared by ``process()`` and the ``clean`` retrofit path."""
     sys_idx = [i for i, u in enumerate(utterances) if u.track == "system"]
     if not sys_idx:
         return utterances, False, None
-    with reporter.stage("cleanup (llm)"):
-        res = cleaner.clean([utterances[i].text for i in sys_idx], glossary, reporter)
+    with reporter.stage("cleanup (repair)"):
+        res = cleaner.clean([utterances[i] for i in sys_idx], glossary, reporter)
     for j, i in enumerate(sys_idx):
-        u = utterances[i]
-        utterances[i] = replace(u, text=res.texts[j], raw_text=u.text)
+        utterances[i] = res.utterances[j]
     if not res.active:
         return utterances, False, None
-    reporter.info(
-        f"cleaned {res.cleaned}/{len(sys_idx)} system segments ({res.kept_raw} kept raw)"
-    )
     return utterances, True, getattr(cleaner, "model_info", None)
 
 
@@ -264,7 +258,7 @@ def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = Tr
     output); if it's absent the cleaner degrades to a no-op at clean() time (warn + raw text),
     so a machine without the LLM model simply produces an uncleaned transcript."""
     from .asr import ParakeetRecognizer
-    from .cleanup import ManagedLlamaCleaner, NullCleaner
+    from .cleanup import ManagedSpanRepairCleaner, NullCleaner
     from .diarize import OfflineDiarizer
     from .embed import SpeakerEmbedder
     from .vad import SileroVad
@@ -275,8 +269,9 @@ def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = Tr
     if cleanup:
         gguf = m / "llm" / "model.gguf"
         if gguf.exists():  # opt-in models-llm output; absent → stay a no-op (uncleaned)
-            cleaner = ManagedLlamaCleaner(
+            cleaner = ManagedSpanRepairCleaner(
                 str(gguf),
+                str(m / "hunspell"),  # de_DE/en_US dicts shipped in the models-llm output
                 {
                     "name": "Qwen2.5-7B-Instruct-Q4_K_M",
                     "sha256": _sha256(str(gguf)),

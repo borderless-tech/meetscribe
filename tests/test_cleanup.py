@@ -1,88 +1,38 @@
-"""LLM cleanup orchestration + anti-hallucination guards (no real model)."""
+"""Flag-then-repair cleanup: NullCleaner, span-prompt, SpanRepairCleaner, managed fallback.
+
+The LLM client and lexicon are injected, so no model/hunspell is needed here.
+"""
 
 from meetscribe.cleanup import (
-    LlamaCleaner,
-    ManagedLlamaCleaner,
+    ManagedSpanRepairCleaner,
     NullCleaner,
-    accept_candidate,
-    build_prompt,
-    token_budget,
+    SpanRepairCleaner,
+    build_span_prompt,
 )
+from meetscribe.lexicon import Lexicon
+from meetscribe.types import Utterance, Word
 
 
-# ---- token_budget (per-segment generation cap) --------------------------------------
-
-def test_token_budget_floor_for_short_text():
-    assert token_budget("") == 64
-    assert token_budget("uh the the") == 64
+def _utt(text, words, track="system"):
+    return Utterance(words[0].start, words[-1].end, "spk_0", track, text, tuple(words))
 
 
-def test_token_budget_proportional_for_medium_text():
-    assert token_budget("x" * 400) == 216  # len//2 + 16
+def _lex(known, glossary=()):
+    kn = {w.lower() for w in known}
+    return Lexicon(spell_de=lambda w: w.lower() in kn, spell_en=lambda w: False, glossary=list(glossary))
 
-
-def test_token_budget_capped_for_long_text():
-    assert token_budget("x" * 4000) == 512  # never exceeds the old flat default
-
-
-# ---- accept_candidate (pure guard) --------------------------------------------------
-
-def test_accept_good_correction():
-    assert accept_candidate("Borderlestern GmbH", "Borderless GmbH")
-
-
-def test_reject_empty_candidate():
-    assert not accept_candidate("Borderless GmbH", "")
-    assert not accept_candidate("Borderless GmbH", "   ")
-
-
-def test_reject_empty_input():
-    # No input to correct → never inject LLM text.
-    assert not accept_candidate("", "anything")
-
-
-def test_reject_runaway_over_3x():
-    assert not accept_candidate("hi there", "ha " * 40)
-
-
-def test_reject_collapse_only_for_long_inputs():
-    long = "this is a genuinely long original sentence with plenty of words here"  # >40 chars
-    assert not accept_candidate(long, "a")                       # <0.3× → collapse, rejected
-    # short backchannel legitimately collapses: "uh the the" -> "the"
-    assert accept_candidate("uh the the", "the")                 # input <=40 chars → allowed
-
-
-# ---- prompt construction ------------------------------------------------------------
-
-def test_build_prompt_includes_glossary_context_and_current():
-    p = build_prompt(["Borderless", "Georg"], prev="hello there", current="borderles stuff")
-    assert "Borderless" in p and "Georg" in p
-    assert "hello there" in p          # previous-segment context
-    assert "borderles stuff" in p      # the text to fix
-
-
-# ---- NullCleaner --------------------------------------------------------------------
-
-def test_null_cleaner_is_identity_and_inactive():
-    res = NullCleaner().clean(["a", "b"], [], None)
-    assert res.texts == ["a", "b"]
-    assert res.active is False
-    assert res.cleaned == 0 and res.kept_raw == 0
-
-
-# ---- LlamaCleaner (fake client) -----------------------------------------------------
 
 class FakeClient:
+    """Returns a scripted correction based on the marked word in the span prompt."""
+
     def __init__(self, mapping):
         self.mapping = mapping
         self.calls = []
-        self.budgets = []
 
     def complete(self, prompt, max_tokens=None):
         self.calls.append(prompt)
-        self.budgets.append(max_tokens)
         for key, val in self.mapping.items():
-            if key in prompt:
+            if f"«{key}" in prompt or f"«{key}»" in prompt:
                 return val
         return "UNMATCHED"
 
@@ -90,55 +40,79 @@ class FakeClient:
 class RecordingReporter:
     def __init__(self):
         self.warns = []
+        self.infos = []
+
+    def info(self, msg):
+        self.infos.append(msg)
 
     def warn(self, msg):
         self.warns.append(msg)
 
 
-def test_llama_cleaner_applies_good_keeps_guarded():
-    client = FakeClient({"Borderlestern": "Borderless.", "runaway": "na " * 99})
-    rep = RecordingReporter()
-    res = LlamaCleaner(client).clean(
-        ["Borderlestern", "runaway text that is quite long here"], ["Borderless"], rep
-    )
-    assert res.texts[0] == "Borderless."                              # applied
-    assert res.texts[1] == "runaway text that is quite long here"     # guard kept raw
-    assert res.cleaned == 1 and res.kept_raw == 1
-    assert res.active is True
-    assert rep.warns  # a guard trip was surfaced
+# ---- NullCleaner --------------------------------------------------------------------
+
+def test_null_cleaner_unchanged_and_inactive():
+    u = _utt("hello world", [Word("hello", 0.0, 0.5), Word("world", 0.5, 1.0)])
+    res = NullCleaner().clean([u], [], None)
+    assert res.utterances == [u]
+    assert res.active is False and res.fixed == 0 and res.echoes == 0
 
 
-def test_llama_cleaner_passes_glossary_and_context():
-    # seg one maps to itself → the cleaned previous line ("seg one") is the context for seg two
-    client = FakeClient({"seg one": "seg one", "seg-two": "cleaned two"})
-    LlamaCleaner(client).clean(["seg one", "seg-two"], ["Borderless", "Georg"], None)
-    p = client.calls[1]
-    assert "Borderless" in p and "Georg" in p
-    assert "seg one" in p and "seg-two" in p  # prior (cleaned) line as context + current
+# ---- build_span_prompt --------------------------------------------------------------
+
+def test_span_prompt_marks_word_with_context_and_glossary():
+    words = [Word("du", 0, 0.3), Word("als", 0.4, 0.7), Word("Ertier", 0.8, 1.5),
+             Word("hier", 1.6, 1.9)]
+    p = build_span_prompt(words, 2, ["Borderless"])
+    assert "«Ertier»" in p and "du als" in p and "hier" in p and "Borderless" in p
 
 
-def test_llama_cleaner_caps_tokens_per_segment():
-    # Each segment requests only ~its own length of generation, not a flat 512 → the
-    # long tail of slow CPU calls collapses.
-    client = FakeClient({})
-    LlamaCleaner(client).clean(["short one", "x" * 400], [], None)
-    assert client.budgets == [token_budget("short one"), token_budget("x" * 400)]
-    assert client.budgets[0] == 64 and client.budgets[1] == 216
+# ---- SpanRepairCleaner --------------------------------------------------------------
+
+def test_repairs_flagged_word_preserving_timestamps():
+    lex = _lex(known=["sagt", "Hallo", "bitte"])
+    client = FakeClient({"Halllo": "Hallo"})
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
+    res = SpanRepairCleaner(client, lex).clean([u], [], None)
+    out = res.utterances[0]
+    assert out.words[1] == Word("Hallo", 0.4, 0.9)  # text fixed, timestamps preserved
+    assert out.text == "sagt Hallo bitte"
+    assert out.raw_text == "sagt Halllo bitte"
+    assert res.fixed == 1 and res.active is True
 
 
-def test_llama_cleaner_survives_client_error():
-    class Boom:
-        def complete(self, prompt, max_tokens=None):
-            raise RuntimeError("server died")
-
-    rep = RecordingReporter()
-    res = LlamaCleaner(Boom()).clean(["keep me"], [], rep)
-    assert res.texts == ["keep me"]
-    assert res.kept_raw == 1 and res.cleaned == 0
-    assert res.active is True
+def test_guard_rejects_acoustically_distant_correction():
+    lex = _lex(known=["sagt", "Hallo", "bitte", "Tschüss"])
+    client = FakeClient({"Halllo": "Tschüss"})  # a real word but nothing like "Halllo"
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
+    res = SpanRepairCleaner(client, lex).clean([u], [], None)
+    assert res.utterances[0].words[1].w == "Halllo"  # kept raw
+    assert res.fixed == 0
 
 
-# ---- ManagedLlamaCleaner (server lifecycle mocked) ----------------------------------
+def test_guard_rejects_non_word_even_if_close():
+    lex = _lex(known=["sagt", "bitte"])  # "Hallllo" is NOT known
+    client = FakeClient({"Halllo": "Hallllo"})  # close but not a real word
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
+    res = SpanRepairCleaner(client, lex).clean([u], [], None)
+    assert res.utterances[0].words[1].w == "Halllo"  # dictionary vetoes it
+    assert res.fixed == 0
+
+
+def test_collapses_echoes():
+    lex = _lex(known=["und", "ja"])
+    u = _utt("und und und ja",
+             [Word("und", 0.0, 0.1), Word("und", 0.1, 0.2), Word("und", 0.2, 0.3),
+              Word("ja", 0.4, 0.6)])
+    res = SpanRepairCleaner(FakeClient({}), lex).clean([u], [], None)
+    assert res.echoes == 2
+    assert [w.w for w in res.utterances[0].words] == ["und", "ja"]
+
+
+# ---- ManagedSpanRepairCleaner -------------------------------------------------------
 
 class _FakeServer:
     base_url = "http://127.0.0.1:0"
@@ -150,22 +124,28 @@ class _FakeServer:
         return False
 
 
-def test_managed_cleaner_delegates_on_success():
-    cleaner = ManagedLlamaCleaner(
-        "m.gguf", model_info={"name": "q"},
+def test_managed_delegates_on_success():
+    lex = _lex(known=["sagt", "Hallo", "bitte"])
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
+    cleaner = ManagedSpanRepairCleaner(
+        "m.gguf", "dic", model_info={"name": "q"},
         _server=lambda: _FakeServer(),
-        _client=lambda url: FakeClient({"borderles": "Borderless"}),
+        _client=lambda url: FakeClient({"Halllo": "Hallo"}),
+        _lexicon=lex,
     )
-    res = cleaner.clean(["borderles"], ["Borderless"], None)
-    assert res.texts == ["Borderless"] and res.active is True
+    res = cleaner.clean([u], [], None)
+    assert res.utterances[0].text == "sagt Hallo bitte" and res.active is True
 
 
-def test_managed_cleaner_falls_back_when_server_unavailable():
+def test_managed_falls_back_when_backend_unavailable():
     def boom():
-        raise RuntimeError("llama-server not found")
+        raise RuntimeError("no llama-server")
 
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
     rep = RecordingReporter()
-    res = ManagedLlamaCleaner("missing.gguf", _server=boom).clean(["keep"], [], rep)
-    assert res.texts == ["keep"]          # raw text preserved
-    assert res.active is False            # → meta stays cleaned:false
+    res = ManagedSpanRepairCleaner("m", "dic", _server=boom, _lexicon=_lex(known=[])).clean(
+        [u], [], rep)
+    assert res.utterances == [u] and res.active is False
     assert rep.warns and "skipped" in rep.warns[0]

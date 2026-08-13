@@ -125,7 +125,7 @@
           venv = runtimeVenv;
           ffmpeg = pkgs.ffmpeg;
           models = modelsLlm;
-          inherit (pkgs) llama-cpp;
+          inherit (pkgs) llama-cpp hunspell;
         };
         doctorApp = pkgs.writeShellScript "meetscribe-doctor" ''
           exec ${meetscribe}/bin/meetscribe doctor "$@"

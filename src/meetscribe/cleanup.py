@@ -1,160 +1,158 @@
-"""Glossary-informed LLM cleanup of transcript text (see docs/plans/…-cleanup-design.md).
+"""Flag-then-repair transcript cleanup (see docs/plans/2026-08-13-asr-artifact-repair.md).
 
-The cleaner fixes garbled proper nouns / spelling from *context* + a known-terms glossary,
-restores punctuation, and lightly smooths disfluencies. It is injected as a pipeline component
-(:class:`NullCleaner` is the default so the unit suite stays LLM-free); the real
-:class:`LlamaCleaner` drives a ``LlamaClient`` (a managed ``llama-server``, see ``llama.py``).
+The defects in these transcripts are ASR *decoder artifacts* — echo loops and garbled
+words — not language errors, so we do NOT rewrite whole segments with an LLM (slow,
+decode-bound, and it invents/over-corrects). Instead, per system-track utterance:
 
-Only ``segment.text`` is ever rewritten — per-word timings are untouched — so the worst case
-degrades, per segment, to the raw ASR text. Two anti-hallucination guards keep an LLM meltdown
-from corrupting the transcript: an empty candidate and a length ratio outside sane bounds are
-rejected in favour of the raw text.
+1. **echo collapse** (deterministic, ``echo.py``): drop decoder-loop repeats (gap≈0).
+2. **flag** broken words (``lexicon.py``): tokens unknown to both de+en + not in glossary.
+3. **repair** only those spans (``repair.py``): the LLM proposes a single word from context,
+   applied only if it is *both* acoustically close to the ASR form *and* a real word
+   (``phonetic`` + ``is_known``) — otherwise the raw word is kept.
+
+Timestamps are never touched; only word text changes. The LLM client and the dictionary
+are injected, so :class:`SpanRepairCleaner` is unit-tested with fakes; :class:`NullCleaner`
+(the default) is a no-op so the suite stays model-free.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
-# A candidate longer than this multiple of the input is a runaway generation.
-_MAX_RATIO = 3.0
-# A candidate shorter than this multiple is a collapse — but only trusted as a signal on
-# inputs long enough that a big shrink is genuinely suspicious (short backchannels like
-# "uh the the" → "the" are legitimate large-ratio shrinks).
-_MIN_RATIO = 0.3
-_MIN_LEN_FOR_COLLAPSE = 40
+from .echo import collapse_echoes
+from .lexicon import Lexicon
+from .repair import is_valid_correction, repair_words
+from .types import Utterance
+
+# A correction must sound within this acoustic distance of the ASR word (else keep raw).
+MAX_DISTANCE = 0.5
+# Generating a single replacement word never needs many tokens.
+_SPAN_MAX_TOKENS = 16
 
 
 class LlamaClient(Protocol):
     def complete(self, prompt: str, max_tokens: int | None = None) -> str: ...
 
 
-def token_budget(text: str) -> int:
-    """Per-segment generation cap ≈ twice the input's token estimate (~4 chars/token), with a
-    floor for short backchannels and a ceiling. A cleaned segment is ~as long as its input, so
-    capping generation to just above it — instead of a flat 512 — collapses the slow-call tail
-    on CPU without truncating legitimate corrections."""
-    est = len(text) // 2 + 16  # (len/4 tokens) * 2 + margin
-    return max(64, min(est, 512))
-
-
 @dataclass
-class CleanResult:
-    texts: list[str]
-    cleaned: int
-    kept_raw: int
+class RepairResult:
+    utterances: list[Utterance]
+    fixed: int  # broken words repaired
+    echoes: int  # echo tokens collapsed
     active: bool  # did a real (non-Null) cleaner run? → drives meta's `cleaned` flag
 
 
 class Cleaner(Protocol):
-    def clean(self, texts: list[str], glossary: list[str], reporter) -> CleanResult: ...
-
-
-def accept_candidate(original: str, candidate: str) -> bool:
-    """True if ``candidate`` is a safe replacement for ``original`` (else keep raw)."""
-    cand = candidate.strip()
-    if not cand:
-        return False
-    n0 = len(original.strip())
-    if n0 == 0:
-        return False  # nothing to correct → never inject LLM text
-    ratio = len(cand) / n0
-    if ratio > _MAX_RATIO:
-        return False  # runaway generation
-    if n0 > _MIN_LEN_FOR_COLLAPSE and ratio < _MIN_RATIO:
-        return False  # collapse on a substantial segment
-    return True
-
-
-_SYSTEM = (
-    "You are a transcription cleanup tool. Correct obvious ASR errors — spelling, "
-    "split/merged words, and misrecognized names using the glossary — and restore "
-    "punctuation and capitalization. Do NOT translate, summarize, paraphrase, or add "
-    "anything. Keep the original language. If the text is already fine, return it unchanged. "
-    "Output only the corrected text, nothing else."
-)
-
-
-def build_prompt(glossary: list[str], prev: str, current: str) -> str:
-    """Assemble the cleanup instruction. The real client wraps this in the model's chat
-    template (ChatML for Qwen); tests only assert the pieces are present."""
-    gloss = ", ".join(glossary) if glossary else "(none)"
-    ctx = prev.strip() or "(start of meeting)"
-    return (
-        f"{_SYSTEM}\n\n"
-        f"Known correct spellings (fix misspellings of these): {gloss}\n\n"
-        f"Previous line (context, do not edit or repeat):\n{ctx}\n\n"
-        f"Line to correct:\n{current}"
-    )
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> RepairResult: ...
 
 
 class NullCleaner:
-    """No-op cleaner (default). Returns text unchanged; marks the run inactive."""
+    """No-op cleaner (default): returns utterances unchanged, marks the run inactive."""
 
-    def clean(self, texts: list[str], glossary: list[str], reporter) -> CleanResult:
-        return CleanResult(texts=list(texts), cleaned=0, kept_raw=0, active=False)
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> RepairResult:
+        return RepairResult(list(utterances), fixed=0, echoes=0, active=False)
 
 
-class LlamaCleaner:
-    """Per-segment cleanup via an injected :class:`LlamaClient`."""
+_SPAN_SYSTEM = (
+    "A German meeting transcript sentence has ONE possibly-garbled word marked with «». "
+    "If it is already a real word (including a name or English term), return it unchanged. "
+    "Otherwise replace it with the single correct word. Output ONLY that one word, nothing else."
+)
 
-    def __init__(self, client: LlamaClient) -> None:
+
+def build_span_prompt(words: list, i: int, glossary: list[str], window: int = 8) -> str:
+    """Prompt to repair the single word at index ``i``, with ±``window`` words of context."""
+    left = " ".join(w.w for w in words[max(0, i - window):i])
+    right = " ".join(w.w for w in words[i + 1:i + 1 + window])
+    gloss = ", ".join(glossary) if glossary else "(none)"
+    return (
+        f"{_SPAN_SYSTEM}\nKnown names: {gloss}\n"
+        f"Sentence: {left} «{words[i].w}» {right}"
+    )
+
+
+def _first_word(text: str) -> str:
+    parts = text.split()
+    return parts[0].strip(".,?!:;«»\"'") if parts else text.strip()
+
+
+class SpanRepairCleaner:
+    """Echo-collapse + flag + guarded span repair over system-track utterances.
+
+    ``client`` (LLM) and ``lexicon`` (dictionary) are injected. Rebuilds each utterance's
+    ``text`` from its (collapsed + repaired) words and stashes the original in ``raw_text``.
+    """
+
+    def __init__(self, client: LlamaClient, lexicon: Lexicon,
+                 max_distance: float = MAX_DISTANCE, max_gap: float = 0.02) -> None:
         self._client = client
+        self._lex = lexicon
+        self._max_distance = max_distance
+        self._max_gap = max_gap
 
-    def clean(self, texts: list[str], glossary: list[str], reporter) -> CleanResult:
-        out: list[str] = []
-        cleaned = kept_raw = 0
-        warned = False
-        prev = ""
-        for text in texts:
-            candidate: str | None = None
-            try:
-                candidate = self._client.complete(
-                    build_prompt(glossary, prev, text), max_tokens=token_budget(text)
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> RepairResult:
+        out: list[Utterance] = []
+        total_fixed = total_echo = 0
+        for u in utterances:
+            words, removed = collapse_echoes(list(u.words), self._max_gap)
+            total_echo += removed
+            flagged = self._lex.flag_broken([w.w for w in words])
+
+            def correct_fn(i: int, ws: list) -> str:
+                return _first_word(
+                    self._client.complete(build_span_prompt(ws, i, glossary),
+                                          max_tokens=_SPAN_MAX_TOKENS)
                 )
-            except Exception as exc:  # server died / timeout → keep raw, don't abort the run
-                if reporter is not None and not warned:
-                    reporter.warn(f"cleanup: LLM call failed ({exc}); keeping raw text")
-                    warned = True
-            if candidate is not None and accept_candidate(text, candidate):
-                out.append(candidate.strip())
-                cleaned += 1
-            else:
-                if candidate is not None and reporter is not None and not warned:
-                    reporter.warn("cleanup: rejected an implausible LLM output; keeping raw text")
-                    warned = True
-                out.append(text)
-                kept_raw += 1
-            prev = out[-1]
-        return CleanResult(texts=out, cleaned=cleaned, kept_raw=kept_raw, active=True)
+
+            def accept_fn(asr: str, cand: str) -> bool:
+                return is_valid_correction(asr, cand, self._max_distance, self._lex.is_known)
+
+            words, fixed = repair_words(words, flagged, correct_fn, accept_fn)
+            total_fixed += fixed
+            text = " ".join(w.w for w in words)  # rebuild from collapsed+repaired words
+            out.append(replace(u, text=text, words=tuple(words), raw_text=u.text))
+        if reporter is not None:
+            reporter.info(
+                f"repaired {total_fixed} word(s), collapsed {total_echo} echo(es) "
+                f"across {len(utterances)} segment(s)"
+            )
+        return RepairResult(out, fixed=total_fixed, echoes=total_echo, active=True)
 
 
-class ManagedLlamaCleaner:
-    """Real cleaner: spins up a ``llama-server`` for the duration of the pass, delegates the
-    per-segment work to :class:`LlamaCleaner`, and tears the server down. If the server can't
-    start (binary/model/port unavailable) it degrades gracefully — a `warn` plus the raw text,
-    marked inactive so meta stays ``cleaned:false``. ``model_info`` (name/sha/params) is read
-    by the pipeline into meta.json when the pass actually runs."""
+class ManagedSpanRepairCleaner:
+    """Real cleaner: builds the hunspell lexicon (with the runtime glossary), spins up a
+    ``llama-server``, delegates to :class:`SpanRepairCleaner`, tears the server down. If the
+    server or dictionaries are unavailable it degrades gracefully — a `warn` + unchanged
+    utterances marked inactive (so meta stays ``cleaned:false``)."""
 
-    def __init__(self, model_path: str, model_info: dict | None = None, threads: int = 4,
-                 _server=None, _client=None) -> None:
+    def __init__(self, model_path: str, dicpath: str, model_info: dict | None = None,
+                 threads: int = 4, _server=None, _client=None, _lexicon=None) -> None:
         self.model_path = model_path
+        self.dicpath = dicpath
         self.model_info = model_info
         self.threads = threads
         self._server = _server
         self._client = _client
+        self._lexicon = _lexicon
 
-    def clean(self, texts: list[str], glossary: list[str], reporter) -> CleanResult:
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> RepairResult:
         try:
+            lexicon = self._lexicon or self._default_lexicon(glossary)
             server_cm = self._server() if self._server else self._default_server()
             with server_cm as server:
                 make_client = self._client or (lambda url: self._default_client(url))
                 client = make_client(server.base_url)
-                return LlamaCleaner(client).clean(texts, glossary, reporter)
+                return SpanRepairCleaner(client, lexicon).clean(utterances, glossary, reporter)
         except Exception as exc:
             if reporter is not None:
-                reporter.warn(f"cleanup skipped: llama-server unavailable ({exc})")
-            return CleanResult(texts=list(texts), cleaned=0, kept_raw=0, active=False)
+                reporter.warn(f"cleanup skipped: repair backend unavailable ({exc})")
+            return RepairResult(list(utterances), fixed=0, echoes=0, active=False)
+
+    def _default_lexicon(self, glossary: list[str]) -> Lexicon:
+        from .lexicon import build_hunspell_lexicon
+
+        return build_hunspell_lexicon(self.dicpath, glossary)
 
     def _default_server(self):
         from .llama import LlamaServer

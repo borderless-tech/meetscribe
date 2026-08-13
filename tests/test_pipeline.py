@@ -290,14 +290,17 @@ def test_process_no_warning_when_all_clusters_spoke(tmp_path):
 
 
 class UpperCleaner:
-    """Fake cleaner: uppercases every text, reports itself active with a model identity."""
+    """Fake cleaner: uppercases each utterance's text (stashing raw_text), reports active."""
 
     model_info = {"name": "fake-llm", "sha256": "deadbeef"}
 
-    def clean(self, texts, glossary, reporter):
-        from meetscribe.cleanup import CleanResult
+    def clean(self, utterances, glossary, reporter):
+        from dataclasses import replace
 
-        return CleanResult([t.upper() for t in texts], cleaned=len(texts), kept_raw=0, active=True)
+        from meetscribe.cleanup import RepairResult
+
+        out = [replace(u, text=u.text.upper(), raw_text=u.text) for u in utterances]
+        return RepairResult(out, fixed=len(out), echoes=0, active=True)
 
 
 def test_process_cleans_system_track_only(tmp_path):
