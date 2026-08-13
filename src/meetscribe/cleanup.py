@@ -23,6 +23,7 @@ from typing import Protocol
 from .echo import collapse_echoes
 from .lexicon import Lexicon
 from .repair import is_valid_correction, repair_words
+from .suggest import gather_candidates
 from .types import Utterance
 
 # A correction must sound within this acoustic distance of the ASR word (else keep raw).
@@ -148,6 +149,114 @@ class ManagedSpanRepairCleaner:
             if reporter is not None:
                 reporter.warn(f"cleanup skipped: repair backend unavailable ({exc})")
             return RepairResult(list(utterances), fixed=0, echoes=0, active=False)
+
+    def _default_lexicon(self, glossary: list[str]) -> Lexicon:
+        from .lexicon import build_hunspell_lexicon
+
+        return build_hunspell_lexicon(self.dicpath, glossary)
+
+    def _default_server(self):
+        from .llama import LlamaServer
+
+        return LlamaServer(self.model_path, threads=self.threads)
+
+    def _default_client(self, base_url: str):
+        from .llama import LlamaClient
+
+        return LlamaClient(base_url)
+
+
+# ---- suggest-mode (human-in-the-loop; the decided direction) ------------------------
+
+@dataclass
+class SuggestResult:
+    utterances: list[Utterance]  # echo-collapsed; broken words left raw (not applied)
+    suggestions: list[dict]  # per flagged word: segment/word_index/start/end/original/candidates
+    echoes: int
+    active: bool
+
+
+class SuggestCleaner:
+    """Echo-collapse (auto, safe) + flag broken words + emit ranked correction *candidates*
+    for a human to accept in borderless-knowledge. Broken words are NOT auto-applied (acoustic
+    distance can't separate right from plausibly-wrong). Candidates = hunspell sound-alikes
+    (``suggest_fn``) unioned with an optional LLM guess (``client``); both injected."""
+
+    def __init__(self, suggest_fn, lexicon: Lexicon, client=None,
+                 max_candidates: int = 5, max_gap: float = 0.02) -> None:
+        self._suggest = suggest_fn
+        self._lex = lexicon
+        self._client = client
+        self._max = max_candidates
+        self._max_gap = max_gap
+
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> SuggestResult:
+        out: list[Utterance] = []
+        suggestions: list[dict] = []
+        total_echo = 0
+        for seg, u in enumerate(utterances):
+            words, removed = collapse_echoes(list(u.words), self._max_gap)
+            total_echo += removed
+            for j in self._lex.flag_broken([w.w for w in words]):
+                w = words[j]
+                llm = None
+                if self._client is not None:
+                    llm = _first_word(self._client.complete(
+                        build_span_prompt(words, j, glossary), max_tokens=_SPAN_MAX_TOKENS))
+                cand = gather_candidates(w.w, self._suggest(w.w), llm, self._max)
+                if cand.candidates:
+                    suggestions.append({
+                        "segment": seg, "word_index": j, "start": w.start, "end": w.end,
+                        "original": w.w, "candidates": cand.candidates,
+                    })
+            out.append(replace(u, words=tuple(words),
+                               text=" ".join(x.w for x in words), raw_text=u.text))
+        if reporter is not None:
+            reporter.info(f"collapsed {total_echo} echo(es); "
+                          f"{len(suggestions)} broken-word suggestion(s) for review")
+        return SuggestResult(out, suggestions, total_echo, active=True)
+
+
+class ManagedSuggestCleaner:
+    """Real suggest cleaner: builds the hunspell lexicon + suggester (runtime glossary), and —
+    when ``use_llm`` — a ``llama-server`` for an extra contextual candidate. Graceful fallback
+    (warn + unchanged, inactive) if the backend is unavailable."""
+
+    def __init__(self, model_path: str, dicpath: str, model_info: dict | None = None,
+                 threads: int = 4, use_llm: bool = True,
+                 _server=None, _client=None, _suggester=None, _lexicon=None) -> None:
+        self.model_path = model_path
+        self.dicpath = dicpath
+        self.model_info = model_info
+        self.threads = threads
+        self.use_llm = use_llm
+        self._server = _server
+        self._client = _client
+        self._suggester = _suggester
+        self._lexicon = _lexicon
+
+    def clean(self, utterances: list[Utterance], glossary: list[str], reporter) -> SuggestResult:
+        try:
+            suggester = self._suggester or self._default_suggester()
+            lexicon = self._lexicon or self._default_lexicon(glossary)
+            if not self.use_llm:
+                return SuggestCleaner(suggester, lexicon, client=None).clean(
+                    utterances, glossary, reporter)
+            server_cm = self._server() if self._server else self._default_server()
+            with server_cm as server:
+                make_client = self._client or (lambda url: self._default_client(url))
+                client = make_client(server.base_url)
+                return SuggestCleaner(suggester, lexicon, client=client).clean(
+                    utterances, glossary, reporter)
+        except Exception as exc:
+            if reporter is not None:
+                reporter.warn(f"cleanup skipped: suggest backend unavailable ({exc})")
+            return SuggestResult(list(utterances), [], 0, active=False)
+
+    def _default_suggester(self):
+        from .lexicon import build_hunspell_suggester
+
+        return build_hunspell_suggester(self.dicpath)
 
     def _default_lexicon(self, glossary: list[str]) -> Lexicon:
         from .lexicon import build_hunspell_lexicon

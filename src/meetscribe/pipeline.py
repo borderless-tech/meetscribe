@@ -9,7 +9,7 @@ sherpa models (the end-to-end smoke test) or fakes.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +50,7 @@ class Result:
     duration_s: float
     cleaned: bool = False
     cleanup_model: dict | None = None
+    suggestions: list = field(default_factory=list)
 
 
 def _group_by_speaker(segments: list[DiarSegment]) -> dict[str, list[DiarSegment]]:
@@ -173,10 +174,10 @@ def process(
 
     utterances = coalesce_utterances(merge_tracks(mic_utts, system_utts))
     duration = max([duration] + [u.end for u in utterances])
-    utterances, cleaned, cleanup_model = apply_cleanup(
+    utterances, cleaned, cleanup_model, suggestions = apply_cleanup(
         utterances, components.cleaner, glossary, reporter
     )
-    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model)
+    return Result(utterances, turns, clusters, dim, duration, cleaned, cleanup_model, suggestions)
 
 
 def apply_cleanup(utterances, cleaner, glossary, reporter):
@@ -186,14 +187,17 @@ def apply_cleanup(utterances, cleaner, glossary, reporter):
     cleanup_model)``. Shared by ``process()`` and the ``clean`` retrofit path."""
     sys_idx = [i for i, u in enumerate(utterances) if u.track == "system"]
     if not sys_idx:
-        return utterances, False, None
+        return utterances, False, None, []
     with reporter.stage("cleanup (repair)"):
         res = cleaner.clean([utterances[i] for i in sys_idx], glossary, reporter)
     for j, i in enumerate(sys_idx):
         utterances[i] = res.utterances[j]
+    suggestions = list(getattr(res, "suggestions", []))
+    for s in suggestions:  # remap local (system-list) segment index → transcript segment index
+        s["segment"] = sys_idx[s["segment"]]
     if not res.active:
-        return utterances, False, None
-    return utterances, True, getattr(cleaner, "model_info", None)
+        return utterances, False, None, suggestions
+    return utterances, True, getattr(cleaner, "model_info", None), suggestions
 
 
 def _transcribe(components, samples, reporter, label):
@@ -258,7 +262,7 @@ def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = Tr
     output); if it's absent the cleaner degrades to a no-op at clean() time (warn + raw text),
     so a machine without the LLM model simply produces an uncleaned transcript."""
     from .asr import ParakeetRecognizer
-    from .cleanup import ManagedSpanRepairCleaner, NullCleaner
+    from .cleanup import ManagedSuggestCleaner, NullCleaner
     from .diarize import OfflineDiarizer
     from .embed import SpeakerEmbedder
     from .vad import SileroVad
@@ -267,16 +271,20 @@ def build_components(models_dir: str, num_speakers: int = -1, cleanup: bool = Tr
     spk = str(m / "spk" / "model.onnx")
     cleaner = NullCleaner()
     if cleanup:
+        # hunspell (dicts under hunspell/, in the models-llm output) drives echo-collapse +
+        # broken-word flagging + suggestions; the LLM (llm/model.gguf) adds a contextual
+        # candidate when present. Broken words are suggested for review, never auto-applied.
+        dic = m / "hunspell"
         gguf = m / "llm" / "model.gguf"
-        if gguf.exists():  # opt-in models-llm output; absent → stay a no-op (uncleaned)
-            cleaner = ManagedSpanRepairCleaner(
-                str(gguf),
-                str(m / "hunspell"),  # de_DE/en_US dicts shipped in the models-llm output
-                {
-                    "name": "Qwen2.5-7B-Instruct-Q4_K_M",
-                    "sha256": _sha256(str(gguf)),
-                    "temperature": 0.0,
-                },
+        if dic.is_dir():
+            cleaner = ManagedSuggestCleaner(
+                str(gguf), str(dic),
+                model_info=(
+                    {"name": "Qwen2.5-7B-Instruct-Q4_K_M", "sha256": _sha256(str(gguf)),
+                     "temperature": 0.0}
+                    if gguf.exists() else None
+                ),
+                use_llm=gguf.exists(),
             )
     return Components(
         vad=SileroVad(str(m / "vad" / "silero_vad.onnx")),
@@ -369,7 +377,7 @@ def run(
     )
     write_transcript(
         out / "transcript.json", meeting_id, result.duration_s, result.utterances,
-        cleaned=result.cleaned,
+        cleaned=result.cleaned, suggestions=result.suggestions,
     )
     write_embeddings(out / "embeddings.npz", result.turns, result.clusters, dim=result.dim)
     write_meta(out / "meta.json", meta)
@@ -416,13 +424,14 @@ def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) ->
     with reporter.stage("loading models"):
         components = build_components(models_dir, -1)
     glossary = glossary_mod.load(glossary_mod.default_path())
-    utterances, cleaned, cleanup_model = apply_cleanup(
+    utterances, cleaned, cleanup_model, suggestions = apply_cleanup(
         list(utterances), components.cleaner, glossary, reporter
     )
 
     out = Path(out_dir) if out_dir else src.parent / f"{src.name}-cleanup"
     out.mkdir(parents=True, exist_ok=True)
-    write_transcript(out / "transcript.json", meeting_id, duration_s, utterances, cleaned=cleaned)
+    write_transcript(out / "transcript.json", meeting_id, duration_s, utterances,
+                     cleaned=cleaned, suggestions=suggestions)
     if (src / "embeddings.npz").exists():  # unaffected by text cleanup → copy verbatim
         shutil.copy(src / "embeddings.npz", out / "embeddings.npz")
     meta = json.loads((src / "meta.json").read_text()) if (src / "meta.json").exists() else {}

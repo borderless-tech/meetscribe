@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_cleanup_repairs_garbled_span_and_preserves_timings():
+def test_cleanup_suggests_candidates_for_garbled_span():
     from meetscribe.pipeline import apply_cleanup, build_components
     from meetscribe.progress import NullReporter
     from meetscribe.types import Utterance, Word
@@ -37,12 +37,12 @@ def test_cleanup_repairs_garbled_span_and_preserves_timings():
     u = Utterance(0.0, 2.0, "spk_0", "system", "wir arbeiten bei Borderles", words)
 
     comps = build_components(MODELS)
-    utts, cleaned, model = apply_cleanup([u], comps.cleaner, ["Borderless"], NullReporter())
+    utts, cleaned, model, suggestions = apply_cleanup([u], comps.cleaner, ["Borderless"], NullReporter())
 
     assert cleaned is True
-    assert model and model["name"].startswith("Qwen2.5")
-    assert utts[0].raw_text == "wir arbeiten bei Borderles"  # original preserved
-    assert "Borderless" in utts[0].text                      # garble repaired via glossary
-    # only the flagged word's TEXT changed; its timestamps (and the others) are intact
-    assert utts[0].words[3].start == 1.2 and utts[0].words[3].end == 2.0
-    assert [w.w for w in utts[0].words[:3]] == ["wir", "arbeiten", "bei"]
+    # suggest-mode: text is left RAW (not auto-applied); the fix is offered as a candidate
+    assert utts[0].text == "wir arbeiten bei Borderles"
+    sug = [s for s in suggestions if s["original"] == "Borderles"]
+    assert sug, "expected a suggestion for the garbled word"
+    assert "Borderless" in sug[0]["candidates"]  # correct term offered (glossary/LLM)
+    assert sug[0]["start"] == 1.2 and sug[0]["end"] == 2.0  # located for the reviewer

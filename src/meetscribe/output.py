@@ -104,14 +104,18 @@ def write_transcript(
     duration_s: float,
     utterances: Sequence[Utterance],
     cleaned: bool = False,
+    suggestions: Sequence[dict] | None = None,
 ) -> None:
     doc = {
         "meeting_id": meeting_id,
         "duration_s": duration_s,
         "cleaned": cleaned,
+        # broken-word correction candidates for human review (borderless-knowledge); the
+        # transcript text is left raw — these are suggestions, not applied edits.
+        "suggestions": list(suggestions) if suggestions else [],
         "segments": [_utterance_to_dict(u) for u in utterances],
     }
-    Path(path).write_text(json.dumps(doc, indent=2))
+    Path(path).write_text(json.dumps(doc, indent=2, ensure_ascii=False))
 
 
 def read_transcript(path: str | Path) -> tuple[str, float, list[Utterance]]:

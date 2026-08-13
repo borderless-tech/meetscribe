@@ -96,3 +96,25 @@ def build_hunspell_lexicon(dicpath: str, glossary: Iterable[str]) -> Lexicon:
         spell_en=_checker("en_US"),
         glossary=glossary,
     )
+
+
+def build_hunspell_suggester(dicpath: str) -> Callable[[str], list[str]]:
+    """A word -> sound-alike-candidates function via ``hunspell -a`` (de_DE + en_US).
+
+    hunspell's ``-a`` (ispell pipe) mode prints ``& <word> <n> <off>: c1, c2, …`` with its
+    ranked correction candidates for a misspelled word. We return that list — free, instant,
+    affix-expanded, bilingual. Not unit-tested (needs the binary + dictionaries), like above.
+    """
+    env = {**os.environ, "DICPATH": dicpath}
+
+    def suggest(word: str) -> list[str]:
+        res = subprocess.run(
+            ["hunspell", "-d", "de_DE,en_US", "-a"],
+            input=word, capture_output=True, text=True, env=env,
+        )
+        for line in res.stdout.splitlines():
+            if line.startswith("& ") and ":" in line:
+                return [c.strip() for c in line.split(":", 1)[1].split(",") if c.strip()]
+        return []
+
+    return suggest

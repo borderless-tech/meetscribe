@@ -7,6 +7,7 @@ from meetscribe.cleanup import (
     ManagedSpanRepairCleaner,
     NullCleaner,
     SpanRepairCleaner,
+    SuggestCleaner,
     build_span_prompt,
 )
 from meetscribe.lexicon import Lexicon
@@ -109,6 +110,33 @@ def test_collapses_echoes():
               Word("ja", 0.4, 0.6)])
     res = SpanRepairCleaner(FakeClient({}), lex).clean([u], [], None)
     assert res.echoes == 2
+    assert [w.w for w in res.utterances[0].words] == ["und", "ja"]
+
+
+# ---- SuggestCleaner (suggest, don't apply) ------------------------------------------
+
+def test_suggest_mode_flags_and_offers_candidates_without_applying():
+    lex = _lex(known=["sagt", "bitte"])  # "Halllo" is broken
+    suggest_fn = lambda w: ["Hallo", "Hallöchen"] if w == "Halllo" else []
+    client = FakeClient({"Halllo": "Hallo"})
+    u = _utt("sagt Halllo bitte",
+             [Word("sagt", 0.0, 0.3), Word("Halllo", 0.4, 0.9), Word("bitte", 1.0, 1.3)])
+    res = SuggestCleaner(suggest_fn, lex, client=client).clean([u], [], None)
+    # text is NOT changed (suggest, don't apply)
+    assert res.utterances[0].text == "sagt Halllo bitte"
+    assert len(res.suggestions) == 1
+    s = res.suggestions[0]
+    assert s["original"] == "Halllo" and s["word_index"] == 1
+    assert s["start"] == 0.4 and s["end"] == 0.9
+    assert "Hallo" in s["candidates"]  # from both hunspell + LLM, deduped
+    assert res.active is True
+
+
+def test_suggest_mode_collapses_echoes_and_skips_clean_words():
+    lex = _lex(known=["und", "ja"])
+    u = _utt("und und ja", [Word("und", 0.0, 0.1), Word("und", 0.1, 0.2), Word("ja", 0.3, 0.5)])
+    res = SuggestCleaner(lambda w: [], lex).clean([u], [], None)
+    assert res.echoes == 1 and res.suggestions == []
     assert [w.w for w in res.utterances[0].words] == ["und", "ja"]
 
 
