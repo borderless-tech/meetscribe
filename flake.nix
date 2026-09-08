@@ -160,6 +160,9 @@
           { nativeBuildInputs = [ testVenv ]; } ''
           cp -r ${./tests} tests
           cp ${./pyproject.toml} pyproject.toml
+          # test_version.py guards the version sync + changelog entry — CI must see these
+          cp ${./uv.lock} uv.lock
+          cp ${./CHANGELOG.md} CHANGELOG.md
           HOME=$TMPDIR python -m pytest tests -q
           touch $out
         '';
