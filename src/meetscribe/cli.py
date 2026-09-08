@@ -181,7 +181,9 @@ def _run_config(action: str | None) -> int:
     print(f"config: {path} ({'exists' if path.exists() else 'missing'})")
     for name, resolved in rows:
         value = resolved.value
-        if name == "api_key" and value:
+        if name == "api_key" and isinstance(value, config_mod.ApiKeyCmd):
+            value = "(via api_key_cmd)"  # never execute here, don't echo the command
+        elif name == "api_key" and value:
             value = f"{str(value)[:3]}…****"  # never print the secret itself
         if value is None:
             display = "(not set)"

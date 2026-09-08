@@ -316,3 +316,13 @@ def test_config_checks_default_path_honors_meetscribe_config_env(tmp_path, monke
     checks = config_checks()
     assert checks[0].ok
     assert str(p) in checks[0].name
+
+
+def test_deepgram_key_check_accepts_lazy_cmd_marker():
+    # A configured api_key_cmd counts as "key available" — and must not be
+    # executed (doctor may run headless; pass/gpg could block on pinentry).
+    from meetscribe.config import ApiKeyCmd
+    from meetscribe.doctor import deepgram_key_check
+
+    check = deepgram_key_check(ApiKeyCmd("pass show deepgram"))
+    assert check.ok is True

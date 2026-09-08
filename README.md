@@ -60,6 +60,7 @@ language = "de"          # remote-STT language
 
 [deepgram]
 api_key = ""             # env DEEPGRAM_API_KEY wins; keep this file 0600 when set
+api_key_cmd = ""         # or: shell command printing the key ("pass show deepgram")
 
 [storage]
 meetings_dir = ""        # default: $XDG_DATA_HOME/meetscribe/meetings

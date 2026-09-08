@@ -143,7 +143,10 @@ everywhere: flag > env > config > default**. Read-only stdlib `tomllib`; we neve
   `config.config_home()`).
 
 **Schema v1** (all keys optional; empty strings count as unset): `[stt]
-backend`/`language`, `[deepgram] api_key`, `[storage] meetings_dir`, `[record]
+backend`/`language`, `[deepgram] api_key`/`api_key_cmd` (mutually exclusive; the cmd is a
+shell command printing the key, executed lazily via `config.fetch_api_key` only when the
+deepgram backend actually needs it — never by `config` display, `validate`, or doctor),
+`[storage] meetings_dir`, `[record]
 system_source`, `[output] bundle`/`cleanup`. `[bk]` is reserved for Phase 2 and never
 reported as unknown. Unknown keys warn; **malformed TOML is exit 2 with file + line**
 (`ConfigError`) — a typo'd config silently degrading to defaults is the worst failure mode.

@@ -496,3 +496,19 @@ def test_config_show_wrongly_typed_value_exits_2(isolated_config, capsys):
 
     assert main(["config"]) == 2
     assert "bundle" in capsys.readouterr().err
+
+
+def test_config_show_api_key_cmd_shown_without_executing(isolated_config, capsys, tmp_path):
+    # `meetscribe config` must indicate the lazy source but NEVER run the command.
+    from meetscribe.cli import main
+
+    canary = tmp_path / "canary"
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text(f'[deepgram]\napi_key_cmd = "touch {canary}"\n')
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    key_line = next(l for l in out.splitlines() if l.startswith("api_key"))
+    assert "via api_key_cmd" in key_line and "(config)" in key_line
+    assert str(canary) not in out  # don't echo the command either
+    assert not canary.exists()

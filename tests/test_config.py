@@ -114,12 +114,15 @@ def test_load_directory_path_raises_configerror(tmp_path):
     assert str(d) in str(exc.value)
 
 
-def test_load_template_is_valid_toml(tmp_path):
+def test_load_template_is_valid_toml_and_sets_nothing(tmp_path):
+    # All template keys ship commented out: a fresh `config init` must behave
+    # exactly like no config file — origin "default" everywhere until edited.
     p = tmp_path / "config.toml"
     p.write_text(config.TEMPLATE, encoding="utf-8")
     cfg = config.load(p)
-    assert cfg["stt"]["backend"] == "local"
-    assert cfg["output"]["bundle"] is True
+    assert cfg == {}
+    assert config.backend(None, {}, cfg).origin == "default"
+    assert config.bundle(None, {}, cfg).origin == "default"
 
 
 # ----------------------------------------------------------- resolver: backend
@@ -452,3 +455,87 @@ def test_insecure_perms_false_when_no_api_key(tmp_path):
 
 def test_insecure_perms_false_when_file_missing(tmp_path):
     assert config.insecure_api_key_perms(tmp_path / "nope.toml") is False
+
+
+# --------------------------------------------------- api_key_cmd + lazy fetch
+
+
+def test_api_key_cmd_resolves_to_marker_without_executing(tmp_path):
+    canary = tmp_path / "canary"
+    cfg = {"deepgram": {"api_key_cmd": f"touch {canary}"}}
+    resolved = config.api_key(None, {}, cfg)
+    assert resolved == Resolved(config.ApiKeyCmd(f"touch {canary}"), "config")
+    assert not canary.exists()  # resolving must NEVER run the command
+
+
+def test_api_key_env_beats_cmd():
+    cfg = {"deepgram": {"api_key_cmd": "echo from-cmd"}}
+    env = {"DEEPGRAM_API_KEY": "dg_env"}
+    assert config.api_key(None, env, cfg) == Resolved("dg_env", "env")
+
+
+def test_api_key_and_cmd_both_set_is_config_error():
+    # A leftover static key silently shadowing the keyring command is the
+    # stale-secret trap — ambiguity fails loudly.
+    cfg = {"deepgram": {"api_key": "dg_static", "api_key_cmd": "pass show dg"}}
+    with pytest.raises(ConfigError, match="api_key_cmd"):
+        config.api_key(None, {}, cfg)
+
+
+def test_api_key_cmd_empty_string_is_unset():
+    cfg = {"deepgram": {"api_key_cmd": "  "}}
+    assert config.api_key(None, {}, cfg) == Resolved(None, "default")
+
+
+def test_api_key_cmd_is_a_known_schema_key():
+    assert config.unknown_keys({"deepgram": {"api_key_cmd": "x"}}) == []
+
+
+def test_validate_does_not_execute_api_key_cmd(tmp_path):
+    canary = tmp_path / "canary"
+    cfg = {"deepgram": {"api_key_cmd": f"touch {canary}"}}
+    config.validate(cfg)
+    assert not canary.exists()
+
+
+def test_fetch_api_key_passes_through_plain_string():
+    assert config.fetch_api_key("dg_plain") == "dg_plain"
+
+
+def test_fetch_api_key_none_stays_none():
+    assert config.fetch_api_key(None) is None
+
+
+def test_fetch_api_key_executes_cmd_and_strips():
+    key = config.fetch_api_key(config.ApiKeyCmd("echo '  dg_from_cmd  '"))
+    assert key == "dg_from_cmd"
+
+
+def test_fetch_api_key_failing_cmd_raises_with_stderr():
+    with pytest.raises(ConfigError, match="boom"):
+        config.fetch_api_key(config.ApiKeyCmd("echo boom >&2; exit 3"))
+
+
+def test_fetch_api_key_empty_output_raises():
+    with pytest.raises(ConfigError, match="empty"):
+        config.fetch_api_key(config.ApiKeyCmd("true"))
+
+
+# ------------------------------------------------- template: all-commented-out
+
+
+def test_template_parses_to_pure_defaults():
+    # The template must not SET anything: every key commented out, so a fresh
+    # `config init` reports origin "default" everywhere until the user edits.
+    import tomllib
+
+    parsed = tomllib.loads(config.TEMPLATE)
+    assert parsed == {}
+
+
+def test_template_mentions_every_schema_key():
+    # Commented-out or not, the template must document the full v1 surface.
+    for section, keys in config._SCHEMA.items():
+        assert f"[{section}]" in config.TEMPLATE
+        for key in keys:
+            assert key in config.TEMPLATE

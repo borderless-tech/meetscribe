@@ -466,7 +466,12 @@ def run(
         cfg = config_mod.load()
         for msg in config_mod.load_warnings(cfg):  # unknown keys, api_key perms
             reporter.warn(msg)
-        backend_err = pipeline.check_backend(backend, cfg=cfg)[1]
+        backend_name, backend_err = pipeline.check_backend(backend, cfg=cfg)
+        if backend_name == "deepgram" and not backend_err:
+            # Eagerly execute an api_key_cmd: a pinentry prompt at record start is
+            # fine (the user just initiated recording); a broken keyring command
+            # an hour later — after the meeting was recorded — is not.
+            config_mod.fetch_api_key(config_mod.api_key(None, os.environ, cfg).value)
         # Validate-only: pipeline.run re-resolves language; a broken [stt].language
         # must abort here, not in the hand-off after the recording.
         config_mod.language(language, os.environ, cfg)

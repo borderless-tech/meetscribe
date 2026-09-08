@@ -434,6 +434,12 @@ def run(
         cleanup = config_mod.cleanup(cleanup, os.environ, cfg).value
         language = resolve_language(language, cfg=cfg)
         dg_key = config_mod.api_key(None, os.environ, cfg).value
+        if backend_name == "deepgram":
+            # An [deepgram].api_key_cmd resolves to an unexecuted marker — fetch
+            # the material here (and only for the deepgram backend: local runs
+            # must never execute a keyring command). Failure lands in the same
+            # exit-2 guard as every other config problem.
+            dg_key = config_mod.fetch_api_key(dg_key)
     except config_mod.ConfigError as e:
         print(config_error_message(e))
         return 2

@@ -149,18 +149,24 @@ def _tls_connect(host: str, port: int, timeout_s: float = 5.0) -> None:
             pass
 
 
-def deepgram_key_check(api_key: str | None) -> Check:
+def deepgram_key_check(api_key) -> Check:
     from . import config as config_mod
 
-    ok = bool(api_key and api_key.strip())
+    # An ApiKeyCmd marker counts as available but is NOT executed here — doctor
+    # may run headless, and a keyring command could block on a pinentry prompt.
+    if isinstance(api_key, config_mod.ApiKeyCmd):
+        ok = bool(api_key.cmd.strip())
+    else:
+        ok = bool(api_key and api_key.strip())
     return Check(
         "Deepgram API key set",
         ok,
         None
         if ok
         else (
-            "export DEEPGRAM_API_KEY=<key> or set [deepgram].api_key in "
-            f"{config_mod.config_path()} — the deepgram backend has no local fallback"
+            "export DEEPGRAM_API_KEY=<key> or set [deepgram].api_key / "
+            f"api_key_cmd in {config_mod.config_path()} — the deepgram backend "
+            "has no local fallback"
         ),
     )
 

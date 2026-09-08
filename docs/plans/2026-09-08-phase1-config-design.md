@@ -34,6 +34,8 @@ language = "de"          # remote-STT language        (flag --language, env STT_
 
 [deepgram]
 api_key = ""             # env DEEPGRAM_API_KEY wins; keep this file 0600 when set
+api_key_cmd = ""         # shell command printing the key; mutually exclusive with api_key,
+                         # executed lazily only when the key is actually needed
 
 [storage]
 meetings_dir = ""        # where recordings land      (flag -o wins per run)

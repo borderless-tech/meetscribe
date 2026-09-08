@@ -28,6 +28,16 @@ bump always warrants at least a minor version bump here, and is called out in th
 - `doctor` gains a config check (runs first, never aborts the audio checks): path in
   use + existence, parse status (malformed = red with the line), unknown-key and
   api_key file-permission warnings (0600 advice).
+- `[deepgram] api_key_cmd`: a shell command that prints the API key (e.g.
+  `"pass show deepgram"`) for keyring/password-manager users. Mutually exclusive with
+  `api_key` (both set = error — a stale static key must not silently shadow the
+  keyring), executed lazily only when the deepgram backend actually needs the key
+  (never by `meetscribe config`, `doctor`, or local runs), and eagerly at record
+  start so a broken command fails before recording, not after.
+- The `config init` template now ships fully commented out: a fresh init behaves
+  exactly like no config file (`meetscribe config` shows `(default)` everywhere
+  until you uncomment something), and the header warns against syncing the file
+  into public dotfiles once `api_key` is set.
 
 ### Changed
 - **Default recordings location:** `meetscribe record` without `-o` now writes to

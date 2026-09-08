@@ -950,3 +950,49 @@ def test_process_resamples_non_16k_input(tmp_path):
     # bug sliced the first sixth of the file instead (mean ≈ 0.15)
     assert embedder.means and all(0.4 < m < 0.5 for m in embedder.means), embedder.means
     assert any("48000" in w for w in rep.warns), rep.warns  # resampling is announced
+
+
+def test_run_deepgram_failing_key_cmd_exits_2(tmp_path, monkeypatch, capsys):
+    # The lazy api_key_cmd is fetched inside run()'s config guard: failure is a
+    # clean exit 2 with the command's stderr, never a traceback.
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text('[deepgram]\napi_key_cmd = "echo kaboom >&2; exit 5"\n')
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(cfgfile))
+    monkeypatch.setenv("MEETSCRIBE_MODELS", str(tmp_path))  # past the models gate
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+
+    from meetscribe import pipeline
+    assert pipeline.run(audio=str(tmp_path), backend="deepgram") == 2
+    out = capsys.readouterr().out
+    assert "api_key_cmd" in out and "kaboom" in out
+
+
+def test_run_deepgram_key_cmd_supplies_key_material(tmp_path, monkeypatch):
+    # The DeepgramConfig handed to the backend must contain the fetched material,
+    # never the ApiKeyCmd marker.
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text('[deepgram]\napi_key_cmd = "echo dg_from_cmd"\n')
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(cfgfile))
+    monkeypatch.setenv("MEETSCRIBE_MODELS", str(tmp_path))  # past the models gate
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+
+    captured = {}
+    import meetscribe.deepgram as dg
+
+    class FakeBackend:
+        def __init__(self, config, client=None):
+            captured["api_key"] = config.api_key
+            raise RuntimeError("stop here — key already captured")
+
+    monkeypatch.setattr(dg, "DeepgramBackend", FakeBackend)
+
+    meeting = tmp_path / "meeting"
+    meeting.mkdir()
+    (meeting / "system.wav").touch()
+
+    from meetscribe import pipeline
+    with pytest.raises(RuntimeError, match="stop here"):
+        pipeline.run(audio=str(meeting), backend="deepgram")
+    assert captured["api_key"] == "dg_from_cmd"

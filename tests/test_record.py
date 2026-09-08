@@ -656,3 +656,22 @@ def test_run_deepgram_key_from_config_passes_preflight(tmp_path, monkeypatch):
     from meetscribe import record
     assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 0
     assert captured["backend"] == "deepgram"
+
+
+def test_run_deepgram_failing_key_cmd_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # api_key_cmd is executed eagerly at record start (pinentry there is fine —
+    # the user just initiated recording); a broken keyring command must fail
+    # BEFORE ffmpeg, not after an hour of recording.
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text('[deepgram]\napi_key_cmd = "echo kaboom >&2; exit 5"\n')
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(cfgfile))
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run when the key cmd fails")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 2
+    assert "api_key_cmd" in capsys.readouterr().out

@@ -27,34 +27,40 @@ from pathlib import Path
 from typing import Mapping, NamedTuple
 
 TEMPLATE = """\
-# meetscribe config — flags > environment > this file > built-in defaults
+# meetscribe config — flags > environment > this file > built-in defaults.
+# Everything ships commented out: absent keys use the built-in default
+# (`meetscribe config` shows every effective value and where it came from).
+# If you set [deepgram].api_key this file holds a secret — keep it 0600 and
+# out of synced/public dotfile repos.
 
-[stt]
-backend = "local"        # "local" | "deepgram"      (flag --backend, env STT_BACKEND)
-language = "de"          # remote-STT language        (flag --language, env STT_LANGUAGE)
+#[stt]
+#backend = "local"        # "local" | "deepgram"      (flag --backend, env STT_BACKEND)
+#language = "de"          # remote-STT language        (flag --language, env STT_LANGUAGE)
 
-[deepgram]
-api_key = ""             # env DEEPGRAM_API_KEY wins; keep this file 0600 when set
+#[deepgram]
+#api_key = ""             # env DEEPGRAM_API_KEY wins; keep this file 0600 when set
+#api_key_cmd = ""         # shell command that prints the key (e.g. "pass show deepgram");
+#                         # mutually exclusive with api_key, run only when the key is needed
 
-[storage]
-meetings_dir = ""        # where recordings land      (flag -o wins per run)
-                         # default: $XDG_DATA_HOME/meetscribe/meetings
+#[storage]
+#meetings_dir = ""        # where recordings land      (flag -o wins per run)
+#                         # default: $XDG_DATA_HOME/meetscribe/meetings
 
-[record]
-system_source = ""       # fixed system-audio source  (flag --system-source wins)
+#[record]
+#system_source = ""       # fixed system-audio source  (flag --system-source wins)
 
-[output]
-bundle = true            # flag --bundle/--no-bundle wins
-cleanup = true           # flag --no-cleanup wins
+#[output]
+#bundle = true            # flag --bundle/--no-bundle wins
+#cleanup = true           # flag --no-cleanup wins
 
-# [bk]                   # reserved for Phase 2 (base_url, token, upload policy)
+#[bk]                     # reserved for Phase 2 (base_url, token, upload policy)
 """
 
 #: Config schema v1 — section -> allowed keys. ``bk`` is reserved for Phase 2 and
 #: deliberately absent here (its keys are never reported as unknown).
 _SCHEMA: dict[str, frozenset[str]] = {
     "stt": frozenset({"backend", "language"}),
-    "deepgram": frozenset({"api_key"}),
+    "deepgram": frozenset({"api_key", "api_key_cmd"}),
     "storage": frozenset({"meetings_dir"}),
     "record": frozenset({"system_source"}),
     "output": frozenset({"bundle", "cleanup"}),
@@ -83,6 +89,15 @@ class Resolved(NamedTuple):
 
     value: object
     origin: str
+
+
+class ApiKeyCmd(NamedTuple):
+    """Marker for a *lazily fetched* API key: ``[deepgram].api_key_cmd`` resolved
+    but deliberately not executed. Only :func:`fetch_api_key` runs the command —
+    at the moment the key material is actually needed, never during ``config``
+    display, :func:`validate`, or doctor."""
+
+    cmd: str
 
 
 # --------------------------------------------------------------------- paths
@@ -253,16 +268,61 @@ def language(flag_value: str | None, env: Mapping, cfg: dict) -> Resolved:
 
 def api_key(flag_value: str | None, env: Mapping, cfg: dict) -> Resolved:
     """Deepgram API key: ``DEEPGRAM_API_KEY`` env > ``[deepgram].api_key`` >
-    ``None`` (there is no flag today; the parameter keeps the uniform shape)."""
+    ``[deepgram].api_key_cmd`` (as an unexecuted :class:`ApiKeyCmd` marker) >
+    ``None`` (there is no flag today; the parameter keeps the uniform shape).
+
+    ``api_key`` and ``api_key_cmd`` both set is a :class:`ConfigError`: a
+    leftover static key would silently shadow the keyring command — likely with
+    a stale secret — so the ambiguity fails loudly."""
     if flag_value and flag_value.strip():
         return Resolved(flag_value.strip(), "flag")
     e = (env.get("DEEPGRAM_API_KEY") or "").strip()
     if e:
         return Resolved(e, "env")
     c = _cfg_str(cfg, "deepgram", "api_key")
+    cmd = _cfg_str(cfg, "deepgram", "api_key_cmd")
+    if c and cmd:
+        raise ConfigError(
+            "[deepgram].api_key and [deepgram].api_key_cmd are both set — "
+            "they are mutually exclusive, remove one"
+        )
     if c:
         return Resolved(c, "config")
+    if cmd:
+        return Resolved(ApiKeyCmd(cmd), "config")
     return Resolved(None, "default")
+
+
+def fetch_api_key(value: object, timeout_s: float = 30.0) -> str | None:
+    """Turn a resolved api-key value into key material. Plain strings and ``None``
+    pass through; an :class:`ApiKeyCmd` is executed HERE and only here — via the
+    shell (the command comes from the user's own 0600 config, same trust model as
+    git config commands), stdout stripped. Failure, timeout, or empty output is a
+    :class:`ConfigError` (exit-2 material with the command's stderr included)."""
+    if not isinstance(value, ApiKeyCmd):
+        return value  # type: ignore[return-value]
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            value.cmd, shell=True, capture_output=True, text=True, timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        raise ConfigError(
+            f"[deepgram].api_key_cmd timed out after {timeout_s:.0f}s: {value.cmd}"
+        ) from None
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        raise ConfigError(
+            f"[deepgram].api_key_cmd failed (exit {proc.returncode})"
+            + (f": {stderr}" if stderr else "")
+        )
+    key = proc.stdout.strip()
+    if not key:
+        raise ConfigError(
+            "[deepgram].api_key_cmd produced empty output — expected the key on stdout"
+        )
+    return key
 
 
 def meetings_dir(
