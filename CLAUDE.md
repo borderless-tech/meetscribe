@@ -36,7 +36,7 @@ Run the app itself (models + ffmpeg are wired in by the flake wrapper):
 ```bash
 nix run .#doctor                  # preflight audio-setup checks — run this first
 nix run .                         # record (Ctrl-C stops) + process (asks participant count)
-nix run . -- process ./meeting-dir [--bundle] [--speakers N] [--no-cleanup]   # N = people incl. the user
+nix run . -- process ./meeting-dir [--no-bundle] [--speakers N] [--no-cleanup]   # N = people incl. the user
 nix run . -- clean ./meeting-dir  # re-run LLM cleanup on an existing transcript → ./meeting-dir-cleanup/
 
 # The LLM transcript-cleanup pass (§ below) is default-on but needs the opt-in models-llm output.
@@ -109,7 +109,8 @@ Three artifacts (`output.py`), plus an optional single-file bundle:
   `cleaned` + (when cleanup ran) `cleanup_model` (name/SHA-256/params), `format_version` (now `2`:
   adds `raw_text`/`cleaned`/`cleanup_model`). **Not optional:** vectors/text from different models
   are incomparable, so the model identity must travel with the artifact (and later into the DB).
-- `meeting-<id>.mscribe` (via `--bundle` or the `meetscribe bundle <dir>` subcommand) — a plain
+- `meeting-<id>.mscribe` (default-on for `record`/`process`, opt out with `--no-bundle`; also
+  retrofittable via the `meetscribe bundle <dir>` subcommand) — a plain
   zip of the three files above, for one atomic authenticated upload to a stateless sink. See
   `docs/plans/2026-08-02-bundle-format-design.md`. `bundle_dir` / `default_bundle_name` in
   `output.py` are the *only* places that know the member names and naming scheme — keep it that way.

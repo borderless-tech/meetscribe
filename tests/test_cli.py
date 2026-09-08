@@ -57,6 +57,26 @@ def test_record_parser_accepts_bundle():
     assert args.bundle is True
 
 
+def test_record_parser_bundles_by_default():
+    args = build_parser().parse_args(["record"])
+    assert args.bundle is True
+
+
+def test_process_parser_bundles_by_default():
+    args = build_parser().parse_args(["process", "x.wav"])
+    assert args.bundle is True
+
+
+def test_record_parser_accepts_no_bundle():
+    args = build_parser().parse_args(["record", "--no-bundle"])
+    assert args.bundle is False
+
+
+def test_process_parser_accepts_no_bundle():
+    args = build_parser().parse_args(["process", "x.wav", "--no-bundle"])
+    assert args.bundle is False
+
+
 def test_main_record_forwards_bundle_flag(monkeypatch):
     # Guards the CLI->record.run wiring: `record --bundle` must actually reach
     # record.run(bundle=True), not just parse into args and get dropped.
@@ -67,6 +87,19 @@ def test_main_record_forwards_bundle_flag(monkeypatch):
     monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
 
     assert main(["record", "--bundle"]) == 0
+    assert captured["bundle"] is True
+
+
+def test_main_bare_invocation_bundles_by_default(monkeypatch):
+    # Bare `meetscribe` skips the subparser entirely, so record.run must get the
+    # bundle default via the getattr fallback — guard that it stays in sync.
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["--quiet"]) == 0
     assert captured["bundle"] is True
 
 

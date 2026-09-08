@@ -43,8 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory for artifacts (default: ./meetscribe-<timestamp>)",
     )
     p_record.add_argument(
-        "--bundle", action="store_true",
-        help="also emit a single meeting-<id>.mscribe upload bundle",
+        "--bundle", action=argparse.BooleanOptionalAction, default=True,
+        help="emit a single meeting-<id>.mscribe upload bundle (default: on; "
+             "--no-bundle to skip)",
     )
     p_record.add_argument(
         "--system-source", default=None, metavar="NAME",
@@ -63,8 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory for artifacts",
     )
     p_process.add_argument(
-        "--bundle", action="store_true",
-        help="also emit a single meeting-<id>.mscribe upload bundle",
+        "--bundle", action=argparse.BooleanOptionalAction, default=True,
+        help="emit a single meeting-<id>.mscribe upload bundle (default: on; "
+             "--no-bundle to skip)",
     )
     p_process.add_argument(
         "--speakers", type=int, default=None, metavar="N",
@@ -120,7 +122,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return record.run(
             out_dir=getattr(args, "out", None),
-            bundle=getattr(args, "bundle", False),
+            # Bare `meetscribe` never runs the subparser, so the fallback must
+            # match the subparser default (bundle on).
+            bundle=getattr(args, "bundle", True),
             system_source=getattr(args, "system_source", None),
             reporter=reporter,
             cleanup=not getattr(args, "no_cleanup", False),
@@ -134,7 +138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return pipeline.run(
             audio=getattr(args, "audio", None),
             out_dir=getattr(args, "out", None),
-            bundle=getattr(args, "bundle", False),
+            bundle=getattr(args, "bundle", True),
             reporter=reporter,
             num_speakers=-1 if speakers is None else speakers_from_count(speakers),
             cleanup=not getattr(args, "no_cleanup", False),
