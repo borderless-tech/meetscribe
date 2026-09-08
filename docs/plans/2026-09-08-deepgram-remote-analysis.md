@@ -128,20 +128,21 @@ the `==`-pin policy trivial. The SDK earns its keep for streaming/agent use we d
 1. **Backend selection**: `local` is the default; override via **`STT_BACKEND=deepgram`**
    (env var, plus a `--backend` CLI flag mirroring it). `deepgram` requires
    `DEEPGRAM_API_KEY` to be present — fail fast with a clear message if it isn't.
-2. **Language**: default **`language=multi`**. Rationale: meetings are mostly German with
-   real English mixed in (and the mic track can be English); `multi` does word-level
-   code-switching and the premium is negligible (batch $0.0052 vs $0.0043/min ≈ +5 ct per
-   meeting-hour). **Scoping `multi` to en+de is not possible** — it's the full 10-language
-   set or a single language; in practice stray third-language misdetections are rare when
-   the audio only contains de/en, and each word carries a `language` tag + confidence we
-   could surface later. A `--language de` escape hatch stays for pure-German meetings
-   (monolingual squeezes out the last bit of accuracy and is 21% cheaper).
-3. **Sample rate**: nothing to decide — `record.py` already writes both tracks as
-   **16 kHz mono WAV at capture time** (the 48 kHz source is downsampled by ffmpeg during
-   recording; no higher-rate original exists on disk). That matches Deepgram guidance:
-   linear16 at the audio's native rate, never upsample (upsampling creates artifacts that
-   hurt WER; downsampling 48→16 kHz at capture is harmless — speech ASR is wideband-16 kHz
-   internally). We upload the on-disk WAVs as-is.
+2. **Language**: default **`language=de`** (most meetings are German; monolingual is also
+   21% cheaper), configurable via **`STT_LANGUAGE`** env + matching `--language` flag.
+   `STT_LANGUAGE=multi` opts into nova-3 code-switching for genuinely mixed meetings.
+   **Scoping `multi` to en+de is not possible** — it's the full 10-language set or a single
+   language; each `multi` word carries a `language` tag + confidence we could surface later.
+   Single borrowed anglicisms in German speech are handled fine by monolingual `de`.
+3. **Sample rate / bit depth**: upload the on-disk WAVs as-is — `record.py` already writes
+   both tracks as **16 kHz mono 16-bit WAV at capture time** (ffmpeg downsamples the 48 kHz
+   source live; no higher-rate original exists on disk). Matches Deepgram guidance: linear16
+   at native rate, never upsample. Higher **bit depth (24/32) is not a quality lever for
+   ASR**: 16-bit PCM already gives ~96 dB dynamic range, ASR models are trained on
+   16-bit-equivalent audio, and — decisive here — the system track is Opus-compressed VoIP
+   before it ever reaches PulseAudio, so extra bits would only record the lossy codec's
+   output more precisely. The known ceiling remains the mixed VoIP downmix, not capture
+   fidelity.
 4. **No `deepgram-sdk`**: plain stdlib HTTP. The SDK (v7.x) would add httpx + pydantic +
    pydantic-core (native wheel) + websockets to the runtime closure for what is, for us,
    one `POST` with a bytes body and JSON response — against the repo's `==`-pin/uv2nix
@@ -150,6 +151,31 @@ the `==`-pin policy trivial. The SDK earns its keep for streaming/agent use we d
    live during recording**, which is the one scenario where the SDK pays for itself.
 5. **Cleanup default on remote**: off (keyterms + `smart_format` address it at the source);
    the flag stays available.
+
+## Open: merge both tracks into ONE upload? (recommendation: no — keep split)
+
+Tempting cost cut: downmix mic+system to one mono file, one request (≈26 instead of ≈52
+ct/meeting-hour; diarization itself is free, billing is audio-minutes only). Recording keeps
+both tracks on disk either way, so this is a per-meeting processing choice, not an
+architectural one-way door. Still recommended against as the default, because it trades away
+the project's central guarantee for ~26 ct/h:
+
+- **`speaker="me"` stops being a fact and becomes a guess.** Today the mic track is
+  hard-labelled; merged, the user is just another diarization cluster, and mapping "which
+  cluster is me" needs new machinery (best candidate: local VAD on the still-on-disk mic
+  track → the cluster with max speech-time overlap is `me`) with a brand-new failure mode.
+- **Overlapping speech is irreversibly lost in a downmix.** Backchannels ("mhm", "genau")
+  over a participant currently land cleanly on their own track and interleave by timestamp;
+  summed into one signal, the diarizer/ASR gets garble and words vanish or misattribute.
+  This is precisely the failure mode the dual-track design §2.1 exists to kill.
+- **The `me` embedding degrades** from clean-solo-audio centroid to
+  contaminated-cluster centroid — and `me` is the vector we match across every meeting.
+- Multichannel is no way out: Deepgram bills per channel (2× again) and params like
+  `diarize` are global per request.
+
+If the cost ever matters, the cheaper sensible variant is asymmetric: system track remote
+(where the quality pain is), mic track local (clean audio, Parakeet copes) — at the price of
+mixed model identities in one transcript. Park both ideas unless real usage asks for them.
 
 ## Suggested next step
 
