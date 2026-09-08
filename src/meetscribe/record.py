@@ -445,8 +445,19 @@ def ask_participants(input_fn=input) -> int:
 def run(
     out_dir: str | None = None, bundle: bool = False, reporter=None,
     system_source: str | None = None, cleanup: bool = True,
+    backend: str | None = None, language: str | None = None,
 ) -> int:
     from datetime import datetime, timezone
+
+    from . import pipeline
+
+    # Fail fast (non-negotiable): an unknown backend name or a missing
+    # DEEPGRAM_API_KEY must surface BEFORE ffmpeg starts — not after the whole
+    # meeting has been recorded and the prompts were answered.
+    backend_err = pipeline.check_backend(backend)[1]
+    if backend_err:
+        print(backend_err)
+        return 2
 
     root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
     raw = root / "raw"
@@ -471,10 +482,9 @@ def run(
         names = ask_participant_names(num_speakers)
         glossary.append(glossary.default_path(), names)
 
-    from . import pipeline
-
     return pipeline.run(
         audio=str(root), out_dir=str(root),
         bundle=bundle, started_at=started_at, reporter=reporter,
         num_speakers=num_speakers, cleanup=cleanup,
+        backend=backend, language=language,  # resolution (flag > env > default) is run()'s job
     )

@@ -5,8 +5,11 @@ import numpy as np
 from meetscribe.doctor import (
     Check,
     checks_pass,
+    deepgram_key_check,
+    deepgram_reachability_check,
     format_report,
     linux_monitor_check,
+    remote_checks,
     rms_after_warmup,
     run,
 )
@@ -92,3 +95,70 @@ def test_run_returns_nonzero_on_failure(capsys):
     out = capsys.readouterr().out
     assert "✗ mic RMS > 0" in out
     assert "→ grant mic permission" in out
+
+
+# --- Remote-backend checks (STT_BACKEND=deepgram) --------------------------------------------
+# The remote backend has NO silent fallback to local, so doctor must surface a missing key and
+# an unreachable API up front. The TLS connector is injected — no network (and no billable
+# Deepgram call) in tests.
+
+
+def _ok_connect(host, port):
+    _ok_connect.calls.append((host, port))
+
+
+_ok_connect.calls = []
+
+
+def test_remote_checks_empty_when_backend_is_local():
+    # Doctor stays purely local unless the env opts into the remote backend.
+    assert remote_checks(env={}, connect=_ok_connect) == []
+    assert remote_checks(env={"STT_BACKEND": "local"}, connect=_ok_connect) == []
+
+
+def test_remote_checks_run_for_deepgram_backend_and_probe_the_right_endpoint():
+    _ok_connect.calls.clear()
+    checks = remote_checks(
+        env={"STT_BACKEND": "deepgram", "DEEPGRAM_API_KEY": "tok"}, connect=_ok_connect
+    )
+    assert len(checks) == 2
+    assert all(c.ok for c in checks)
+    # DNS+TLS reachability must probe the real API endpoint — and nothing else.
+    assert _ok_connect.calls == [("api.deepgram.com", 443)]
+
+
+def test_deepgram_key_check_fails_with_actionable_hint_when_missing():
+    for absent in (None, "", "   "):
+        check = deepgram_key_check(absent)
+        assert not check.ok
+        assert "DEEPGRAM_API_KEY" in (check.hint or "")
+
+
+def test_deepgram_key_check_passes_when_set():
+    check = deepgram_key_check("dg_secret")
+    assert check.ok
+    assert "dg_secret" not in check.name  # never echo the secret into the report
+
+
+def test_deepgram_reachability_check_fails_offline_with_hint():
+    def down(host, port):
+        raise OSError("Name or service not known")
+
+    check = deepgram_reachability_check(connect=down)
+    assert not check.ok
+    assert "offline" in (check.hint or "").lower()
+
+
+def test_deepgram_reachability_check_passes_when_tls_connects():
+    check = deepgram_reachability_check(connect=lambda host, port: None)
+    assert check.ok
+    assert "api.deepgram.com" in check.name
+
+
+def test_remote_checks_report_missing_key_and_unreachable_api_together():
+    # Both failures must be visible in one doctor run, not discovered one at a time.
+    def down(host, port):
+        raise OSError("network is unreachable")
+
+    checks = remote_checks(env={"STT_BACKEND": "deepgram"}, connect=down)
+    assert [c.ok for c in checks] == [False, False]

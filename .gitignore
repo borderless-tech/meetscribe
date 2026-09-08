@@ -21,5 +21,6 @@ meetscribe-*/
 .idea/
 .vscode/
 
-# local env variables
+# local env variables / direnv entrypoint
 .env
+.envrc

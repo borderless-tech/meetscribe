@@ -39,6 +39,25 @@ is far more robust: after a recording stops, meetscribe asks how many people wer
 meeting; `process` takes the same number as `--speakers N`. Count yourself in both cases —
 meetscribe subtracts you before diarizing, since your own voice lives on the mic track.
 
+### Remote backend (Deepgram, opt-in)
+
+Transcription + diarization can optionally run on the Deepgram API instead of the local
+models — faster, but the meeting **audio is uploaded** (embeddings are still computed
+locally and never leave the machine):
+
+```bash
+export DEEPGRAM_API_KEY=...                                   # required; no silent fallback
+nix run . -- process ./meeting-dir --backend deepgram --language de
+# or via env: STT_BACKEND=deepgram STT_LANGUAGE=de nix run .
+```
+
+Flags beat the `STT_BACKEND`/`STT_LANGUAGE` env vars; the default stays fully
+local/offline. `meta.json` records `"backend"` plus Deepgram's model versions and request
+ids. `doctor` checks the key and API reachability when `STT_BACKEND=deepgram` is set.
+`--speakers` (and the post-recording participant count) only steers the local diarizer —
+Deepgram infers the speaker count itself, so remotely it is warned about and ignored
+(participant *names* still help: they feed the glossary, which is sent as keyterm boosts).
+
 ## Terminal output
 
 While recording, live level-meters show both tracks in real time — a dead track is obvious

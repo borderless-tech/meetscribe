@@ -20,6 +20,25 @@ from collections.abc import Sequence
 from . import __version__
 
 
+def _add_backend_flags(p: argparse.ArgumentParser) -> None:
+    """STT backend selection, shared by ``record`` and ``process``.
+
+    Defaults are ``None`` (NOT "local"/"de") so the pipeline can apply the
+    flag > env (``STT_BACKEND``/``STT_LANGUAGE``) > default precedence — a concrete
+    parser default would shadow the env variables."""
+    p.add_argument(
+        "--backend", choices=("local", "deepgram"), default=None,
+        help="transcription backend (default: $STT_BACKEND or local). 'deepgram' uploads "
+             "the meeting AUDIO to the Deepgram API (requires DEEPGRAM_API_KEY); "
+             "embeddings are always computed locally",
+    )
+    p.add_argument(
+        "--language", default=None, metavar="LANG",
+        help="spoken language for the remote backend, e.g. de/en/multi "
+             "(default: $STT_LANGUAGE or de); ignored by the local backend",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser. Pure — no side effects, for easy testing."""
     parser = argparse.ArgumentParser(
@@ -56,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-cleanup", action="store_true",
         help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
     )
+    _add_backend_flags(p_record)
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
     p_process.add_argument("audio", nargs="?", help="path to an existing recording to process")
@@ -71,12 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_process.add_argument(
         "--speakers", type=int, default=None, metavar="N",
         help="number of people in the meeting, including you — same question the "
-             "record flow asks (default: automatic threshold clustering)",
+             "record flow asks (default: automatic threshold clustering); local "
+             "backend only — deepgram infers the count itself (warned + ignored)",
     )
     p_process.add_argument(
         "--no-cleanup", action="store_true",
         help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
     )
+    _add_backend_flags(p_process)
 
     p_bundle = sub.add_parser("bundle", help="zip an artifact directory into one .mscribe")
     p_bundle.add_argument(
@@ -128,6 +150,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             system_source=getattr(args, "system_source", None),
             reporter=reporter,
             cleanup=not getattr(args, "no_cleanup", False),
+            backend=getattr(args, "backend", None),
+            language=getattr(args, "language", None),
         )
     if command == "process":
         from . import pipeline
@@ -142,6 +166,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             reporter=reporter,
             num_speakers=-1 if speakers is None else speakers_from_count(speakers),
             cleanup=not getattr(args, "no_cleanup", False),
+            backend=getattr(args, "backend", None),
+            language=getattr(args, "language", None),
         )
     if command == "clean":
         from . import pipeline

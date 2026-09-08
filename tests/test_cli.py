@@ -240,3 +240,68 @@ def test_main_process_forwards_speakers(monkeypatch):
 
     assert main(["process", "x", "--speakers", "1"]) == 0
     assert captured["num_speakers"] == -1
+
+
+# ---- --backend / --language ----------------------------------------------------------
+
+def test_backend_and_language_flags_parse_on_process_and_record():
+    for base in (["process", "x"], ["record"]):
+        args = build_parser().parse_args(base + ["--backend", "deepgram", "--language", "en"])
+        assert args.backend == "deepgram"
+        assert args.language == "en"
+
+
+def test_backend_and_language_default_to_none():
+    # None (not "local"/"de") so pipeline.run can apply flag > env > default precedence:
+    # a concrete parser default would shadow STT_BACKEND / STT_LANGUAGE.
+    for base in (["process", "x"], ["record"]):
+        args = build_parser().parse_args(base)
+        assert args.backend is None
+        assert args.language is None
+
+
+def test_backend_flag_rejects_unknown_value():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["process", "x", "--backend", "whisper"])
+
+
+def test_main_process_forwards_backend_and_language(monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.cli import main
+
+    captured = {}
+    monkeypatch.setattr(pipeline, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["process", "x", "--backend", "deepgram", "--language", "en"]) == 0
+    assert captured["backend"] == "deepgram"
+    assert captured["language"] == "en"
+
+    assert main(["process", "x"]) == 0
+    assert captured["backend"] is None  # unset flag → pipeline resolves env/default
+    assert captured["language"] is None
+
+
+def test_main_record_forwards_backend_and_language(monkeypatch):
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["record", "--backend", "deepgram", "--language", "multi"]) == 0
+    assert captured["backend"] == "deepgram"
+    assert captured["language"] == "multi"
+
+
+def test_main_bare_invocation_backend_fallbacks_match_parser_defaults(monkeypatch):
+    # Bare `meetscribe` never runs the subparser, so record.run gets backend/language via
+    # the getattr fallbacks — they must equal the parser defaults (None → env/default).
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["--quiet"]) == 0
+    assert captured["backend"] is None
+    assert captured["language"] is None
