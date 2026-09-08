@@ -2,19 +2,20 @@
 
 One term per line; blank lines and ``#`` comments are ignored. :func:`append` is a
 case-insensitive, order-preserving dedup so recurring names accumulate across meetings
-without ever duplicating. The file lives under ``$XDG_CONFIG_HOME`` (else ``~/.config``).
+without ever duplicating. The file lives next to the config file, under
+``config.config_home()`` (``$XDG_CONFIG_HOME``, else ``~/.config``).
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 
 def default_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME")
-    root = Path(base) if base else Path.home() / ".config"
-    return root / "meetscribe" / "glossary.txt"
+    """``config_home()/meetscribe/glossary.txt`` — always the config file's directory."""
+    from . import config
+
+    return config.config_home() / "meetscribe" / "glossary.txt"
 
 
 def load(path: str | Path) -> list[str]:

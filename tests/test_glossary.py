@@ -38,6 +38,22 @@ def test_default_path_honours_xdg(monkeypatch, tmp_path):
     assert glossary.default_path() == tmp_path / "meetscribe" / "glossary.txt"
 
 
+def test_default_path_falls_back_to_dot_config(monkeypatch, tmp_path):
+    # Same behavior as before the XDG helper was hoisted into config.config_home().
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert glossary.default_path() == tmp_path / ".config" / "meetscribe" / "glossary.txt"
+
+
+def test_default_path_delegates_to_config_home(monkeypatch, tmp_path):
+    # The glossary and the config file must always share one directory: the path is
+    # derived from config.config_home(), not a private XDG lookup.
+    from meetscribe import config
+
+    monkeypatch.setattr(config, "config_home", lambda: tmp_path / "hoisted")
+    assert glossary.default_path() == tmp_path / "hoisted" / "meetscribe" / "glossary.txt"
+
+
 def test_base_has_tech_and_officetalk_terms():
     b = glossary.base()
     for term in ["HubSpot", "Teams", "committen", "Onboarding", "PwC"]:

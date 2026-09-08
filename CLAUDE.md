@@ -102,8 +102,8 @@ stdin (a hard kill corrupts WAV headers).
 
 Opt-in alternative to the local sherpa path: `--backend deepgram` on `record`/`process`, or
 `STT_BACKEND=deepgram`; language via `--language`/`STT_LANGUAGE` (default `de`). Precedence is
-always **flag > env > default**, resolved once in `pipeline.run` (`resolve_backend`/
-`resolve_language`). `backends.py` defines the seam (`TranscriptionBackend` →
+always **flag > env > config > default** (see § Configuration), resolved once in `pipeline.run`
+(`resolve_backend`/`resolve_language`). `backends.py` defines the seam (`TranscriptionBackend` →
 `BackendResult`); `deepgram.py` implements it over stdlib `urllib` (no SDK, no new deps),
 uploading the mic track plain and the system track with `diarize=true`, forwarding glossary
 terms as nova-3 `keyterm` boosts. Rules:
@@ -126,6 +126,44 @@ terms as nova-3 `keyterm` boosts. Rules:
   fully local/offline.
 - Real-API e2e: `tests/test_deepgram_e2e.py` (paid, ~$0.01/run; double-gated on
   `DEEPGRAM_API_KEY` + `MEETSCRIBE_MODELS`).
+
+## Configuration
+
+`config.py` owns all of it — the TOML file, the XDG paths, and the **one precedence rule
+everywhere: flag > env > config > default**. Read-only stdlib `tomllib`; we never write TOML
+(the `config init` template is the plain string `config.TEMPLATE`).
+
+**Paths** (Linux + macOS, both via XDG):
+- Config: `$XDG_CONFIG_HOME/meetscribe/config.toml` (`~/.config` fallback);
+  `MEETSCRIBE_CONFIG=<path>` overrides — tests monkeypatch these and must **never** read the
+  real home.
+- Recordings default: `$XDG_DATA_HOME/meetscribe/meetings/` (`~/.local/share` fallback) —
+  `record` without `-o` writes `<meetings_dir>/meetscribe-<timestamp>/` there.
+- Glossary (unchanged): `$XDG_CONFIG_HOME/meetscribe/glossary.txt` (`glossary.py` uses
+  `config.config_home()`).
+
+**Schema v1** (all keys optional; empty strings count as unset): `[stt]
+backend`/`language`, `[deepgram] api_key`/`api_key_cmd` (mutually exclusive; the cmd is a
+shell command printing the key, executed lazily via `config.fetch_api_key` only when the
+deepgram backend actually needs it — never by `config` display, `validate`, or doctor),
+`[storage] meetings_dir`, `[record]
+system_source`, `[output] bundle`/`cleanup`. `[bk]` is reserved for Phase 2 and never
+reported as unknown. Unknown keys warn; **malformed TOML is exit 2 with file + line**
+(`ConfigError`) — a typo'd config silently degrading to defaults is the worst failure mode.
+Booleans must be real TOML booleans (`"false"` is a `ConfigError`, never truthy).
+
+Every resolver in `config.py` returns `Resolved(value, origin)` with origin ∈
+`flag|env|config|default`, so `meetscribe config` can show *why* each value is what it is
+(`config init` writes the 0600 template, `config path` prints the path). `doctor` runs a
+config check first (path + parse status red-with-line, unknown-key and api_key-permission
+warnings) that never aborts the audio checks.
+
+**The None-default flag pattern:** tri-state CLI flags (`--bundle/--no-bundle`,
+`--cleanup/--no-cleanup`, `--backend`, `--language`, `--system-source`) have parser default
+`None` = "flag not given → resolve env/config/default downstream" in
+`pipeline.run`/`record.run`. An explicit flag value always wins. When adding a config-backed
+option, keep this shape: never give the parser a concrete default, or the config layer
+underneath becomes unreachable.
 
 ## Outputs
 

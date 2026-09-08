@@ -27,15 +27,17 @@ class Check:
     name: str
     ok: bool
     hint: str | None = None
+    #: Advisory: rendered as ``!`` with its hint, but never fails the run.
+    warn: bool = False
 
 
 def format_report(checks: list[Check]) -> str:
     lines: list[str] = []
     for c in checks:
-        if c.ok:
+        if c.ok and not c.warn:
             lines.append(f"✓ {c.name}")
         else:
-            lines.append(f"✗ {c.name}")
+            lines.append(f"{'!' if c.warn else '✗'} {c.name}")
             if c.hint:
                 lines.append(f"    → {c.hint}")
     return "\n".join(lines)
@@ -43,6 +45,69 @@ def format_report(checks: list[Check]) -> str:
 
 def checks_pass(checks: list[Check]) -> bool:
     return all(c.ok for c in checks)
+
+
+def config_checks(path: str | os.PathLike | None = None) -> list[Check]:
+    """Config-file health: path in use + existence, parse status, unknown-key and
+    api_key-permission warnings.
+
+    Returns Checks and never raises — a broken config is a red check, not an abort,
+    so the audio checks that follow always run. A missing file is fine (all defaults).
+    Malformed TOML (or an unreadable file) is red with the detail; wrongly-typed
+    values — valid TOML that every record/process run would reject with exit 2 —
+    are red too (the resolvers run here); unknown keys (typo detection) and a
+    group/world-readable file with ``[deepgram].api_key`` set are warnings.
+    """
+    from . import config as config_mod
+
+    p = Path(path) if path is not None else config_mod.config_path()
+    if not p.exists():
+        return [Check(f"Config {p} (not found — defaults apply)", True)]
+    try:
+        cfg = config_mod.load(p)
+    except config_mod.ConfigError as e:
+        detail = f"malformed TOML at line {e.line}" if e.line is not None else str(e)
+        return [
+            Check(
+                f"Config {p}",
+                False,
+                f"{detail} — fix it or remove the file "
+                "(meetscribe refuses to silently fall back to defaults)",
+            )
+        ]
+    out = [Check(f"Config {p}", True)]
+    try:
+        config_mod.validate(cfg)
+    except config_mod.ConfigError as e:
+        out.append(
+            Check(
+                "Config values",
+                False,
+                f"{e} — every record/process run would abort on this (exit 2)",
+            )
+        )
+    unknown = config_mod.unknown_keys(cfg)
+    if unknown:
+        out.append(
+            Check(
+                "Config keys",
+                True,
+                f"unknown key{'s' if len(unknown) > 1 else ''}: "
+                f"{', '.join(unknown)} — typo? (ignored)",
+                warn=True,
+            )
+        )
+    if config_mod.insecure_api_key_perms(p):
+        out.append(
+            Check(
+                "Config permissions",
+                True,
+                f"[deepgram].api_key is set but {p} is group/world-readable — "
+                f"chmod 0600 {p}",
+                warn=True,
+            )
+        )
+    return out
 
 
 def linux_monitor_check(sources: list[str], default_sink: str | None) -> Check:
@@ -84,14 +149,25 @@ def _tls_connect(host: str, port: int, timeout_s: float = 5.0) -> None:
             pass
 
 
-def deepgram_key_check(api_key: str | None) -> Check:
-    ok = bool(api_key and api_key.strip())
+def deepgram_key_check(api_key) -> Check:
+    from . import config as config_mod
+
+    # An ApiKeyCmd marker counts as available but is NOT executed here — doctor
+    # may run headless, and a keyring command could block on a pinentry prompt.
+    if isinstance(api_key, config_mod.ApiKeyCmd):
+        ok = bool(api_key.cmd.strip())
+    else:
+        ok = bool(api_key and api_key.strip())
     return Check(
-        "DEEPGRAM_API_KEY set",
+        "Deepgram API key set",
         ok,
         None
         if ok
-        else "export DEEPGRAM_API_KEY=<key> — the deepgram backend has no local fallback",
+        else (
+            "export DEEPGRAM_API_KEY=<key> or set [deepgram].api_key / "
+            f"api_key_cmd in {config_mod.config_path()} — the deepgram backend "
+            "has no local fallback"
+        ),
     )
 
 
@@ -111,19 +187,36 @@ def deepgram_reachability_check(connect: Connect | None = None) -> Check:
 
 
 def remote_checks(
-    env: Mapping[str, str] | None = None, connect: Connect | None = None
+    env: Mapping[str, str] | None = None,
+    connect: Connect | None = None,
+    cfg: dict | None = None,
 ) -> list[Check]:
     """Extra checks when the STT backend resolves to ``deepgram``; empty for local.
 
-    Doctor has no ``--backend`` flag, so resolution here is env > default (``STT_BACKEND``,
-    matching the pipeline's precedence chain minus the flag).
+    Doctor has no ``--backend`` flag, so resolution here is env > config > default —
+    the pipeline's precedence chain minus the flag (``config.backend`` /
+    ``config.api_key``), so a config-driven deepgram setup gets the same verdict
+    doctor gives an env-driven one. A config the loader/resolvers reject falls back
+    to env-only resolution here; ``config_checks`` already reports the file red.
     """
+    from . import config as config_mod
+
     env = os.environ if env is None else env
-    backend = (env.get("STT_BACKEND") or "local").strip().lower() or "local"
+    if cfg is None:
+        try:
+            cfg = config_mod.load()
+        except config_mod.ConfigError:
+            cfg = {}
+    try:
+        backend = config_mod.backend(None, env, cfg).value
+        key = config_mod.api_key(None, env, cfg).value
+    except config_mod.ConfigError:
+        backend = config_mod.backend(None, env, {}).value
+        key = config_mod.api_key(None, env, {}).value
     if backend != "deepgram":
         return []
     return [
-        deepgram_key_check(env.get("DEEPGRAM_API_KEY")),
+        deepgram_key_check(key),
         deepgram_reachability_check(connect),
     ]
 
@@ -168,13 +261,16 @@ class RealProbe:
     """Real platform probes. Not unit-tested; run for real via ``nix run .#doctor``."""
 
     def checks(self) -> list[Check]:
-        out = [self._ffmpeg(), self._models()]
+        # Config first — and config_checks never raises, so a broken config file
+        # cannot abort the audio checks below.
+        out = config_checks()
+        out += [self._ffmpeg(), self._models()]
         if platform.system() == "Darwin":
             out += self._macos_audio()
         else:
             out += self._linux_audio()
         out.append(self._mic_rms())
-        out += remote_checks()  # no-op unless STT_BACKEND=deepgram
+        out += remote_checks()  # no-op unless the backend resolves to deepgram (env/config)
         return out
 
     def _ffmpeg(self) -> Check:

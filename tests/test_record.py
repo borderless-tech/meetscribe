@@ -28,6 +28,20 @@ from meetscribe.record import (
 FIX = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_config(monkeypatch, tmp_path):
+    """No test may read the real home: the config is a per-test tmp file (missing by
+    default → all defaults) and the XDG dirs point into tmp_path (the record flow also
+    touches the glossary under XDG_CONFIG_HOME). Tests that need a config layer write
+    ``tmp_path / "config.toml"``. The STT env vars are scrubbed too — a developer
+    shell exporting STT_BACKEND/DEEPGRAM_API_KEY must not leak into run() tests."""
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+
+
 # ---- macOS device parsing / matching -------------------------------------------------
 
 def test_parse_avfoundation_audio_devices_only():
@@ -494,3 +508,170 @@ def test_run_unknown_backend_env_fails_before_recording(tmp_path, monkeypatch, c
     from meetscribe import record
     assert record.run(out_dir=str(tmp_path / "m")) == 2
     assert "deepgramm" in capsys.readouterr().out
+
+
+# ---- config-backed resolution (meetings_dir / system_source / bundle / cleanup) -------
+
+def _stub_run(monkeypatch, captured):
+    """Stub the capture + pipeline hand-off; ``captured`` collects pipeline.run kwargs."""
+    monkeypatch.setattr("meetscribe.record.record_tracks", lambda *a, **k: None)
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: False)
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: captured.update(k) or 0)
+
+
+def test_run_default_out_dir_under_meetings_dir(tmp_path, monkeypatch):
+    # Without -o, recordings land under <meetings_dir>/meetscribe-<timestamp>/ —
+    # $XDG_DATA_HOME/meetscribe/meetings by default — instead of littering the CWD.
+    captured = {}
+    _stub_run(monkeypatch, captured)
+
+    from meetscribe import record
+    assert record.run() == 0
+    root = Path(captured["audio"])
+    assert root.parent == tmp_path / "xdg-data" / "meetscribe" / "meetings"
+    assert root.name.startswith("meetscribe-")
+    assert (root / "raw").is_dir()  # created with parents
+
+
+def test_run_meetings_dir_from_config(tmp_path, monkeypatch):
+    # [storage].meetings_dir beats the XDG default; -o (out_dir) still wins per run.
+    captured = {}
+    _stub_run(monkeypatch, captured)
+    (tmp_path / "config.toml").write_text(
+        f'[storage]\nmeetings_dir = "{tmp_path / "mtg"}"\n'
+    )
+
+    from meetscribe import record
+    assert record.run() == 0
+    assert Path(captured["audio"]).parent == tmp_path / "mtg"
+
+    assert record.run(out_dir=str(tmp_path / "explicit")) == 0
+    assert Path(captured["audio"]) == tmp_path / "explicit"  # -o untouched
+
+
+def test_run_system_source_from_config(tmp_path, monkeypatch):
+    # [record].system_source fills in when the flag is absent; the flag wins.
+    captured_pl: dict = {}
+    captured_rec: dict = {}
+    _stub_run(monkeypatch, captured_pl)
+    monkeypatch.setattr(
+        "meetscribe.record.record_tracks", lambda *a, **k: captured_rec.update(k)
+    )
+    (tmp_path / "config.toml").write_text('[record]\nsystem_source = "cfg_sink.monitor"\n')
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured_rec["system_source"] == "cfg_sink.monitor"
+
+    assert record.run(out_dir=str(tmp_path / "m"), system_source="flag.monitor") == 0
+    assert captured_rec["system_source"] == "flag.monitor"
+
+
+def test_run_resolves_bundle_and_cleanup(tmp_path, monkeypatch):
+    # None = "resolve from config" (contract with the CLI): default on, config layer
+    # beneath, an explicit flag on top.
+    captured = {}
+    _stub_run(monkeypatch, captured)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["bundle"] is True and captured["cleanup"] is True  # defaults on
+
+    (tmp_path / "config.toml").write_text("[output]\nbundle = false\ncleanup = false\n")
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["bundle"] is False and captured["cleanup"] is False  # config layer
+
+    assert record.run(out_dir=str(tmp_path / "m"), bundle=True, cleanup=True) == 0
+    assert captured["bundle"] is True and captured["cleanup"] is True  # flag wins
+
+
+def test_run_malformed_config_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # A typo'd config must abort (exit 2, path + line) BEFORE ffmpeg starts.
+    (tmp_path / "config.toml").write_text("[output\nbundle = false\n")
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run with a malformed config")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 2
+    printed = capsys.readouterr().out
+    assert "config.toml" in printed and "line 1" in printed
+    assert not (tmp_path / "m").exists()  # nothing was created either
+
+
+class _WarnReporter:
+    """Minimal reporter capturing warn() calls (record.run only warns directly)."""
+
+    def __init__(self):
+        self.warns = []
+
+    def warn(self, msg):
+        self.warns.append(msg)
+
+    def info(self, msg):
+        pass
+
+
+def test_run_warns_on_unknown_config_key(tmp_path, monkeypatch):
+    # Design: a typo'd key warns at LOAD time on every record run — the user must
+    # not need to run doctor to learn their config is being ignored.
+    captured = {}
+    _stub_run(monkeypatch, captured)
+    (tmp_path / "config.toml").write_text("[output]\nbundel = false\n")
+
+    from meetscribe import record
+    rep = _WarnReporter()
+    assert record.run(out_dir=str(tmp_path / "m"), reporter=rep) == 0
+    assert any("output.bundel" in w for w in rep.warns), rep.warns
+
+
+def test_run_wrongly_typed_language_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # A wrongly-typed [stt].language previously crashed only in the pipeline
+    # hand-off — AFTER the whole meeting was recorded. Preflight must catch it.
+    (tmp_path / "config.toml").write_text("[stt]\nlanguage = 5\n")
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run with a broken config")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 2
+    assert "language" in capsys.readouterr().out
+    assert not (tmp_path / "m").exists()  # nothing was created either
+
+
+def test_run_deepgram_key_from_config_passes_preflight(tmp_path, monkeypatch):
+    # [deepgram].api_key (no env var) satisfies the fail-fast preflight.
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+    (tmp_path / "config.toml").write_text('[deepgram]\napi_key = "dg_cfg_key"\n')
+    captured = {}
+    _stub_run(monkeypatch, captured)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 0
+    assert captured["backend"] == "deepgram"
+
+
+def test_run_deepgram_failing_key_cmd_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # api_key_cmd is executed eagerly at record start (pinentry there is fine —
+    # the user just initiated recording); a broken keyring command must fail
+    # BEFORE ffmpeg, not after an hour of recording.
+    cfgfile = tmp_path / "config.toml"
+    cfgfile.write_text('[deepgram]\napi_key_cmd = "echo kaboom >&2; exit 5"\n')
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(cfgfile))
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run when the key cmd fails")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 2
+    assert "api_key_cmd" in capsys.readouterr().out

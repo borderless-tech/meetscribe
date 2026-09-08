@@ -39,6 +39,44 @@ is far more robust: after a recording stops, meetscribe asks how many people wer
 meeting; `process` takes the same number as `--speakers N`. Count yourself in both cases —
 meetscribe subtracts you before diarizing, since your own voice lives on the mic track.
 
+## Configuration
+
+meetscribe reads an optional TOML config from `$XDG_CONFIG_HOME/meetscribe/config.toml`
+(`~/.config/meetscribe/config.toml` fallback; `MEETSCRIBE_CONFIG=<path>` overrides). One
+precedence rule everywhere: **flags > environment > config file > built-in defaults.**
+
+```bash
+meetscribe config init    # write a commented template (0600) to the config path
+meetscribe config         # show every effective value and where it came from
+meetscribe config path    # print just the path (scripting)
+```
+
+All keys are optional — with no config file, behavior is all defaults:
+
+```toml
+[stt]
+backend = "local"        # "local" | "deepgram"
+language = "de"          # remote-STT language
+
+[deepgram]
+api_key = ""             # env DEEPGRAM_API_KEY wins; keep this file 0600 when set
+api_key_cmd = ""         # or: shell command printing the key ("pass show deepgram")
+
+[storage]
+meetings_dir = ""        # default: $XDG_DATA_HOME/meetscribe/meetings
+
+[record]
+system_source = ""       # fixed system-audio source (auto-detected when empty)
+
+[output]
+bundle = true            # write the .mscribe bundle
+cleanup = true           # run the LLM cleanup pass
+```
+
+Recordings land under `$XDG_DATA_HOME/meetscribe/meetings/` by default (`-o` overrides per
+run). A malformed config exits with an error pointing at the offending line — it never
+silently falls back to defaults; `doctor` also reports the config's health.
+
 ### Remote backend (Deepgram, opt-in)
 
 Transcription + diarization can optionally run on the Deepgram API instead of the local

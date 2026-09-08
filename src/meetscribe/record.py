@@ -443,23 +443,56 @@ def ask_participants(input_fn=input) -> int:
 
 
 def run(
-    out_dir: str | None = None, bundle: bool = False, reporter=None,
-    system_source: str | None = None, cleanup: bool = True,
+    out_dir: str | None = None, bundle: bool | None = None, reporter=None,
+    system_source: str | None = None, cleanup: bool | None = None,
     backend: str | None = None, language: str | None = None,
 ) -> int:
+    import os
     from datetime import datetime, timezone
 
+    from . import config as config_mod
     from . import pipeline
+    from .progress import NullReporter
 
-    # Fail fast (non-negotiable): an unknown backend name or a missing
-    # DEEPGRAM_API_KEY must surface BEFORE ffmpeg starts — not after the whole
-    # meeting has been recorded and the prompts were answered.
-    backend_err = pipeline.check_backend(backend)[1]
+    reporter = reporter or NullReporter()
+
+    # Resolve everything config-backed up front and fail fast (non-negotiable): a
+    # malformed config, an unknown backend name, a missing Deepgram key, or a
+    # wrongly-typed value must surface BEFORE ffmpeg starts — not after the whole
+    # meeting has been recorded and the prompts were answered. bundle/cleanup:
+    # None = "flag not given" → config layer → default on (contract with the CLI);
+    # an explicit flag wins.
+    try:
+        cfg = config_mod.load()
+        for msg in config_mod.load_warnings(cfg):  # unknown keys, api_key perms
+            reporter.warn(msg)
+        backend_name, backend_err = pipeline.check_backend(backend, cfg=cfg)
+        if backend_name == "deepgram" and not backend_err:
+            # Eagerly execute an api_key_cmd: a pinentry prompt at record start is
+            # fine (the user just initiated recording); a broken keyring command
+            # an hour later — after the meeting was recorded — is not.
+            config_mod.fetch_api_key(config_mod.api_key(None, os.environ, cfg).value)
+        # Validate-only: pipeline.run re-resolves language; a broken [stt].language
+        # must abort here, not in the hand-off after the recording.
+        config_mod.language(language, os.environ, cfg)
+        system_source = config_mod.system_source(system_source, os.environ, cfg).value
+        bundle = config_mod.bundle(bundle, os.environ, cfg).value
+        cleanup = config_mod.cleanup(cleanup, os.environ, cfg).value
+        if out_dir is None:
+            # Without -o, recordings land under the resolved meetings_dir
+            # ($XDG_DATA_HOME/meetscribe/meetings by default) — never the CWD.
+            meetings = config_mod.meetings_dir(None, os.environ, cfg).value
+            out_dir = str(
+                meetings / f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
+            )
+    except config_mod.ConfigError as e:
+        print(pipeline.config_error_message(e))
+        return 2
     if backend_err:
         print(backend_err)
         return 2
 
-    root = Path(out_dir or f"meetscribe-{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}")
+    root = Path(out_dir)
     raw = root / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     mic_out = str(raw / "mic.wav")
@@ -486,5 +519,5 @@ def run(
         audio=str(root), out_dir=str(root),
         bundle=bundle, started_at=started_at, reporter=reporter,
         num_speakers=num_speakers, cleanup=cleanup,
-        backend=backend, language=language,  # resolution (flag > env > default) is run()'s job
+        backend=backend, language=language,  # resolution (flag > env > config > default) is run()'s job
     )
