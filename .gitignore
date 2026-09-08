@@ -20,3 +20,6 @@ meetscribe-*/
 # editor
 .idea/
 .vscode/
+
+# local env variables
+.env
