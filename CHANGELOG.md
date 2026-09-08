@@ -11,6 +11,12 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-08
+
+Feature release shipped as a patch (0.x pragmatism — same-day follow-up to 0.2.0). No
+breaking changes: the artifact contract stays at `format_version` 2, `local` remains the
+default backend, and all CLI/meta additions are backwards-compatible.
+
 ### Added
 - Optional remote transcription backend: `--backend deepgram` on `record`/`process` (or
   `STT_BACKEND=deepgram`), with `--language`/`STT_LANGUAGE` (default `de`). Both tracks are
@@ -28,6 +34,11 @@ bump always warrants at least a minor version bump here, and is called out in th
 - With `--backend deepgram` the meeting **audio leaves the machine** (both tracks are
   uploaded to Deepgram's API). Speaker embeddings are still computed locally (CAM++) and
   never uploaded; the default remains fully local/offline.
+
+### Fixed
+- `nix flake check` (the CI gate) had failed since the 0.2.0 SemVer setup: the hermetic
+  test derivation was missing `uv.lock` and `CHANGELOG.md`, which `tests/test_version.py`
+  guards against.
 
 ## [0.2.0] - 2026-09-08
 
@@ -71,6 +82,7 @@ producing a diarized transcript with per-word timestamps and 192-dim speaker emb
 (per-turn + per-cluster centroid). Silero VAD, Parakeet TDT ASR, sherpa-onnx diarization,
 `doctor` preflight checks, reproducible Nix/uv2nix build with SHA-256-pinned models.
 
-[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/borderless-tech/meetscribe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/borderless-tech/meetscribe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/borderless-tech/meetscribe/releases/tag/v0.1.0
