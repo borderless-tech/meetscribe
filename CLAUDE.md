@@ -115,6 +115,21 @@ Three artifacts (`output.py`), plus an optional single-file bundle:
   `docs/plans/2026-08-02-bundle-format-design.md`. `bundle_dir` / `default_bundle_name` in
   `output.py` are the *only* places that know the member names and naming scheme — keep it that way.
 
+## Versioning & releases
+
+SemVer + [Keep a Changelog](CHANGELOG.md). To cut a release:
+
+1. Bump the version in **both** `pyproject.toml` and `src/meetscribe/__init__.py`, then run
+   `nix develop -c uv lock` (uv.lock records the project's own version).
+2. Move the `## [Unreleased]` notes into a new `## [x.y.z] - <date>` section (+ compare link
+   at the bottom) — and keep `[Unreleased]` fed as features land, not at release time.
+3. Commit, then `git tag vX.Y.Z` (push tags with `git push --tags`).
+
+`tests/test_version.py` enforces the sync (pyproject == `__version__` == uv.lock, changelog
+entry exists), so forgetting a step fails the suite. The artifact contract is versioned
+separately by the integer `format_version` (`output.py`); bumping it warrants at least a
+minor release and an explicit changelog callout.
+
 ## Invariants / gotchas
 
 - **Embedding dimension is 192** (CAM++), read at runtime from `extractor.dim` — **never hard-code
