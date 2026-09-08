@@ -52,12 +52,17 @@ merge them into one review task — see the forward-compat rules).
   payloads. The labels are the shared keys — they're identical in `transcript.json` and
   `embeddings.npz` inside the bundle.
 - **Suggestions, not questions.** The `speaker_annotation` payload should carry your best
-  guesses: pgvector matches against previous meetings' cluster/turn vectors
+  guesses: voice matches against previous meetings' cluster/turn vectors
   (`source: "voice_match"`), calendar attendees (`source: "roster"`), and the uploading
   user for `me` (`source: "owner"`). The common case in the client is then one-click
   confirmation. The embeddings you need ship in every bundle (192-dim CAM++; dimension and
-  model identity in `meta.json` — reject vectors whose `embedding_model_sha256` doesn't
-  match your stored history, they'd be incomparable).
+  model identity in `meta.json`). *Settled 2026-09-09:* treat **(model name, sha256) as the
+  model identity and scope matching to it** — a bundle under a new identity matches nothing
+  (speakers surface with roster/owner suggestions only) and its vectors seed the new
+  identity's history. No hard reject; uploads never fail over a model upgrade. Nice-to-have:
+  when a bundle's identity is new, hint it in the annotation step ("first meeting with a new
+  voice model — matches resume as history builds") so all-unresolved speakers don't read as
+  a bug.
 - **Attendees carry `email` AND `name`** (nullable) — you manage contacts, so resolve names
   where you can; meetscribe feeds them into its ASR keyterm boost, which measurably improves
   proper-noun recognition. This is why the meetings query happens *before* recording.
@@ -89,9 +94,20 @@ merge them into one review task — see the forward-compat rules).
   (see `docs/plans/2026-09-08-transition-roadmap.md`), so we can integrate incrementally —
   capabilities+upload alone already kills the manual-upload step.
 
-## Open points for you to decide (tell us, we'll follow)
+## Open points — ANSWERED 2026-09-09 (bk review; folded into the contract)
 
-1. Token issuance/scoping: per-user API token from bk settings? That's our assumption.
-2. The matching window for `?around` (we assumed ±30 min; it's your `capabilities` field).
-3. Whether/when to merge `speaker_annotation` + `meeting_mapping` into one review task.
-4. Where the contract copy + fixtures live in the bk repo.
+1. Token issuance: existing per-user bk API keys (created in web UI, shown once, revocable,
+   `Bearer`). No OAuth.
+2. Matching window: ±30 min, served from `/capabilities`.
+3. No task merging: sequential gates, at most one task per `awaiting_review`, and the order
+   flipped to **`meeting_mapping` strictly before `speaker_annotation`** (roster derives
+   from the matched event; `?meeting_id=` on upload skips the mapping gate).
+4. bk copy at `docs/contracts/meetscribe-bk-contract-v1.md`, fixtures in
+   `fixtures/meetscribe-contract/`, asserted against real handler output in bk CI.
+
+Further agreed in the same review: `mscribe_format_versions: [2]` (bk is v2-only),
+`max_bundle_bytes` (50 MiB) in capabilities, idempotency dedupes only while a workflow is
+live (terminal → new workflow), interactive gates time out after 7 days, submit responses
+are current-as-of-acceptance (usually `processing`; keep polling), several review rounds
+per workflow are normal, and voice-match scoping by (model name, sha256) instead of hard
+rejects.
