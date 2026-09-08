@@ -30,6 +30,9 @@ meetscribe = "meetscribe.cli:main"
 # Dev-only tooling. Kept out of the runtime closure (workspace.deps.default).
 dev = [
     "pytest==8.3.4",
+    # Deepgram CLI (`dg`): docs/MCP access + API tooling for the remote-ASR backend.
+    # Project-local on purpose — nothing is installed into the user's home.
+    "deepctl==0.3.0",
 ]
 
 [build-system]

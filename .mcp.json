@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "deepgram": {
+      "type": "stdio",
+      "command": "nix",
+      "args": ["develop", "--command", "dg", "mcp"]
+    }
+  }
+}
