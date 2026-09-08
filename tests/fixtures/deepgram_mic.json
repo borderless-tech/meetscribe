@@ -1,0 +1,56 @@
+{
+  "metadata": {
+    "transaction_key": "deprecated",
+    "request_id": "mic-req-0002",
+    "sha256": "b5f37e0e15296dbb876ce1b30a2d6bc6cf94d13b0e2ba05cbb1a37a0c5bfe0a2",
+    "created": "2026-09-08T10:00:01.000Z",
+    "duration": 3.4,
+    "channels": 1,
+    "models": ["model-uuid-mic"],
+    "model_info": {
+      "model-uuid-mic": {
+        "name": "2-general-nova",
+        "version": "2025-12-15.0",
+        "arch": "nova-3"
+      }
+    }
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Okay, I will check the logs.",
+            "confidence": 0.99,
+            "words": [
+              {"word": "okay", "punctuated_word": "Okay,", "start": 0.1, "end": 0.5, "confidence": 0.99},
+              {"word": "i", "punctuated_word": "I", "start": 0.5, "end": 0.65, "confidence": 0.99},
+              {"word": "will", "start": 0.65, "end": 0.9, "confidence": 0.98},
+              {"word": "check", "punctuated_word": "check", "start": 0.9, "end": 1.3, "confidence": 0.99},
+              {"word": "the", "punctuated_word": "the", "start": 1.3, "end": 1.45, "confidence": 0.99},
+              {"word": "logs", "punctuated_word": "logs.", "start": 1.45, "end": 2.1, "confidence": 0.98}
+            ]
+          }
+        ]
+      }
+    ],
+    "utterances": [
+      {
+        "start": 0.1,
+        "end": 2.1,
+        "confidence": 0.99,
+        "channel": 0,
+        "transcript": "Okay, I will check the logs.",
+        "words": [
+          {"word": "okay", "punctuated_word": "Okay,", "start": 0.1, "end": 0.5, "confidence": 0.99},
+          {"word": "i", "punctuated_word": "I", "start": 0.5, "end": 0.65, "confidence": 0.99},
+          {"word": "will", "start": 0.65, "end": 0.9, "confidence": 0.98},
+          {"word": "check", "punctuated_word": "check", "start": 0.9, "end": 1.3, "confidence": 0.99},
+          {"word": "the", "punctuated_word": "the", "start": 1.3, "end": 1.45, "confidence": 0.99},
+          {"word": "logs", "punctuated_word": "logs.", "start": 1.45, "end": 2.1, "confidence": 0.98}
+        ],
+        "id": "utt-mic-0"
+      }
+    ]
+  }
+}

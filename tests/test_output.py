@@ -184,3 +184,27 @@ def test_write_embeddings_empty_gives_zero_row_arrays(tmp_path):
     assert z["turn_vectors"].shape == (0, DIM)
     assert z["cluster_vectors"].shape == (0, DIM)
     assert z["turn_ids"].shape == (0,)
+
+
+def test_build_meta_backend_defaults_to_local():
+    meta = build_meta(MODELS, embedding_dim=DIM, **BUNDLE_FIELDS)
+    assert meta["backend"] == "local"
+
+
+def test_build_meta_records_backend_and_merges_backend_models():
+    # A remote backend contributes extra identity keys (its substitute for local SHA
+    # pins); build_meta must carry them into meta.json — additively, format_version
+    # stays 2.
+    models = {
+        **MODELS,
+        "asr_model": "deepgram-nova-3",
+        "segmentation_model": "deepgram-diarizer",
+        "backend_model_versions": {"name": "2-general-nova"},
+        "request_ids": ["req-1"],
+    }
+    meta = build_meta(models, embedding_dim=DIM, backend="deepgram", **BUNDLE_FIELDS)
+    assert meta["backend"] == "deepgram"
+    assert meta["asr_model"] == "deepgram-nova-3"
+    assert meta["backend_model_versions"] == {"name": "2-general-nova"}
+    assert meta["request_ids"] == ["req-1"]
+    assert meta["format_version"] == FORMAT_VERSION == 2

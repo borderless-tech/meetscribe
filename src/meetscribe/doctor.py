@@ -11,11 +11,13 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import socket
+import ssl
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Mapping, Protocol
 
 import numpy as np
 
@@ -61,6 +63,69 @@ def linux_monitor_check(sources: list[str], default_sink: str | None) -> Check:
             "start PipeWire; a <sink>.monitor source is required",
         )
     return Check(f"System-audio source → {monitor}", True)
+
+
+# --- Remote-backend checks (STT_BACKEND=deepgram) --------------------------------------------
+# The remote backend has no silent fallback to local, so a missing key or an unreachable API
+# must surface in the preflight, not mid-recording. The reachability probe is a bare DNS+TCP+TLS
+# handshake against the API endpoint — deliberately NOT an HTTP request, so it can never bill.
+
+_DEEPGRAM_HOST = "api.deepgram.com"
+_DEEPGRAM_PORT = 443
+
+# Injected transport seam: callable(host, port) that raises on any DNS/TCP/TLS failure.
+Connect = Callable[[str, int], None]
+
+
+def _tls_connect(host: str, port: int, timeout_s: float = 5.0) -> None:
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, port), timeout=timeout_s) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host):
+            pass
+
+
+def deepgram_key_check(api_key: str | None) -> Check:
+    ok = bool(api_key and api_key.strip())
+    return Check(
+        "DEEPGRAM_API_KEY set",
+        ok,
+        None
+        if ok
+        else "export DEEPGRAM_API_KEY=<key> — the deepgram backend has no local fallback",
+    )
+
+
+def deepgram_reachability_check(connect: Connect | None = None) -> Check:
+    connect = connect or _tls_connect
+    name = f"Deepgram API reachable ({_DEEPGRAM_HOST}:{_DEEPGRAM_PORT})"
+    try:
+        connect(_DEEPGRAM_HOST, _DEEPGRAM_PORT)
+    except Exception:
+        return Check(
+            name,
+            False,
+            f"cannot reach {_DEEPGRAM_HOST}:{_DEEPGRAM_PORT} — offline or DNS/proxy problem? "
+            "the remote backend needs network; use STT_BACKEND=local to work offline",
+        )
+    return Check(name, True)
+
+
+def remote_checks(
+    env: Mapping[str, str] | None = None, connect: Connect | None = None
+) -> list[Check]:
+    """Extra checks when the STT backend resolves to ``deepgram``; empty for local.
+
+    Doctor has no ``--backend`` flag, so resolution here is env > default (``STT_BACKEND``,
+    matching the pipeline's precedence chain minus the flag).
+    """
+    env = os.environ if env is None else env
+    backend = (env.get("STT_BACKEND") or "local").strip().lower() or "local"
+    if backend != "deepgram":
+        return []
+    return [
+        deepgram_key_check(env.get("DEEPGRAM_API_KEY")),
+        deepgram_reachability_check(connect),
+    ]
 
 
 class Probe(Protocol):
@@ -109,6 +174,7 @@ class RealProbe:
         else:
             out += self._linux_audio()
         out.append(self._mic_rms())
+        out += remote_checks()  # no-op unless STT_BACKEND=deepgram
         return out
 
     def _ffmpeg(self) -> Check:

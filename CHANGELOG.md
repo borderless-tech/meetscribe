@@ -11,6 +11,24 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+### Added
+- Optional remote transcription backend: `--backend deepgram` on `record`/`process` (or
+  `STT_BACKEND=deepgram`), with `--language`/`STT_LANGUAGE` (default `de`). Both tracks are
+  transcribed — and the system track diarized — by Deepgram nova-3 over plain stdlib HTTP
+  (no new dependencies). Requires `DEEPGRAM_API_KEY`; a missing key fails fast with exit 2 —
+  there is **no silent fallback** to local. Glossary terms are forwarded as nova-3 `keyterm`
+  boosts. Remote mode loads neither Parakeet nor the diarizer/VAD/GGUF cleaner.
+- `meta.json` gains a top-level `backend` (`local`/`deepgram`) plus, for remote runs, the
+  service's model identity (`backend_model_versions`, `request_ids`) — the remote substitute
+  for local SHA-256 pins. Additive only: `format_version` stays 2.
+- `doctor` preflights the remote backend when `STT_BACKEND=deepgram`: key present +
+  DNS/TCP/TLS reachability of `api.deepgram.com:443` (no billable API call).
+
+### Privacy
+- With `--backend deepgram` the meeting **audio leaves the machine** (both tracks are
+  uploaded to Deepgram's API). Speaker embeddings are still computed locally (CAM++) and
+  never uploaded; the default remains fully local/offline.
+
 ## [0.2.0] - 2026-09-08
 
 ### Added

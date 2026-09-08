@@ -460,3 +460,266 @@ def test_run_forwards_num_speakers_to_build_components(tmp_path, monkeypatch):
     out = tmp_path / "out"
     assert pipeline.run(audio=str(rec), out_dir=str(out), num_speakers=4) == 0
     assert captured["num_speakers"] == 4
+
+
+# ---- backend resolution + remote (deepgram) wiring ----------------------------------
+
+def test_resolve_backend_precedence(monkeypatch):
+    # flag > STT_BACKEND env > default "local"
+    from meetscribe.pipeline import resolve_backend
+
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+    assert resolve_backend(None) == "local"
+    monkeypatch.setenv("STT_BACKEND", "deepgram")
+    assert resolve_backend(None) == "deepgram"
+    assert resolve_backend("local") == "local"  # explicit flag beats env
+
+
+def test_resolve_language_precedence(monkeypatch):
+    # flag > STT_LANGUAGE env > default "de"
+    from meetscribe.pipeline import resolve_language
+
+    monkeypatch.delenv("STT_LANGUAGE", raising=False)
+    assert resolve_language(None) == "de"
+    monkeypatch.setenv("STT_LANGUAGE", "en")
+    assert resolve_language(None) == "en"
+    assert resolve_language("multi") == "multi"  # explicit flag beats env
+
+
+def _remote_rec_dir(tmp_path):
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "mic.wav")
+    _write_wav(rec / "raw" / "system.wav")
+    return rec
+
+
+def test_run_deepgram_without_key_exits_2(tmp_path, monkeypatch, capsys):
+    # NO silent fallback to local: a missing key must abort with an actionable message.
+    from meetscribe import pipeline
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        backend="deepgram") == 2
+    assert "DEEPGRAM_API_KEY" in capsys.readouterr().out
+    assert not (tmp_path / "out" / "transcript.json").exists()  # nothing was processed
+
+
+def test_run_unknown_backend_exits_2(tmp_path, monkeypatch, capsys):
+    # A garbage STT_BACKEND must not be silently treated as local.
+    from meetscribe import pipeline
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setenv("STT_BACKEND", "whisper")
+
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out")) == 2
+    assert "whisper" in capsys.readouterr().out
+
+
+def test_run_deepgram_skips_local_models_and_records_backend_meta(tmp_path, monkeypatch):
+    """Remote mode must not load Parakeet/diarizer/VAD or the GGUF cleaner — only the
+    local embedder (+ NullCleaner) — and meta.json must carry the remote identity."""
+    import json
+
+    from meetscribe import pipeline
+    from meetscribe.backends import BackendResult
+    from meetscribe.types import DiarSegment, Utterance, Word
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "k")
+    monkeypatch.setenv("STT_BACKEND", "deepgram")  # env route (no flag) must work too
+
+    def _boom(*a, **k):
+        raise AssertionError("remote mode must not build the full local components")
+
+    monkeypatch.setattr(pipeline, "build_components", _boom)
+    monkeypatch.setattr(
+        pipeline, "build_embed_components",
+        lambda models_dir: Components(None, None, None, FakeEmbedder()),
+    )
+
+    seen = {}
+
+    def fake_transcribe(self, mic, system, glossary, reporter):
+        seen["language"] = self.config.language
+        return BackendResult(
+            mic_utts=[Utterance(0.0, 1.0, "me", "mic", "hi", (Word("hi", 0.0, 1.0),))],
+            system_utts=[Utterance(0.0, 1.0, "spk_0", "system", "hallo",
+                                   (Word("hallo", 0.0, 1.0),))],
+            system_diar=[DiarSegment(0.0, 1.0, "spk_0")],
+            models_meta={
+                "asr_model": "deepgram-nova-3",
+                "segmentation_model": "deepgram-diarizer",
+                "backend_model_versions": {"name": "2-general-nova"},
+                "request_ids": ["req-1", "req-2"],
+            },
+        )
+
+    import meetscribe.deepgram as dg
+    monkeypatch.setattr(dg.DeepgramBackend, "transcribe", fake_transcribe)
+
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), language="en") == 0
+    assert seen["language"] == "en"  # --language reached the DeepgramConfig
+
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["backend"] == "deepgram"
+    assert meta["asr_model"] == "deepgram-nova-3"
+    assert meta["segmentation_model"] == "deepgram-diarizer"
+    # remote substitute for local SHA pins travels with the artifact
+    assert meta["backend_model_versions"] == {"name": "2-general-nova"}
+    assert meta["request_ids"] == ["req-1", "req-2"]
+    # embeddings stay local: identity + dim recorded exactly as in local mode
+    assert meta["embedding_model"] == "3dspeaker_campplus_sv_zh_en_16k"
+    assert meta["embedding_dim"] == 192
+    assert meta["format_version"] == 2  # additions are additive; version unchanged
+
+    # no cleanup in remote mode (NullCleaner): raw text, cleaned:false
+    doc = json.loads((out / "transcript.json").read_text())
+    assert doc["cleaned"] is False
+    assert {s["speaker"] for s in doc["segments"]} == {"me", "spk_0"}
+
+
+def _deepgram_run_env(tmp_path, monkeypatch):
+    """Shared wiring for deepgram-mode run() tests: env + fake embed components +
+    a scripted DeepgramBackend.transcribe."""
+    from meetscribe import pipeline
+    from meetscribe.backends import BackendResult
+    from meetscribe.types import DiarSegment, Utterance, Word
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "k")
+    monkeypatch.setattr(
+        pipeline, "build_embed_components",
+        lambda models_dir: Components(None, None, None, FakeEmbedder()),
+    )
+
+    def fake_transcribe(self, mic, system, glossary, reporter):
+        return BackendResult(
+            mic_utts=[Utterance(0.0, 1.0, "me", "mic", "hi", (Word("hi", 0.0, 1.0),))],
+            system_utts=[Utterance(0.0, 1.0, "spk_0", "system", "hallo",
+                                   (Word("hallo", 0.0, 1.0),))],
+            system_diar=[DiarSegment(0.0, 1.0, "spk_0")],
+            models_meta={"asr_model": "deepgram-nova-3",
+                         "segmentation_model": "deepgram-diarizer"},
+        )
+
+    import meetscribe.deepgram as dg
+    monkeypatch.setattr(dg.DeepgramBackend, "transcribe", fake_transcribe)
+    return rec
+
+
+def test_run_deepgram_warns_that_speakers_is_ignored(tmp_path, monkeypatch):
+    # Deepgram's diarizer takes no forced cluster count: `--speakers 3` (or the
+    # record-flow participant answer) must WARN, not be silently discarded.
+    from meetscribe import pipeline
+
+    rec = _deepgram_run_env(tmp_path, monkeypatch)
+    rep = RecordingReporter()
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        backend="deepgram", num_speakers=3, reporter=rep) == 0
+    assert any("speakers" in w for w in rep.warns), rep.warns
+
+
+def test_run_deepgram_no_speakers_warning_when_automatic(tmp_path, monkeypatch):
+    # No spurious warning when the count was never given (-1 = automatic).
+    from meetscribe import pipeline
+
+    rec = _deepgram_run_env(tmp_path, monkeypatch)
+    rep = RecordingReporter()
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        backend="deepgram", num_speakers=-1, reporter=rep) == 0
+    assert not any("speakers" in w for w in rep.warns), rep.warns
+
+
+def test_run_deepgram_error_is_a_clean_exit_2(tmp_path, monkeypatch, capsys):
+    # A present-but-invalid key (401 → DeepgramError) must surface as exit 2 with the
+    # server's message — not an unhandled traceback after the meeting was recorded.
+    from meetscribe import pipeline
+    from meetscribe.deepgram import DeepgramError
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "invalid")
+    monkeypatch.setattr(
+        pipeline, "build_embed_components",
+        lambda models_dir: Components(None, None, None, FakeEmbedder()),
+    )
+
+    def fake_transcribe(self, mic, system, glossary, reporter):
+        raise DeepgramError("Deepgram rejected the request (HTTP 401) — check DEEPGRAM_API_KEY")
+
+    import meetscribe.deepgram as dg
+    monkeypatch.setattr(dg.DeepgramBackend, "transcribe", fake_transcribe)
+
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        backend="deepgram") == 2
+    assert "DEEPGRAM_API_KEY" in capsys.readouterr().out
+
+
+# ---- non-16 kHz input ---------------------------------------------------------------
+
+class FixedBackend:
+    """Backend returning a canned BackendResult (stands in for Deepgram: timestamps
+    are true seconds regardless of the file's sample rate)."""
+
+    name = "fixed"
+
+    def __init__(self, result):
+        self.result = result
+
+    def transcribe(self, mic, system, glossary, reporter):
+        return self.result
+
+
+class SliceMeanEmbedder:
+    dim = 192
+
+    def __init__(self):
+        self.means = []
+
+    def embed(self, samples):
+        self.means.append(float(np.mean(samples)))
+        return np.ones(192, dtype=np.float32)
+
+
+def test_process_resamples_non_16k_input(tmp_path):
+    """A 48 kHz WAV (natural with the remote path: Deepgram reads the header, returns
+    true-second timestamps) must not be sliced at 16 kHz offsets: that computed every
+    turn/cluster vector from the wrong audio and inflated duration 3x — silently."""
+    from meetscribe.backends import BackendResult
+    from meetscribe.types import DiarSegment, Utterance, Word
+
+    rate, seconds = 48000, 2.0
+    n = int(rate * seconds)
+    ramp = (np.linspace(0.0, 0.9, n) * 32767).astype("<i2")  # position-encoded content
+    wav = tmp_path / "system.wav"
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(ramp.tobytes())
+
+    embedder = SliceMeanEmbedder()
+    comps = Components(None, None, None, embedder)
+    backend = FixedBackend(BackendResult(
+        mic_utts=[],
+        system_utts=[Utterance(0.5, 1.5, "spk_0", "system", "hallo",
+                               (Word("hallo", 0.5, 1.5),))],
+        system_diar=[DiarSegment(0.5, 1.5, "spk_0")],
+        models_meta={},
+    ))
+    rep = RecordingReporter()
+    res = process(None, str(wav), comps, reporter=rep, backend=backend)
+
+    assert res.duration_s == 2.0  # not 6.0 (96000 samples read as 16 kHz)
+    # the 0.5–1.5 s slice sits at the middle of the ramp → mean ≈ 0.45; the unresampled
+    # bug sliced the first sixth of the file instead (mean ≈ 0.15)
+    assert embedder.means and all(0.4 < m < 0.5 for m in embedder.means), embedder.means
+    assert any("48000" in w for w in rep.warns), rep.warns  # resampling is announced

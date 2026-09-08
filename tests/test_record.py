@@ -440,3 +440,57 @@ def test_run_skips_prompt_without_tty(tmp_path, monkeypatch):
     from meetscribe import record
     assert record.run(out_dir=str(tmp_path / "m")) == 0
     assert captured["num_speakers"] == -1
+
+
+def test_run_forwards_backend_and_language(tmp_path, monkeypatch):
+    # record.run must hand --backend/--language through to pipeline.run untouched
+    # (resolution — flag > env > default — happens once, in the pipeline).
+    captured = {}
+    monkeypatch.setattr("meetscribe.record.record_tracks", lambda *a, **k: None)
+    monkeypatch.setattr("meetscribe.record.warn_if_silent", lambda p: None)
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "k")  # record.run preflights the key
+    import meetscribe.pipeline as pl
+    monkeypatch.setattr(pl, "run", lambda **k: captured.update(k) or 0)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram", language="en") == 0
+    assert captured["backend"] == "deepgram"
+    assert captured["language"] == "en"
+
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["backend"] is None  # default: let the pipeline resolve env
+    assert captured["language"] is None
+
+
+def test_run_deepgram_without_key_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # Non-negotiable: a missing DEEPGRAM_API_KEY must fail BEFORE ffmpeg starts —
+    # not after the user recorded an hour-long meeting and answered the prompts.
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run without a usable backend")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 2
+    assert "DEEPGRAM_API_KEY" in capsys.readouterr().out
+    assert not (tmp_path / "m").exists()  # nothing was created either
+
+
+def test_run_unknown_backend_env_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # A typo'd STT_BACKEND env value bypasses argparse choices — it must still fail
+    # before recording starts, not an hour later in pipeline.run.
+    monkeypatch.setenv("STT_BACKEND", "deepgramm")
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run with an unknown backend")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 2
+    assert "deepgramm" in capsys.readouterr().out

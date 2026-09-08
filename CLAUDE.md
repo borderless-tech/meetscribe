@@ -98,6 +98,35 @@ an aggregate device split by channel; Linux uses two `pulse` inputs (mic + `<sin
 Device indices are matched by **name**, never hard-coded. ffmpeg is stopped by writing `q` to its
 stdin (a hard kill corrupts WAV headers).
 
+## Remote backend (Deepgram)
+
+Opt-in alternative to the local sherpa path: `--backend deepgram` on `record`/`process`, or
+`STT_BACKEND=deepgram`; language via `--language`/`STT_LANGUAGE` (default `de`). Precedence is
+always **flag > env > default**, resolved once in `pipeline.run` (`resolve_backend`/
+`resolve_language`). `backends.py` defines the seam (`TranscriptionBackend` →
+`BackendResult`); `deepgram.py` implements it over stdlib `urllib` (no SDK, no new deps),
+uploading the mic track plain and the system track with `diarize=true`, forwarding glossary
+terms as nova-3 `keyterm` boosts. Rules:
+
+- `DEEPGRAM_API_KEY` is required — missing key is exit 2 with an actionable message,
+  **never** a silent fallback to local. `pipeline.check_backend` is the single validator
+  (name + key) and runs both in `pipeline.run` and at the TOP of `record.run`, so
+  `record --backend deepgram` without a key fails *before* ffmpeg starts — not after an
+  hour of recording. A `DeepgramError` at process time (e.g. invalid key → 401) is also
+  a clean exit 2. Doctor preflights key + reachability when `STT_BACKEND=deepgram`.
+- `--speakers` / the participant-count prompt steers only the local diarizer; remote mode
+  warns and ignores it (participant *names* still matter — they feed the glossary →
+  nova-3 keyterms).
+- **Embeddings stay local in every backend** (CAM++ via `build_embed_components`); only
+  audio is uploaded, vectors never leave the machine. Remote mode must not load Parakeet,
+  the diarizer/VAD, or the GGUF cleaner (`NullCleaner`; transcript ships `cleaned: false`).
+- `meta.json` records `backend` plus the service's `backend_model_versions`/`request_ids`
+  (the remote substitute for SHA-256 pins); additions are additive, `format_version` stays 2.
+- Privacy: with this backend the meeting **audio leaves the machine**. The default remains
+  fully local/offline.
+- Real-API e2e: `tests/test_deepgram_e2e.py` (paid, ~$0.01/run; double-gated on
+  `DEEPGRAM_API_KEY` + `MEETSCRIBE_MODELS`).
+
 ## Outputs
 
 Three artifacts (`output.py`), plus an optional single-file bundle:

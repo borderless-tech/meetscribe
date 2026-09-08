@@ -37,13 +37,17 @@ def build_meta(
     sample_rate: int = 16000,
     cleaned: bool = False,
     cleanup_model: dict | None = None,
+    backend: str = "local",
 ) -> dict:
     """Assemble meta.json. ``models`` supplies the model names + embedding hash.
 
     ``started_at``/``ended_at`` are tz-aware ISO 8601 strings (with offset) — the
     calendar-reconciliation match window. ``cleanup_model`` (name + SHA-256 + params) travels
     with the artifact when the LLM cleanup ran — text cleaned by different models isn't
-    equivalent, same rule as the embedding model identity.
+    equivalent, same rule as the embedding model identity. ``backend`` names the STT path
+    (``local``/``deepgram``); any extra keys in ``models`` (a remote backend's identity, e.g.
+    ``backend_model_versions``/``request_ids``) are merged additively — ``format_version``
+    stays 2.
     """
     meta = {
         "embedding_model": models["embedding_model"],
@@ -51,6 +55,7 @@ def build_meta(
         "embedding_dim": embedding_dim,
         "asr_model": models["asr_model"],
         "segmentation_model": models["segmentation_model"],
+        "backend": backend,
         "sample_rate": sample_rate,
         "meetscribe_version": __version__,
         "meeting_id": meeting_id,
@@ -62,6 +67,10 @@ def build_meta(
     }
     if cleanup_model is not None:
         meta["cleanup_model"] = cleanup_model
+    # Additive merge of whatever else the backend recorded about itself (the remote
+    # substitute for local SHA-256 pins) — model identity must travel with the artifact.
+    for key, value in models.items():
+        meta.setdefault(key, value)
     return meta
 
 
