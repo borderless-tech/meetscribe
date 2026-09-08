@@ -49,7 +49,26 @@ The **dual-track asymmetry survives unchanged** — it becomes two API requests:
 Deepgram's per-word speakers arrive already aligned, so **`align.py` and `vad.py` are simply
 not used** on the remote path (they stay for local mode).
 
-### The critical constraint: embeddings stay LOCAL
+### Combining the two API results into one transcript — a solved problem
+
+Merging two per-track results is not new machinery: `merge.py` already never knew where
+utterances come from — it only requires time-stamped utterances on a **shared clock**, sorts
+by start (mic wins ties), and coalesces adjacent same-speaker runs. Both properties hold on
+the remote path:
+
+- **Shared clock**: both tracks are captured by ONE ffmpeg invocation (Linux: two pulse
+  inputs in one command; macOS: one aggregate device split by channel), so t=0 is common and
+  in-file timestamps are directly comparable. Deepgram's pre-recorded timestamps are
+  file-relative float seconds — same convention. (The "timestamps reset on reconnect" caveat
+  is streaming-WebSocket-only.) Any tens-of-ms capture skew between the two pulse inputs
+  exists identically in local mode today — utterance-level interleaving doesn't feel it.
+- **Disjoint speaker spaces by construction**: mic → `me`, system → Deepgram integer → `spk_N`.
+  No collision, no cross-track reconciliation needed.
+- **Comparable segmentation granularity**: Deepgram `utterances=true` splits on ~0.8 s pauses
+  (`utt_split`, tunable) — close to our local 0.7 s VAD gap, so interleaving behaves like
+  today (a long monologue doesn't swallow a mid-way `me` backchannel any worse than now).
+  Safety valve: responses carry **per-word timestamps**, so we can re-segment Deepgram
+  utterances ourselves at any granularity if their splits ever prove too coarse.
 
 Deepgram returns **no speaker embedding vectors**, and even if it did, they would be from a
 different model — incomparable with every vector already in pgvector (this is exactly why
