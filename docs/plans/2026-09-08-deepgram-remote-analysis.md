@@ -123,16 +123,33 @@ the `==`-pin policy trivial. The SDK earns its keep for streaming/agent use we d
 - E2E: `tests/test_deepgram_e2e.py`, skip-gated on `DEEPGRAM_API_KEY` (mirrors the
   `MEETSCRIBE_MODELS` gating pattern); costs ~$0.005/run on the existing short fixtures.
 
-## Open questions (user decision needed)
+## Decisions (settled with the user, 2026-09-08)
 
-1. **Default backend?** Suggest: `local` stays default; `deepgram` is opt-in per run/env —
-   privacy says the cloud must never be a surprise.
-2. **Cleanup default on remote?** Suggest: off (keyterms + smart_format do the job at the
-   source); flag still available.
-3. **`language` param**: default `multi` (handles DE/EN mixed meetings) or `de` with a
-   `--language` flag? Suggest: `--language` flag, default `multi`.
-4. Send the 16 kHz mono working WAVs (small, sufficient — ASR is 16 kHz internally anyway) or
-   the original-rate raws? Suggest: 16 kHz mono.
+1. **Backend selection**: `local` is the default; override via **`STT_BACKEND=deepgram`**
+   (env var, plus a `--backend` CLI flag mirroring it). `deepgram` requires
+   `DEEPGRAM_API_KEY` to be present — fail fast with a clear message if it isn't.
+2. **Language**: default **`language=multi`**. Rationale: meetings are mostly German with
+   real English mixed in (and the mic track can be English); `multi` does word-level
+   code-switching and the premium is negligible (batch $0.0052 vs $0.0043/min ≈ +5 ct per
+   meeting-hour). **Scoping `multi` to en+de is not possible** — it's the full 10-language
+   set or a single language; in practice stray third-language misdetections are rare when
+   the audio only contains de/en, and each word carries a `language` tag + confidence we
+   could surface later. A `--language de` escape hatch stays for pure-German meetings
+   (monolingual squeezes out the last bit of accuracy and is 21% cheaper).
+3. **Sample rate**: nothing to decide — `record.py` already writes both tracks as
+   **16 kHz mono WAV at capture time** (the 48 kHz source is downsampled by ffmpeg during
+   recording; no higher-rate original exists on disk). That matches Deepgram guidance:
+   linear16 at the audio's native rate, never upsample (upsampling creates artifacts that
+   hurt WER; downsampling 48→16 kHz at capture is harmless — speech ASR is wideband-16 kHz
+   internally). We upload the on-disk WAVs as-is.
+4. **No `deepgram-sdk`**: plain stdlib HTTP. The SDK (v7.x) would add httpx + pydantic +
+   pydantic-core (native wheel) + websockets to the runtime closure for what is, for us,
+   one `POST` with a bytes body and JSON response — against the repo's `==`-pin/uv2nix
+   philosophy and a wider supply-chain surface. What we'd gain (typed models, live
+   WebSocket streaming support) we don't need today; **revisit iff we ever stream audio
+   live during recording**, which is the one scenario where the SDK pays for itself.
+5. **Cleanup default on remote**: off (keyterms + `smart_format` address it at the source);
+   the flag stays available.
 
 ## Suggested next step
 
