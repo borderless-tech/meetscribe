@@ -11,6 +11,30 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+### Added
+- TOML config file at `$XDG_CONFIG_HOME/meetscribe/config.toml` (`~/.config` fallback;
+  `MEETSCRIBE_CONFIG=<path>` overrides). All keys optional; schema v1 covers
+  `[stt] backend/language`, `[deepgram] api_key`, `[storage] meetings_dir`,
+  `[record] system_source`, `[output] bundle/cleanup`. One precedence rule everywhere:
+  **flag > env > config > default**. Malformed TOML exits 2 with file + line (never a
+  silent fall-back to defaults); unknown keys warn. Read via stdlib `tomllib` — no new
+  dependencies.
+- `meetscribe config` subcommand: bare = effective values as a table (value, origin,
+  api_key masked) plus the config path; `config init` writes a commented template
+  (0600, refuses to overwrite); `config path` prints the path for scripting.
+- XDG data dir: recordings now have a standard home under
+  `$XDG_DATA_HOME/meetscribe/meetings/` (`~/.local/share` fallback), configurable via
+  `[storage] meetings_dir`.
+- `doctor` gains a config check (runs first, never aborts the audio checks): path in
+  use + existence, parse status (malformed = red with the line), unknown-key and
+  api_key file-permission warnings (0600 advice).
+
+### Changed
+- **Default recordings location:** `meetscribe record` without `-o` now writes to
+  `$XDG_DATA_HOME/meetscribe/meetings/meetscribe-<timestamp>/` instead of littering the
+  current working directory with `./meetscribe-<timestamp>/`. `-o` behaves exactly as
+  before. This is the only behavior change for existing setups.
+
 ## [0.2.1] - 2026-09-08
 
 Feature release shipped as a patch (0.x pragmatism — same-day follow-up to 0.2.0). No

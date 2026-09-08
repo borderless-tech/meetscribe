@@ -1,4 +1,4 @@
-"""Command-line entrypoint: ``record`` | ``process`` | ``doctor``.
+"""Command-line entrypoint: ``record`` | ``process`` | ``doctor`` | ``config`` | …
 
 Target UX (see what-we-build.md §1):
 
@@ -59,12 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="record mic + system audio, then process")
     p_record.add_argument(
         "-o", "--out", default=None,
-        help="output directory for artifacts (default: ./meetscribe-<timestamp>)",
+        help="output directory for artifacts (default: a new meetscribe-<timestamp>/ "
+             "under the meetings dir — $XDG_DATA_HOME/meetscribe/meetings, or "
+             "[storage].meetings_dir in the config)",
     )
     p_record.add_argument(
-        "--bundle", action=argparse.BooleanOptionalAction, default=True,
-        help="emit a single meeting-<id>.mscribe upload bundle (default: on; "
-             "--no-bundle to skip)",
+        "--bundle", action=argparse.BooleanOptionalAction, default=None,
+        help="emit a single meeting-<id>.mscribe upload bundle (default: on, or "
+             "[output].bundle in the config; --no-bundle to skip)",
     )
     p_record.add_argument(
         "--system-source", default=None, metavar="NAME",
@@ -72,8 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
              "overrides the default-sink auto-detection",
     )
     p_record.add_argument(
-        "--no-cleanup", action="store_true",
-        help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
+        "--cleanup", action=argparse.BooleanOptionalAction, default=None,
+        help="run the LLM transcript-cleanup pass (default: on, or [output].cleanup "
+             "in the config; --no-cleanup emits raw ASR text)",
     )
     _add_backend_flags(p_record)
 
@@ -84,9 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="output directory for artifacts",
     )
     p_process.add_argument(
-        "--bundle", action=argparse.BooleanOptionalAction, default=True,
-        help="emit a single meeting-<id>.mscribe upload bundle (default: on; "
-             "--no-bundle to skip)",
+        "--bundle", action=argparse.BooleanOptionalAction, default=None,
+        help="emit a single meeting-<id>.mscribe upload bundle (default: on, or "
+             "[output].bundle in the config; --no-bundle to skip)",
     )
     p_process.add_argument(
         "--speakers", type=int, default=None, metavar="N",
@@ -95,8 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
              "backend only — deepgram infers the count itself (warned + ignored)",
     )
     p_process.add_argument(
-        "--no-cleanup", action="store_true",
-        help="skip the LLM transcript-cleanup pass (emit raw ASR text)",
+        "--cleanup", action=argparse.BooleanOptionalAction, default=None,
+        help="run the LLM transcript-cleanup pass (default: on, or [output].cleanup "
+             "in the config; --no-cleanup emits raw ASR text)",
     )
     _add_backend_flags(p_process)
 
@@ -120,7 +124,73 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check the audio setup is ready to record")
 
+    p_config = sub.add_parser(
+        "config", help="show effective configuration (init/path subactions)"
+    )
+    p_config.add_argument(
+        "action", nargs="?", choices=("init", "path"), default=None,
+        help="init: write a commented template config (refuses to overwrite); "
+             "path: print the config file path; omit to show effective values",
+    )
+
     return parser
+
+
+def _run_config(action: str | None) -> int:
+    """The ``config`` subcommand. Unlike record/process, stdout IS the data
+    output here, so plain ``print`` is correct (and keeps it ``--quiet``-proof)."""
+    import os
+
+    from . import config as config_mod
+
+    path = config_mod.config_path()
+
+    if action == "path":
+        print(path)
+        return 0
+
+    if action == "init":
+        if path.exists():
+            print(f"refusing to overwrite existing config: {path}", file=sys.stderr)
+            return 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(config_mod.TEMPLATE, encoding="utf-8")
+        path.chmod(0o600)  # the template has an api_key slot — private from day one
+        print(f"wrote {path}")
+        return 0
+
+    # Bare `config`: the effective values table — key, value, origin — plus the
+    # config path in use and whether it exists.
+    env = os.environ
+    try:
+        cfg = config_mod.load(path)
+        rows = [
+            ("backend", config_mod.backend(None, env, cfg)),
+            ("language", config_mod.language(None, env, cfg)),
+            ("api_key", config_mod.api_key(None, env, cfg)),
+            ("meetings_dir", config_mod.meetings_dir(None, env, cfg)),
+            ("system_source", config_mod.system_source(None, env, cfg)),
+            ("bundle", config_mod.bundle(None, env, cfg)),
+            ("cleanup", config_mod.cleanup(None, env, cfg)),
+        ]
+    except config_mod.ConfigError as e:
+        print(f"config: {path} (invalid)", file=sys.stderr)
+        print(str(e), file=sys.stderr)
+        return 2
+
+    print(f"config: {path} ({'exists' if path.exists() else 'missing'})")
+    for name, resolved in rows:
+        value = resolved.value
+        if name == "api_key" and value:
+            value = f"{str(value)[:3]}…****"  # never print the secret itself
+        if value is None:
+            display = "(not set)"
+        elif isinstance(value, bool):
+            display = "true" if value else "false"
+        else:
+            display = str(value)
+        print(f"{name:<14} {display}  ({resolved.origin})")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -144,12 +214,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return record.run(
             out_dir=getattr(args, "out", None),
-            # Bare `meetscribe` never runs the subparser, so the fallback must
-            # match the subparser default (bundle on).
-            bundle=getattr(args, "bundle", True),
+            # Bare `meetscribe` never runs the subparser, so the fallbacks must
+            # match the subparser defaults: None = "resolve from config".
+            bundle=getattr(args, "bundle", None),
             system_source=getattr(args, "system_source", None),
             reporter=reporter,
-            cleanup=not getattr(args, "no_cleanup", False),
+            cleanup=getattr(args, "cleanup", None),
             backend=getattr(args, "backend", None),
             language=getattr(args, "language", None),
         )
@@ -162,10 +232,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return pipeline.run(
             audio=getattr(args, "audio", None),
             out_dir=getattr(args, "out", None),
-            bundle=getattr(args, "bundle", True),
+            bundle=getattr(args, "bundle", None),
             reporter=reporter,
             num_speakers=-1 if speakers is None else speakers_from_count(speakers),
-            cleanup=not getattr(args, "no_cleanup", False),
+            cleanup=getattr(args, "cleanup", None),
             backend=getattr(args, "backend", None),
             language=getattr(args, "language", None),
         )
@@ -175,11 +245,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return pipeline.clean_existing(
             audio_dir=args.dir, out_dir=getattr(args, "out", None), reporter=reporter,
         )
+    if command == "config":
+        return _run_config(getattr(args, "action", None))
     if command == "bundle":
         import json
         from pathlib import Path
 
+        from . import config as config_mod
         from .output import bundle_dir, default_bundle_name
+
+        # Acceptance: EVERY subcommand exits 2 on a broken config (bundle doesn't
+        # use config values today, but a broken file must never pass silently).
+        try:
+            config_mod.load()
+        except config_mod.ConfigError as e:
+            from .pipeline import config_error_message
+
+            print(config_error_message(e))
+            return 2
 
         src = Path(args.dir)
         meta = json.loads((src / "meta.json").read_text())

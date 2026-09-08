@@ -237,47 +237,74 @@ def resolve_inputs(path: str) -> tuple[str | None, str | None]:
 BACKENDS = ("local", "deepgram")
 
 
-def resolve_backend(flag: str | None = None, env=None) -> str:
-    """STT backend name: flag > ``STT_BACKEND`` env > ``local``. Not validated here —
-    ``run()`` rejects unknown names (exit 2) instead of silently falling back."""
+def config_error_message(e) -> str:
+    """Render a :class:`config.ConfigError` for the exit-2 print. Always names the
+    config file (the malformed-TOML message already carries path + line; the typed-
+    value errors from the resolvers do not, so the path is prefixed here)."""
+    from . import config as config_mod
+
+    path = e.path or str(config_mod.config_path())
+    msg = str(e)
+    return msg if path in msg else f"config error in {path}: {msg}"
+
+
+def resolve_backend(flag: str | None = None, env=None, cfg: dict | None = None) -> str:
+    """STT backend name: flag > ``STT_BACKEND`` env > ``[stt].backend`` config >
+    ``local`` (delegates to ``config.backend``; ``cfg=None`` loads the config file).
+    Not validated here — ``run()`` rejects unknown names (exit 2) instead of silently
+    falling back."""
     import os
 
+    from . import config as config_mod
+
     env = os.environ if env is None else env
-    return (flag or env.get("STT_BACKEND") or "local").strip().lower() or "local"
+    cfg = config_mod.load() if cfg is None else cfg
+    return config_mod.backend(flag, env, cfg).value
 
 
-def check_backend(flag: str | None = None, env=None) -> tuple[str, str | None]:
+def check_backend(
+    flag: str | None = None, env=None, cfg: dict | None = None
+) -> tuple[str, str | None]:
     """Resolve the STT backend AND validate it is runnable *now*: a known name, and
-    (for ``deepgram``) a present ``DEEPGRAM_API_KEY``. Returns ``(name, error)`` where
-    ``error`` is a printable message (exit-2 material) or ``None``. Shared by
-    ``pipeline.run`` and ``record.run`` — the record flow must fail BEFORE ffmpeg
-    starts, not after an hour-long meeting was recorded. NEVER a silent fallback to
-    local (the user chose remote; degrading quietly would betray that)."""
+    (for ``deepgram``) a present API key (``DEEPGRAM_API_KEY`` env or
+    ``[deepgram].api_key`` config). Returns ``(name, error)`` where ``error`` is a
+    printable message (exit-2 material) or ``None``. Shared by ``pipeline.run`` and
+    ``record.run`` — the record flow must fail BEFORE ffmpeg starts, not after an
+    hour-long meeting was recorded. NEVER a silent fallback to local (the user chose
+    remote; degrading quietly would betray that)."""
     import os
 
+    from . import config as config_mod
+
     env = os.environ if env is None else env
-    name = resolve_backend(flag, env)
+    cfg = config_mod.load() if cfg is None else cfg
+    name = resolve_backend(flag, env, cfg)
     if name not in BACKENDS:
         return name, (
             f"unknown STT backend {name!r} "
             f"(--backend/STT_BACKEND must be one of: {', '.join(BACKENDS)})"
         )
-    if name == "deepgram" and not env.get("DEEPGRAM_API_KEY"):
+    if name == "deepgram" and not config_mod.api_key(None, env, cfg).value:
         return name, (
-            "the deepgram backend requires DEEPGRAM_API_KEY — export it, or use "
+            "the deepgram backend requires an API key — export DEEPGRAM_API_KEY or "
+            f"set [deepgram].api_key in {config_mod.config_path()}, or use "
             "--backend local (or unset STT_BACKEND) to transcribe offline; "
             "there is no silent fallback"
         )
     return name, None
 
 
-def resolve_language(flag: str | None = None, env=None) -> str:
-    """Remote-STT language: flag > ``STT_LANGUAGE`` env > ``de`` (the local backend is
-    language-agnostic and ignores this)."""
+def resolve_language(flag: str | None = None, env=None, cfg: dict | None = None) -> str:
+    """Remote-STT language: flag > ``STT_LANGUAGE`` env > ``[stt].language`` config >
+    ``de`` (delegates to ``config.language``; the local backend is language-agnostic
+    and ignores this)."""
     import os
 
+    from . import config as config_mod
+
     env = os.environ if env is None else env
-    return (flag or env.get("STT_LANGUAGE") or "de").strip() or "de"
+    cfg = config_mod.load() if cfg is None else cfg
+    return config_mod.language(flag, env, cfg).value
 
 
 def _sha256(path: str) -> str:
@@ -367,16 +394,18 @@ def _window(started_at, duration_s, mic_wav, system_wav):
 def run(
     audio: str | None = None,
     out_dir: str | None = None,
-    bundle: bool = False,
+    bundle: bool | None = None,
     started_at=None,
     reporter=None,
     num_speakers: int = -1,
-    cleanup: bool = True,
+    cleanup: bool | None = None,
     backend: str | None = None,
     language: str | None = None,
 ) -> int:
     import os
     from datetime import datetime, timezone
+
+    from . import config as config_mod
 
     if audio is None:
         print("process: no input given (expected a directory or a .wav file)")
@@ -387,9 +416,27 @@ def run(
         print("MEETSCRIBE_MODELS is not set — run via `nix run` or the wrapper")
         return 2
 
-    # flag > env > default; a bad name or missing key fails fast — the record flow
-    # runs the same check before recording even starts.
-    backend_name, backend_err = check_backend(backend)
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+
+    # flag > env > config > default (bundle/cleanup: None = "flag not given", contract
+    # with the CLI). EVERY config-backed value resolves inside this guard — a
+    # malformed config, bad backend name, missing key, or wrongly-typed value fails
+    # fast (exit 2, never a traceback) — the record flow runs the same checks before
+    # recording even starts.
+    try:
+        cfg = config_mod.load()
+        for msg in config_mod.load_warnings(cfg):  # unknown keys, api_key perms
+            reporter.warn(msg)
+        backend_name, backend_err = check_backend(backend, cfg=cfg)
+        bundle = config_mod.bundle(bundle, os.environ, cfg).value
+        cleanup = config_mod.cleanup(cleanup, os.environ, cfg).value
+        language = resolve_language(language, cfg=cfg)
+        dg_key = config_mod.api_key(None, os.environ, cfg).value
+    except config_mod.ConfigError as e:
+        print(config_error_message(e))
+        return 2
     if backend_err:
         print(backend_err)
         return 2
@@ -404,18 +451,15 @@ def run(
     meeting_id = out.name if out.name else f"{datetime.now(timezone.utc):%Y-%m-%dT%H-%M-%S}"
 
     from . import glossary as glossary_mod
-    from .progress import NullReporter
 
-    reporter = reporter or NullReporter()
     backend_obj = None
     if backend_name == "deepgram":
         from .deepgram import DeepgramBackend, DeepgramConfig
 
         backend_obj = DeepgramBackend(
-            DeepgramConfig(
-                api_key=os.environ["DEEPGRAM_API_KEY"],
-                language=resolve_language(language),
-            )
+            # Both values were resolved inside the guarded block above;
+            # check_backend guaranteed the key exists in one of the layers.
+            DeepgramConfig(api_key=dg_key, language=language)
         )
         if num_speakers != -1:
             # Deepgram's diarizer takes no forced cluster count — say so instead of
@@ -433,7 +477,7 @@ def run(
         # the record→process transition isn't a silent gap.
         with reporter.stage("loading models"):
             components = build_components(models_dir, num_speakers)
-    if not cleanup:  # --no-cleanup: force the no-op cleaner regardless of what was built
+    if not cleanup:  # --no-cleanup / [output].cleanup=false: force the no-op cleaner
         from .cleanup import NullCleaner
 
         components.cleaner = NullCleaner()
@@ -499,11 +543,19 @@ def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) ->
     import os
     import shutil
 
+    from . import config as config_mod
     from . import glossary as glossary_mod
     from .output import read_transcript, write_meta, write_transcript
     from .progress import NullReporter
 
     reporter = reporter or NullReporter()
+    # Acceptance: EVERY subcommand exits 2 on a broken config (clean doesn't use
+    # config values today, but silently running against a broken file would hide it).
+    try:
+        config_mod.load()
+    except config_mod.ConfigError as e:
+        print(config_error_message(e))
+        return 2
     src = Path(audio_dir)
     transcript = src / "transcript.json"
     if not transcript.exists():

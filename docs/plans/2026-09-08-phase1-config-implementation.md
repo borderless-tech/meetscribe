@@ -93,5 +93,7 @@ tests, offline suite), test quality; findings adversarially verified before fixi
 - `meetscribe config init` → edit backend to deepgram → `meetscribe config` shows
   `backend deepgram (config)`; `STT_BACKEND=local` flips it to `(env)`; `--backend
   deepgram` flips it to `(flag)`.
-- Malformed config: every subcommand exits 2 with path+line (except `config path`).
+- Malformed config: every subcommand exits 2 with path+line — except `config path`
+  (must keep printing the path so the user can locate the broken file) and `doctor`
+  (renders it as a red check and exits 1, so the remaining preflight checks still run).
 - Full suite green, offline, sub-second; `nix flake check` passes.

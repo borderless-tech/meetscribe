@@ -1,10 +1,12 @@
 """Preflight checks: report formatting + exit code. Platform probes are injected."""
 
 import numpy as np
+import pytest
 
 from meetscribe.doctor import (
     Check,
     checks_pass,
+    config_checks,
     deepgram_key_check,
     deepgram_reachability_check,
     format_report,
@@ -13,6 +15,19 @@ from meetscribe.doctor import (
     rms_after_warmup,
     run,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config(monkeypatch, tmp_path):
+    """No test may read the real home: remote_checks now consults the config layer,
+    so the config path and XDG dirs always point into tmp_path, and the STT env vars
+    from the runner's shell are scrubbed. Tests that need a config layer write
+    ``tmp_path / "config.toml"``."""
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def test_format_report_marks_ok_and_failures():
@@ -127,11 +142,40 @@ def test_remote_checks_run_for_deepgram_backend_and_probe_the_right_endpoint():
     assert _ok_connect.calls == [("api.deepgram.com", 443)]
 
 
+def test_remote_checks_backend_from_config_triggers_checks(tmp_path):
+    # [stt].backend = "deepgram" with no env var: the pipeline WILL use deepgram,
+    # so doctor must run the key + reachability checks — not silently skip them.
+    (tmp_path / "config.toml").write_text(
+        '[stt]\nbackend = "deepgram"\n[deepgram]\napi_key = "dg_cfg_key"\n'
+    )
+    _ok_connect.calls.clear()
+    checks = remote_checks(env={}, connect=_ok_connect)
+    assert len(checks) == 2
+    assert all(c.ok for c in checks), [(c.name, c.hint) for c in checks]
+    assert _ok_connect.calls == [("api.deepgram.com", 443)]
+
+
+def test_remote_checks_env_backend_with_config_key_is_not_a_false_red(tmp_path):
+    # STT_BACKEND=deepgram in the env, key only in the config: record/process work,
+    # so doctor must not fail the key check on this working setup.
+    (tmp_path / "config.toml").write_text('[deepgram]\napi_key = "dg_cfg_key"\n')
+    checks = remote_checks(env={"STT_BACKEND": "deepgram"}, connect=_ok_connect)
+    assert all(c.ok for c in checks), [(c.name, c.hint) for c in checks]
+
+
+def test_remote_checks_env_backend_beats_config_backend(tmp_path):
+    # env > config: STT_BACKEND=local overrides a config-selected deepgram.
+    (tmp_path / "config.toml").write_text('[stt]\nbackend = "deepgram"\n')
+    assert remote_checks(env={"STT_BACKEND": "local"}, connect=_ok_connect) == []
+
+
 def test_deepgram_key_check_fails_with_actionable_hint_when_missing():
     for absent in (None, "", "   "):
         check = deepgram_key_check(absent)
         assert not check.ok
         assert "DEEPGRAM_API_KEY" in (check.hint or "")
+        # both fixes are offered, matching check_backend's fail-fast message
+        assert "[deepgram].api_key" in (check.hint or "")
 
 
 def test_deepgram_key_check_passes_when_set():
@@ -162,3 +206,113 @@ def test_remote_checks_report_missing_key_and_unreachable_api_together():
 
     checks = remote_checks(env={"STT_BACKEND": "deepgram"}, connect=down)
     assert [c.ok for c in checks] == [False, False]
+
+
+# --- Config check ------------------------------------------------------------------------------
+# Doctor surfaces the config file's health up front: path in use + existence, parse status
+# (malformed = red with the line number), unknown keys and api_key file permissions as warnings.
+# A broken config must never abort the other checks — config_checks returns Checks, never raises.
+
+
+def test_format_report_renders_warnings_distinctly_with_hint():
+    checks = [Check("all good", True), Check("config keys", True, "unknown key: stt.foo", warn=True)]
+    report = format_report(checks)
+    assert "✓ all good" in report
+    assert "! config keys" in report
+    assert "→ unknown key: stt.foo" in report
+    assert "✗" not in report
+
+
+def test_checks_pass_treats_warnings_as_passing():
+    # Warnings are advisory: doctor still exits 0 on warnings alone.
+    assert checks_pass([Check("a", True), Check("b", True, "advice", warn=True)])
+
+
+def test_config_checks_missing_file_is_ok_and_names_the_path(tmp_path):
+    p = tmp_path / "config.toml"
+    checks = config_checks(p)
+    assert len(checks) == 1
+    assert checks[0].ok
+    assert str(p) in checks[0].name
+    assert "defaults" in checks[0].name
+
+
+def test_config_checks_valid_file_passes(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[stt]\nbackend = "local"\n')
+    checks = config_checks(p)
+    assert all(c.ok for c in checks)
+    assert not any(c.warn for c in checks)
+    assert str(p) in checks[0].name
+
+
+def test_config_checks_malformed_toml_is_red_with_line_and_does_not_raise(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[stt]\nbackend = not-a-string\n')
+    checks = config_checks(p)  # must not raise — the other doctor checks still run
+    assert len(checks) == 1
+    assert not checks[0].ok
+    assert "line 2" in (checks[0].hint or "")
+    assert str(p) in checks[0].name
+
+
+def test_config_checks_wrongly_typed_value_is_red(tmp_path):
+    # Valid TOML, but every record/process run would exit 2 on it — a green doctor
+    # would defeat the preflight's purpose, so the resolvers run here too.
+    p = tmp_path / "config.toml"
+    p.write_text('[output]\nbundle = "false"\n')
+    checks = config_checks(p)
+    assert not checks_pass(checks)
+    bad = next(c for c in checks if not c.ok)
+    assert "bundle" in (bad.hint or "")
+
+
+def test_config_checks_unreadable_file_is_red_not_a_crash(tmp_path):
+    # config_checks promises to never raise; a chmod-000 file must not abort the
+    # audio checks that follow.
+    p = tmp_path / "config.toml"
+    p.write_text("[stt]\n")
+    p.chmod(0o000)
+    try:
+        checks = config_checks(p)
+    finally:
+        p.chmod(0o600)
+    assert not checks_pass(checks)
+
+
+def test_config_checks_warn_on_unknown_keys_but_still_pass(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[stt]\nbackedn = "local"\n')  # typo'd key
+    checks = config_checks(p)
+    warns = [c for c in checks if c.warn]
+    assert len(warns) == 1
+    assert "stt.backedn" in (warns[0].hint or "")
+    assert checks_pass(checks)  # warning, not failure
+
+
+def test_config_checks_warn_when_api_key_file_is_group_readable(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[deepgram]\napi_key = "dg_secret"\n')
+    p.chmod(0o644)
+    checks = config_checks(p)
+    warns = [c for c in checks if c.warn]
+    assert len(warns) == 1
+    assert "0600" in (warns[0].hint or "")
+    assert "dg_secret" not in format_report(checks)  # never echo the secret
+    assert checks_pass(checks)
+
+
+def test_config_checks_no_perm_warning_when_file_is_0600(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[deepgram]\napi_key = "dg_secret"\n')
+    p.chmod(0o600)
+    assert not any(c.warn for c in config_checks(p))
+
+
+def test_config_checks_default_path_honors_meetscribe_config_env(tmp_path, monkeypatch):
+    p = tmp_path / "elsewhere.toml"
+    p.write_text('[output]\nbundle = true\n')
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(p))
+    checks = config_checks()
+    assert checks[0].ok
+    assert str(p) in checks[0].name

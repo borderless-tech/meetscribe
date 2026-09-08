@@ -1,0 +1,454 @@
+"""Config foundation: XDG paths, TOML loading, and flag>env>config>default resolvers.
+
+Tests never touch the real home: XDG_CONFIG_HOME / XDG_DATA_HOME / MEETSCRIBE_CONFIG
+(and HOME, for the fallback paths) are always monkeypatched to tmp_path.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from meetscribe import config
+from meetscribe.config import ConfigError, Resolved
+
+
+# ---------------------------------------------------------------- XDG helpers
+
+
+def test_config_home_honors_xdg_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-cfg"))
+    assert config.config_home() == tmp_path / "xdg-cfg"
+
+
+def test_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config.config_home() == tmp_path / ".config"
+
+
+def test_config_home_ignores_empty_xdg_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config.config_home() == tmp_path / ".config"
+
+
+def test_data_home_honors_xdg_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    assert config.data_home() == tmp_path / "xdg-data"
+
+
+def test_data_home_falls_back_to_local_share(monkeypatch, tmp_path):
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert config.data_home() == tmp_path / ".local" / "share"
+
+
+# ------------------------------------------------------- config_path override
+
+
+def test_config_path_default_location(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEETSCRIBE_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert config.config_path() == tmp_path / "meetscribe" / "config.toml"
+
+
+def test_config_path_env_override_wins(monkeypatch, tmp_path):
+    override = tmp_path / "elsewhere" / "my.toml"
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(override))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "unused"))
+    assert config.config_path() == override
+
+
+# -------------------------------------------------------------------- load()
+
+
+def test_load_missing_file_is_empty_dict(tmp_path):
+    assert config.load(tmp_path / "nope.toml") == {}
+
+
+def test_load_parses_toml_as_is(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[stt]\nbackend = "deepgram"\n', encoding="utf-8")
+    assert config.load(p) == {"stt": {"backend": "deepgram"}}
+
+
+def test_load_default_path_uses_meetscribe_config_env(monkeypatch, tmp_path):
+    p = tmp_path / "override.toml"
+    p.write_text('[stt]\nlanguage = "en"\n', encoding="utf-8")
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(p))
+    assert config.load() == {"stt": {"language": "en"}}
+
+
+def test_load_malformed_raises_configerror_with_file_and_line(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[stt]\nbackend = "deepgram\n', encoding="utf-8")  # unclosed string
+    with pytest.raises(ConfigError) as exc:
+        config.load(p)
+    err = exc.value
+    assert err.path == str(p)
+    assert err.line == 2
+    assert str(p) in str(err)
+    assert "2" in str(err)
+
+
+def test_load_unreadable_file_raises_configerror_not_traceback(tmp_path):
+    # PermissionError must become ConfigError (exit-2 material with the path) —
+    # an uncaught OSError would traceback out of every subcommand.
+    p = tmp_path / "config.toml"
+    p.write_text("[stt]\n", encoding="utf-8")
+    p.chmod(0o000)
+    try:
+        with pytest.raises(ConfigError) as exc:
+            config.load(p)
+        assert str(p) in str(exc.value)
+    finally:
+        p.chmod(0o600)
+
+
+def test_load_directory_path_raises_configerror(tmp_path):
+    # MEETSCRIBE_CONFIG pointing at a directory: IsADirectoryError → ConfigError.
+    d = tmp_path / "confdir"
+    d.mkdir()
+    with pytest.raises(ConfigError) as exc:
+        config.load(d)
+    assert str(d) in str(exc.value)
+
+
+def test_load_template_is_valid_toml(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(config.TEMPLATE, encoding="utf-8")
+    cfg = config.load(p)
+    assert cfg["stt"]["backend"] == "local"
+    assert cfg["output"]["bundle"] is True
+
+
+# ----------------------------------------------------------- resolver: backend
+
+
+def test_backend_default(tmp_path):
+    assert config.backend(None, {}, {}) == Resolved("local", "default")
+
+
+def test_backend_from_config():
+    cfg = {"stt": {"backend": "deepgram"}}
+    assert config.backend(None, {}, cfg) == Resolved("deepgram", "config")
+
+
+def test_backend_env_beats_config():
+    cfg = {"stt": {"backend": "deepgram"}}
+    env = {"STT_BACKEND": "local"}
+    assert config.backend(None, env, cfg) == Resolved("local", "env")
+
+
+def test_backend_flag_beats_env_and_config():
+    cfg = {"stt": {"backend": "deepgram"}}
+    env = {"STT_BACKEND": "deepgram"}
+    assert config.backend("local", env, cfg) == Resolved("local", "flag")
+
+
+def test_backend_normalizes_case_and_whitespace():
+    assert config.backend("  Deepgram ", {}, {}) == Resolved("deepgram", "flag")
+    assert config.backend(None, {"STT_BACKEND": " LOCAL "}, {}) == Resolved(
+        "local", "env"
+    )
+
+
+def test_backend_empty_layers_fall_through():
+    cfg = {"stt": {"backend": ""}}  # template ships empty strings — not "set"
+    env = {"STT_BACKEND": ""}
+    assert config.backend("", env, cfg) == Resolved("local", "default")
+
+
+def test_backend_non_string_config_is_error():
+    with pytest.raises(ConfigError):
+        config.backend(None, {}, {"stt": {"backend": True}})
+
+
+# ---------------------------------------------------------- resolver: language
+
+
+def test_language_default():
+    assert config.language(None, {}, {}) == Resolved("de", "default")
+
+
+def test_language_from_config():
+    cfg = {"stt": {"language": "en"}}
+    assert config.language(None, {}, cfg) == Resolved("en", "config")
+
+
+def test_language_env_beats_config():
+    cfg = {"stt": {"language": "en"}}
+    assert config.language(None, {"STT_LANGUAGE": "fr"}, cfg) == Resolved("fr", "env")
+
+
+def test_language_flag_beats_env_and_config():
+    cfg = {"stt": {"language": "en"}}
+    env = {"STT_LANGUAGE": "fr"}
+    assert config.language("de", env, cfg) == Resolved("de", "flag")
+
+
+def test_language_empty_config_falls_through():
+    assert config.language(None, {}, {"stt": {"language": " "}}) == Resolved(
+        "de", "default"
+    )
+
+
+# ----------------------------------------------------------- resolver: api_key
+
+
+def test_api_key_default_is_none():
+    assert config.api_key(None, {}, {}) == Resolved(None, "default")
+
+
+def test_api_key_from_config():
+    cfg = {"deepgram": {"api_key": "dg_secret"}}
+    assert config.api_key(None, {}, cfg) == Resolved("dg_secret", "config")
+
+
+def test_api_key_env_beats_config():
+    cfg = {"deepgram": {"api_key": "dg_cfg"}}
+    env = {"DEEPGRAM_API_KEY": "dg_env"}
+    assert config.api_key(None, env, cfg) == Resolved("dg_env", "env")
+
+
+def test_api_key_flag_beats_env_and_config():
+    cfg = {"deepgram": {"api_key": "dg_cfg"}}
+    env = {"DEEPGRAM_API_KEY": "dg_env"}
+    assert config.api_key("dg_flag", env, cfg) == Resolved("dg_flag", "flag")
+
+
+def test_api_key_empty_config_string_is_unset():
+    # the shipped template has api_key = "" — must not count as configured
+    cfg = {"deepgram": {"api_key": ""}}
+    assert config.api_key(None, {}, cfg) == Resolved(None, "default")
+
+
+# ------------------------------------------------------ resolver: meetings_dir
+
+
+def test_meetings_dir_default_under_data_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert config.meetings_dir(None, {}, {}) == Resolved(
+        tmp_path / "data" / "meetscribe" / "meetings", "default"
+    )
+
+
+def test_meetings_dir_from_config_expands_user(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = {"storage": {"meetings_dir": "~/recordings"}}
+    assert config.meetings_dir(None, {}, cfg) == Resolved(
+        tmp_path / "recordings", "config"
+    )
+
+
+def test_meetings_dir_flag_beats_config(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = {"storage": {"meetings_dir": "/cfg/dir"}}
+    assert config.meetings_dir("~/flagged", {}, cfg) == Resolved(
+        tmp_path / "flagged", "flag"
+    )
+
+
+def test_meetings_dir_empty_config_string_is_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    cfg = {"storage": {"meetings_dir": ""}}
+    assert config.meetings_dir(None, {}, cfg) == Resolved(
+        tmp_path / "data" / "meetscribe" / "meetings", "default"
+    )
+
+
+# ---------------------------------------------------- resolver: system_source
+
+
+def test_system_source_default_is_none():
+    assert config.system_source(None, {}, {}) == Resolved(None, "default")
+
+
+def test_system_source_from_config():
+    cfg = {"record": {"system_source": "alsa_output.foo.monitor"}}
+    assert config.system_source(None, {}, cfg) == Resolved(
+        "alsa_output.foo.monitor", "config"
+    )
+
+
+def test_system_source_flag_beats_config():
+    cfg = {"record": {"system_source": "cfg.monitor"}}
+    assert config.system_source("flag.monitor", {}, cfg) == Resolved(
+        "flag.monitor", "flag"
+    )
+
+
+def test_system_source_empty_config_string_is_unset():
+    cfg = {"record": {"system_source": ""}}
+    assert config.system_source(None, {}, cfg) == Resolved(None, "default")
+
+
+# --------------------------------------------------- resolvers: bundle/cleanup
+
+
+@pytest.mark.parametrize("resolver", [config.bundle, config.cleanup])
+def test_bool_default_is_true(resolver):
+    assert resolver(None, {}, {}) == Resolved(True, "default")
+
+
+def test_bundle_from_config():
+    assert config.bundle(None, {}, {"output": {"bundle": False}}) == Resolved(
+        False, "config"
+    )
+
+
+def test_cleanup_from_config():
+    assert config.cleanup(None, {}, {"output": {"cleanup": False}}) == Resolved(
+        False, "config"
+    )
+
+
+def test_bundle_flag_beats_config():
+    cfg = {"output": {"bundle": True}}
+    assert config.bundle(False, {}, cfg) == Resolved(False, "flag")
+    assert config.bundle(True, {}, {"output": {"bundle": False}}) == Resolved(
+        True, "flag"
+    )
+
+
+def test_cleanup_flag_beats_config():
+    cfg = {"output": {"cleanup": True}}
+    assert config.cleanup(False, {}, cfg) == Resolved(False, "flag")
+
+
+@pytest.mark.parametrize("bad", ["false", "true", "no", 1, 0])
+def test_bundle_config_string_or_int_is_error_not_truthiness(bad):
+    with pytest.raises(ConfigError):
+        config.bundle(None, {}, {"output": {"bundle": bad}})
+
+
+@pytest.mark.parametrize("bad", ["false", 1])
+def test_cleanup_config_string_or_int_is_error_not_truthiness(bad):
+    with pytest.raises(ConfigError):
+        config.cleanup(None, {}, {"output": {"cleanup": bad}})
+
+
+# ---------------------------------------------------------------- unknown_keys
+
+
+def test_unknown_keys_empty_config():
+    assert config.unknown_keys({}) == []
+
+
+def test_unknown_keys_template_is_fully_known(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(config.TEMPLATE, encoding="utf-8")
+    assert config.unknown_keys(config.load(p)) == []
+
+
+def test_unknown_keys_reports_typoed_key_dotted():
+    cfg = {"output": {"bundel": True, "bundle": True}}
+    assert config.unknown_keys(cfg) == ["output.bundel"]
+
+
+def test_unknown_keys_reports_unknown_section():
+    cfg = {"outputs": {"bundle": True}}
+    assert config.unknown_keys(cfg) == ["outputs"]
+
+
+def test_unknown_keys_reports_stray_top_level_key():
+    assert config.unknown_keys({"backend": "local"}) == ["backend"]
+
+
+def test_unknown_keys_ignores_reserved_bk_section():
+    cfg = {"bk": {"base_url": "https://example.invalid", "token": "t"}}
+    assert config.unknown_keys(cfg) == []
+
+
+def test_unknown_keys_multiple_sorted_by_appearance():
+    cfg = {
+        "stt": {"backend": "local", "langauge": "de"},
+        "extra": {"x": 1},
+    }
+    assert config.unknown_keys(cfg) == ["stt.langauge", "extra"]
+
+
+# -------------------------------------------------------------------- validate
+
+
+def test_validate_passes_on_template(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(config.TEMPLATE, encoding="utf-8")
+    config.validate(config.load(p))  # must not raise
+
+
+def test_validate_raises_on_wrongly_typed_bool():
+    # valid TOML that every run would reject at resolve time — validate must
+    # surface it (doctor turns this into a red check).
+    with pytest.raises(ConfigError, match="bundle"):
+        config.validate({"output": {"bundle": "false"}})
+
+
+def test_validate_raises_on_wrongly_typed_string():
+    with pytest.raises(ConfigError, match="language"):
+        config.validate({"stt": {"language": 5}})
+
+
+def test_validate_raises_on_non_string_api_key():
+    with pytest.raises(ConfigError, match="api_key"):
+        config.validate({"deepgram": {"api_key": 5}})
+
+
+# --------------------------------------------------------------- load_warnings
+
+
+def test_load_warnings_empty_for_clean_config(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("[output]\nbundle = false\n", encoding="utf-8")
+    p.chmod(0o600)
+    assert config.load_warnings(config.load(p), p) == []
+
+
+def test_load_warnings_reports_unknown_keys(tmp_path):
+    # the design's load-time typo detection: warn, then continue.
+    p = tmp_path / "config.toml"
+    p.write_text("[output]\nbundel = false\n", encoding="utf-8")
+    msgs = config.load_warnings(config.load(p), p)
+    assert any("output.bundel" in m for m in msgs)
+
+
+def test_load_warnings_reports_insecure_api_key_perms(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('[deepgram]\napi_key = "dg_secret"\n', encoding="utf-8")
+    p.chmod(0o644)
+    msgs = config.load_warnings(config.load(p), p)
+    assert any("0600" in m for m in msgs)
+    assert not any("dg_secret" in m for m in msgs)  # never echo the secret
+
+
+def test_load_warnings_missing_file_is_silent(tmp_path):
+    assert config.load_warnings({}, tmp_path / "nope.toml") == []
+
+
+# ------------------------------------------------------ insecure_api_key_perms
+
+
+def _write_cfg(tmp_path, body, mode):
+    p = tmp_path / "config.toml"
+    p.write_text(body, encoding="utf-8")
+    p.chmod(mode)
+    return p
+
+
+def test_insecure_perms_true_when_key_set_and_group_other_readable(tmp_path):
+    p = _write_cfg(tmp_path, '[deepgram]\napi_key = "dg_secret"\n', 0o644)
+    assert config.insecure_api_key_perms(p) is True
+
+
+def test_insecure_perms_false_when_mode_0600(tmp_path):
+    p = _write_cfg(tmp_path, '[deepgram]\napi_key = "dg_secret"\n', 0o600)
+    assert config.insecure_api_key_perms(p) is False
+
+
+def test_insecure_perms_false_when_no_api_key(tmp_path):
+    p = _write_cfg(tmp_path, '[deepgram]\napi_key = ""\n', 0o644)
+    assert config.insecure_api_key_perms(p) is False
+
+
+def test_insecure_perms_false_when_file_missing(tmp_path):
+    assert config.insecure_api_key_perms(tmp_path / "nope.toml") is False

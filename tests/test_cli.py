@@ -34,6 +34,16 @@ def test_record_out_flag():
     assert args.out == "/tmp/out"
 
 
+def test_record_help_documents_meetings_dir_default(capsys):
+    # Without -o, recordings land under the configured meetings dir — the help
+    # must not keep advertising the removed CWD-littering default.
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["record", "--help"])
+    out = capsys.readouterr().out
+    assert "meetings" in out
+    assert "./meetscribe-" not in out
+
+
 def test_quiet_and_verbose_flags():
     args = build_parser().parse_args(["--quiet", "process", "x.wav"])
     assert args.quiet is True and args.verbose is False
@@ -57,14 +67,16 @@ def test_record_parser_accepts_bundle():
     assert args.bundle is True
 
 
-def test_record_parser_bundles_by_default():
+def test_record_parser_bundle_defaults_to_none():
+    # None (not True) so an unset flag is distinguishable from an explicit one —
+    # the resolved default (flag > env > config > default) lives in config.py.
     args = build_parser().parse_args(["record"])
-    assert args.bundle is True
+    assert args.bundle is None
 
 
-def test_process_parser_bundles_by_default():
+def test_process_parser_bundle_defaults_to_none():
     args = build_parser().parse_args(["process", "x.wav"])
-    assert args.bundle is True
+    assert args.bundle is None
 
 
 def test_record_parser_accepts_no_bundle():
@@ -78,8 +90,9 @@ def test_process_parser_accepts_no_bundle():
 
 
 def test_main_record_forwards_bundle_flag(monkeypatch):
-    # Guards the CLI->record.run wiring: `record --bundle` must actually reach
-    # record.run(bundle=True), not just parse into args and get dropped.
+    # Guards the CLI->record.run wiring: explicit `--bundle`/`--no-bundle` must
+    # reach record.run as True/False; without the flag, main forwards None and
+    # record.run resolves the default from config (contract with pipeline/record).
     from meetscribe.cli import main
 
     captured = {}
@@ -89,10 +102,16 @@ def test_main_record_forwards_bundle_flag(monkeypatch):
     assert main(["record", "--bundle"]) == 0
     assert captured["bundle"] is True
 
+    assert main(["record", "--no-bundle"]) == 0
+    assert captured["bundle"] is False
 
-def test_main_bare_invocation_bundles_by_default(monkeypatch):
+    assert main(["record"]) == 0
+    assert captured["bundle"] is None
+
+
+def test_main_bare_invocation_forwards_bundle_none(monkeypatch):
     # Bare `meetscribe` skips the subparser entirely, so record.run must get the
-    # bundle default via the getattr fallback — guard that it stays in sync.
+    # bundle default via the getattr fallback — None, i.e. "resolve from config".
     from meetscribe.cli import main
 
     captured = {}
@@ -100,7 +119,8 @@ def test_main_bare_invocation_bundles_by_default(monkeypatch):
     monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
 
     assert main(["--quiet"]) == 0
-    assert captured["bundle"] is True
+    assert captured["bundle"] is None
+    assert captured["cleanup"] is None
 
 
 def test_bundle_parser_accepts_dir_and_out():
@@ -151,7 +171,7 @@ def _make_artifacts(d):
     )
 
 
-def test_bundle_command_writes_default_named_archive(tmp_path, monkeypatch):
+def test_bundle_command_writes_default_named_archive(isolated_config, tmp_path, monkeypatch):
     import zipfile
 
     from meetscribe.cli import main
@@ -169,7 +189,7 @@ def test_bundle_command_writes_default_named_archive(tmp_path, monkeypatch):
         assert sorted(z.namelist()) == ["embeddings.npz", "meta.json", "transcript.json"]
 
 
-def test_bundle_command_honours_explicit_out(tmp_path):
+def test_bundle_command_honours_explicit_out(isolated_config, tmp_path):
     from meetscribe.cli import main
 
     src = tmp_path / "meeting"
@@ -179,6 +199,23 @@ def test_bundle_command_honours_explicit_out(tmp_path):
 
     assert main(["bundle", str(src), "-o", str(out)]) == 0
     assert out.exists()
+
+
+def test_bundle_command_malformed_config_exits_2(isolated_config, tmp_path, capsys):
+    # Acceptance: EVERY subcommand exits 2 on a malformed config (except
+    # `config path`) — bundle included.
+    from meetscribe.cli import main
+
+    src = tmp_path / "meeting"
+    src.mkdir()
+    _make_artifacts(src)
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[output\nbundle = false\n")
+
+    assert main(["bundle", str(src)]) == 2
+    printed = capsys.readouterr().out
+    assert "config.toml" in printed and "line 1" in printed
+    assert not list(tmp_path.glob("*.mscribe"))  # nothing was written
 
 
 # ---- process --speakers --------------------------------------------------------------
@@ -197,6 +234,15 @@ def test_process_speakers_defaults_to_none():
     assert args.speakers is None
 
 
+def test_cleanup_parser_defaults_and_spellings():
+    # BooleanOptionalAction: default None ("resolve from config"), and the
+    # historical `--no-cleanup` spelling must keep working alongside `--cleanup`.
+    for base in (["record"], ["process", "x"]):
+        assert build_parser().parse_args(base).cleanup is None
+        assert build_parser().parse_args(base + ["--cleanup"]).cleanup is True
+        assert build_parser().parse_args(base + ["--no-cleanup"]).cleanup is False
+
+
 def test_main_process_forwards_cleanup_flag(monkeypatch):
     from meetscribe import pipeline
     from meetscribe.cli import main
@@ -205,10 +251,14 @@ def test_main_process_forwards_cleanup_flag(monkeypatch):
     monkeypatch.setattr(pipeline, "run", lambda **k: captured.update(k) or 0)
 
     assert main(["process", "x"]) == 0
-    assert captured["cleanup"] is True  # default: cleanup on
+    assert captured["cleanup"] is None  # unset flag → pipeline resolves config/default
+    assert captured["bundle"] is None
 
     assert main(["process", "x", "--no-cleanup"]) == 0
     assert captured["cleanup"] is False
+
+    assert main(["process", "x", "--cleanup"]) == 0
+    assert captured["cleanup"] is True
 
 
 def test_main_clean_dispatches_to_clean_existing(monkeypatch):
@@ -305,3 +355,144 @@ def test_main_bare_invocation_backend_fallbacks_match_parser_defaults(monkeypatc
     assert main(["--quiet"]) == 0
     assert captured["backend"] is None
     assert captured["language"] is None
+
+
+# ---- config subcommand ---------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_config(monkeypatch, tmp_path):
+    """Point every config/data path at tmp_path and scrub the STT env vars, so no
+    test ever reads the real home or inherits the developer's environment."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    cfg_file = tmp_path / "conf" / "config.toml"
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(cfg_file))
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    return cfg_file
+
+
+def test_config_parser_actions():
+    assert build_parser().parse_args(["config"]).action is None
+    assert build_parser().parse_args(["config", "init"]).action == "init"
+    assert build_parser().parse_args(["config", "path"]).action == "path"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["config", "bogus"])
+
+
+def test_config_path_prints_path_only(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    assert main(["config", "path"]) == 0
+    assert capsys.readouterr().out == f"{isolated_config}\n"
+
+
+def test_config_path_works_with_malformed_config(isolated_config, capsys):
+    # Explicit acceptance carve-out: `config path` is the escape hatch a user
+    # needs to LOCATE the broken file — it must not exit 2 on it.
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[stt\nbackend = 'x'\n")
+
+    assert main(["config", "path"]) == 0
+    assert capsys.readouterr().out == f"{isolated_config}\n"
+
+
+def test_config_init_writes_template_0600(isolated_config, capsys):
+    import os
+
+    from meetscribe.cli import main
+    from meetscribe.config import TEMPLATE
+
+    # Pin the umask: under umask 077 write_text alone already yields 0600, which
+    # would let a deleted chmod call escape this test on hardened runners.
+    old = os.umask(0o022)
+    try:
+        assert main(["config", "init"]) == 0
+    finally:
+        os.umask(old)
+    assert isolated_config.read_text() == TEMPLATE  # parent dirs were created
+    assert (isolated_config.stat().st_mode & 0o777) == 0o600
+    assert str(isolated_config) in capsys.readouterr().out
+
+
+def test_config_init_refuses_overwrite(isolated_config):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[stt]\nbackend = \"deepgram\"\n")
+
+    assert main(["config", "init"]) != 0
+    # The existing file is untouched.
+    assert isolated_config.read_text() == "[stt]\nbackend = \"deepgram\"\n"
+
+
+def test_config_show_defaults_when_missing(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    assert str(isolated_config) in out and "missing" in out
+    assert "backend" in out and "local" in out
+    assert "cleanup" in out and "true" in out
+    assert "(default)" in out
+
+
+def test_config_show_reports_config_and_env_origins(isolated_config, monkeypatch, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[stt]\nbackend = \"deepgram\"\n[output]\nbundle = false\n")
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    assert "exists" in out
+    backend_line = next(l for l in out.splitlines() if l.startswith("backend"))
+    assert "deepgram" in backend_line and "(config)" in backend_line
+    bundle_line = next(l for l in out.splitlines() if l.startswith("bundle"))
+    assert "false" in bundle_line and "(config)" in bundle_line
+
+    monkeypatch.setenv("STT_BACKEND", "local")
+    assert main(["config"]) == 0
+    backend_line = next(
+        l for l in capsys.readouterr().out.splitlines() if l.startswith("backend")
+    )
+    assert "local" in backend_line and "(env)" in backend_line
+
+
+def test_config_show_masks_api_key(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text('[deepgram]\napi_key = "dg_supersecret123"\n')
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    assert "supersecret" not in out  # the secret itself never hits stdout
+    assert "secret123" not in out
+    key_line = next(l for l in out.splitlines() if l.startswith("api_key"))
+    # the exact mask: 3-char prefix only — anything longer leaks the secret
+    assert "dg_…****" in key_line and "(config)" in key_line
+
+
+def test_config_show_malformed_exits_2(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[stt\nbackend = 'x'\n")  # unclosed section header
+
+    assert main(["config"]) == 2
+    err = capsys.readouterr().err
+    assert str(isolated_config) in err
+
+
+def test_config_show_wrongly_typed_value_exits_2(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text('[output]\nbundle = "false"\n')  # string, not TOML bool
+
+    assert main(["config"]) == 2
+    assert "bundle" in capsys.readouterr().err

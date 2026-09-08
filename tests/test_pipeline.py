@@ -6,10 +6,26 @@ The heavy real-model end-to-end smoke lives in tests/test_e2e.py (opt-in, needs 
 import wave
 
 import numpy as np
+import pytest
 
 from meetscribe.asr import RawResult
 from meetscribe.pipeline import Components, process, resolve_inputs
 from meetscribe.vad import Chunk
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config(monkeypatch, tmp_path):
+    """No test may read the real home: the config is a per-test tmp file (missing by
+    default → all defaults) and the XDG dirs point into tmp_path (run() also reads the
+    glossary under XDG_CONFIG_HOME). Tests that need a config layer write
+    ``tmp_path / "config.toml"``. The STT env vars are scrubbed too — a developer
+    shell exporting STT_BACKEND=deepgram must not send run() tests down the
+    unstubbed remote path."""
+    monkeypatch.setenv("MEETSCRIBE_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def _write_wav(path, seconds=1.0, rate=16000):
@@ -387,6 +403,7 @@ def test_run_with_bundle_writes_mscribe(tmp_path, monkeypatch):
 
 
 def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
+    # explicit bundle=False (the --no-bundle flag) always wins
     from meetscribe import pipeline
 
     rec = tmp_path / "rec"
@@ -399,8 +416,153 @@ def test_run_without_bundle_writes_no_mscribe(tmp_path, monkeypatch):
     )
 
     out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), bundle=False) == 0
+    assert not list(out.glob("*.mscribe"))
+
+
+def _bundle_run_env(tmp_path, monkeypatch):
+    from meetscribe import pipeline
+
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "system.wav")
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(
+        pipeline, "build_components", lambda models_dir, num_speakers=-1, cleanup=True: _components()
+    )
+    return rec
+
+
+def test_run_bundle_none_defaults_on(tmp_path, monkeypatch):
+    # bundle=None (flag not given) with no config → the built-in default (on).
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
+    assert (out / f"meeting-{out.name}.mscribe").exists()
+
+
+def test_run_bundle_none_resolves_from_config(tmp_path, monkeypatch):
+    # bundle=None (flag not given) + [output].bundle=false → no bundle.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text("[output]\nbundle = false\n")
+    out = tmp_path / "out"
     assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
     assert not list(out.glob("*.mscribe"))
+
+
+def test_run_bundle_flag_beats_config(tmp_path, monkeypatch):
+    # an explicit True (the --bundle flag) wins over [output].bundle=false.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text("[output]\nbundle = false\n")
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), bundle=True) == 0
+    assert (out / f"meeting-{out.name}.mscribe").exists()
+
+
+def test_run_cleanup_none_resolves_from_config(tmp_path, monkeypatch):
+    # cleanup=None (flag not given) + [output].cleanup=false → the built cleaner is
+    # replaced by NullCleaner; without the config it runs (default on).
+    import json
+
+    from meetscribe import pipeline
+
+    rec = tmp_path / "rec"
+    (rec / "raw").mkdir(parents=True)
+    _write_wav(rec / "raw" / "system.wav")
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.setattr(
+        pipeline, "build_components",
+        lambda models_dir, num_speakers=-1, cleanup=True: Components(
+            FakeVad(), FakeRecognizer(), FakeDiarizer(), FakeEmbedder(), UpperCleaner()
+        ),
+    )
+
+    out1 = tmp_path / "out1"
+    assert pipeline.run(audio=str(rec), out_dir=str(out1), bundle=False) == 0
+    doc = json.loads((out1 / "transcript.json").read_text())
+    assert doc["segments"][0]["text"] == "HELLO WORLD"  # default: cleanup on
+
+    (tmp_path / "config.toml").write_text("[output]\ncleanup = false\n")
+    out2 = tmp_path / "out2"
+    assert pipeline.run(audio=str(rec), out_dir=str(out2), bundle=False) == 0
+    doc = json.loads((out2 / "transcript.json").read_text())
+    assert doc["segments"][0]["text"] == "hello world"  # config turned it off
+    assert doc["cleaned"] is False
+
+
+def test_run_malformed_config_exits_2_with_path_and_line(tmp_path, monkeypatch, capsys):
+    # A typo'd config must abort loudly (exit 2, path + line) — never silently
+    # degrade to defaults.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text("[output\nbundle = false\n")
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 2
+    printed = capsys.readouterr().out
+    assert "config.toml" in printed and "line 1" in printed
+    assert not (out / "transcript.json").exists()  # nothing was processed
+
+
+def test_run_warns_on_unknown_config_key(tmp_path, monkeypatch):
+    # Design: unknown sections/keys warn at LOAD time on every run (typo detection),
+    # not only when the user happens to run doctor.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text("[output]\nbundel = false\n")  # typo'd key
+    rep = RecordingReporter()
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        reporter=rep) == 0
+    assert any("output.bundel" in w for w in rep.warns), rep.warns
+
+
+def test_run_warns_on_insecure_api_key_perms(tmp_path, monkeypatch):
+    # Design: [deepgram].api_key in a group/world-readable file warns once, at load.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    cfgp = tmp_path / "config.toml"
+    cfgp.write_text('[deepgram]\napi_key = "dg_secret"\n')
+    cfgp.chmod(0o644)
+    rep = RecordingReporter()
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        reporter=rep) == 0
+    assert any("0600" in w for w in rep.warns), rep.warns
+    assert not any("dg_secret" in w for w in rep.warns)  # never echo the secret
+
+
+def test_run_wrongly_typed_language_exits_2(tmp_path, monkeypatch, capsys):
+    # Regression: [stt].language = 5 was resolved OUTSIDE the guarded block and
+    # tracebacked (after the whole meeting, in the record flow). It must be a
+    # clean exit 2 like every other typed-value error.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text(
+        '[stt]\nbackend = "deepgram"\nlanguage = 5\n[deepgram]\napi_key = "k"\n'
+    )
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out")) == 2
+    assert "language" in capsys.readouterr().out
+    assert not (tmp_path / "out" / "transcript.json").exists()
+
+
+def test_clean_existing_malformed_config_exits_2(tmp_path, monkeypatch, capsys):
+    # Acceptance: EVERY subcommand exits 2 on a malformed config — clean included.
+    from meetscribe import pipeline
+
+    (tmp_path / "config.toml").write_text("[output\nbundle = false\n")
+    src = tmp_path / "meeting"
+    src.mkdir()
+    assert pipeline.clean_existing(audio_dir=str(src)) == 2
+    printed = capsys.readouterr().out
+    assert "config.toml" in printed and "line 1" in printed
 
 
 def test_clean_existing_writes_cleanup_dir_nondestructively(tmp_path, monkeypatch):
@@ -464,26 +626,54 @@ def test_run_forwards_num_speakers_to_build_components(tmp_path, monkeypatch):
 
 # ---- backend resolution + remote (deepgram) wiring ----------------------------------
 
-def test_resolve_backend_precedence(monkeypatch):
-    # flag > STT_BACKEND env > default "local"
+def test_resolve_backend_precedence(monkeypatch, tmp_path):
+    # flag > STT_BACKEND env > [stt].backend config > default "local"
     from meetscribe.pipeline import resolve_backend
 
     monkeypatch.delenv("STT_BACKEND", raising=False)
     assert resolve_backend(None) == "local"
+    (tmp_path / "config.toml").write_text('[stt]\nbackend = "deepgram"\n')
+    assert resolve_backend(None) == "deepgram"  # config beats default
+    monkeypatch.setenv("STT_BACKEND", "local")
+    assert resolve_backend(None) == "local"  # env beats config
     monkeypatch.setenv("STT_BACKEND", "deepgram")
-    assert resolve_backend(None) == "deepgram"
     assert resolve_backend("local") == "local"  # explicit flag beats env
 
 
-def test_resolve_language_precedence(monkeypatch):
-    # flag > STT_LANGUAGE env > default "de"
+def test_resolve_language_precedence(monkeypatch, tmp_path):
+    # flag > STT_LANGUAGE env > [stt].language config > default "de"
     from meetscribe.pipeline import resolve_language
 
     monkeypatch.delenv("STT_LANGUAGE", raising=False)
     assert resolve_language(None) == "de"
+    (tmp_path / "config.toml").write_text('[stt]\nlanguage = "multi"\n')
+    assert resolve_language(None) == "multi"  # config beats default
     monkeypatch.setenv("STT_LANGUAGE", "en")
-    assert resolve_language(None) == "en"
+    assert resolve_language(None) == "en"  # env beats config
     assert resolve_language("multi") == "multi"  # explicit flag beats env
+
+
+def test_check_backend_accepts_api_key_from_config(monkeypatch, tmp_path):
+    # [deepgram].api_key beneath the env var satisfies the fail-fast check.
+    from meetscribe.pipeline import check_backend
+
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("STT_BACKEND", raising=False)
+    (tmp_path / "config.toml").write_text('[deepgram]\napi_key = "dg_cfg_key"\n')
+    name, err = check_backend("deepgram")
+    assert name == "deepgram" and err is None
+
+
+def test_check_backend_missing_key_mentions_env_and_config(monkeypatch, tmp_path):
+    # The fail-fast message must offer BOTH fixes: the env var and the config key.
+    from meetscribe.pipeline import check_backend
+
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    name, err = check_backend("deepgram")
+    assert err is not None
+    assert "DEEPGRAM_API_KEY" in err
+    assert "[deepgram].api_key" in err
+    assert str(tmp_path / "config.toml") in err  # points at the config path in use
 
 
 def _remote_rec_dir(tmp_path):
@@ -661,6 +851,43 @@ def test_run_deepgram_error_is_a_clean_exit_2(tmp_path, monkeypatch, capsys):
     assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
                         backend="deepgram") == 2
     assert "DEEPGRAM_API_KEY" in capsys.readouterr().out
+
+
+def test_run_deepgram_uses_config_api_key(tmp_path, monkeypatch):
+    # With no DEEPGRAM_API_KEY in the env, the key from [deepgram].api_key must both
+    # pass the preflight AND reach the DeepgramConfig actually used for the upload.
+    from meetscribe import pipeline
+    from meetscribe.backends import BackendResult
+    from meetscribe.types import DiarSegment, Utterance, Word
+
+    rec = _remote_rec_dir(tmp_path)
+    monkeypatch.setenv("MEETSCRIBE_MODELS", _fake_models_dir(tmp_path))
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    (tmp_path / "config.toml").write_text('[deepgram]\napi_key = "dg_cfg_key"\n')
+    monkeypatch.setattr(
+        pipeline, "build_embed_components",
+        lambda models_dir: Components(None, None, None, FakeEmbedder()),
+    )
+
+    seen = {}
+
+    def fake_transcribe(self, mic, system, glossary, reporter):
+        seen["api_key"] = self.config.api_key
+        return BackendResult(
+            mic_utts=[Utterance(0.0, 1.0, "me", "mic", "hi", (Word("hi", 0.0, 1.0),))],
+            system_utts=[Utterance(0.0, 1.0, "spk_0", "system", "hallo",
+                                   (Word("hallo", 0.0, 1.0),))],
+            system_diar=[DiarSegment(0.0, 1.0, "spk_0")],
+            models_meta={"asr_model": "deepgram-nova-3",
+                         "segmentation_model": "deepgram-diarizer"},
+        )
+
+    import meetscribe.deepgram as dg
+    monkeypatch.setattr(dg.DeepgramBackend, "transcribe", fake_transcribe)
+
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        backend="deepgram", bundle=False) == 0
+    assert seen["api_key"] == "dg_cfg_key"
 
 
 # ---- non-16 kHz input ---------------------------------------------------------------
