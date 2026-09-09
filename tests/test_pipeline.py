@@ -24,7 +24,8 @@ def _isolated_config(monkeypatch, tmp_path):
     monkeypatch.setenv("MEETSCRIBE_CONFIG", str(tmp_path / "config.toml"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
-    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY",
+                "MEETSCRIBE_BK_URL", "MEETSCRIBE_BK_TOKEN"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -996,3 +997,247 @@ def test_run_deepgram_key_cmd_supplies_key_material(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="stop here"):
         pipeline.run(audio=str(meeting), backend="deepgram")
     assert captured["api_key"] == "dg_from_cmd"
+
+
+# ---- bk auto-upload wiring ----------------------------------------------------------
+#
+# The error-handling matrix (2026-09-09-phase2-bk-upload-design.md) is binding:
+#   auto-upload on + missing base_url/token  → exit 2 in the config guard
+#   auto-upload on + --no-bundle             → exit 2 naming both knobs
+#   ANY upload-stage failure after processing → warn + retry hint, EXIT 0
+#   success → bk-workflow.json + workflow_id/web_url printed
+
+
+def _bk_run_env(tmp_path, monkeypatch, auto_upload=True):
+    """A processable rec dir + a valid [bk] config (0600 — no perms-warning noise)."""
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    cfgp = tmp_path / "config.toml"
+    cfgp.write_text(
+        '[bk]\nbase_url = "https://bk.example.com"\ntoken = "tkn"\n'
+        f"auto_upload = {'true' if auto_upload else 'false'}\n"
+    )
+    cfgp.chmod(0o600)
+    return rec
+
+
+def _fake_bk(monkeypatch, caps=None, caps_error=None, upload_error=None):
+    """Patch the ONE seam — the bk.BkClient module symbol — with a scriptable fake.
+
+    Returns a state dict; ``state["clients"]`` collects every constructed client so
+    tests can assert config, calls, and (crucially) *non*-construction."""
+    import meetscribe.bk as bk_mod
+
+    state: dict = {"clients": []}
+
+    class FakeBkClient:
+        def __init__(self, config, opener=None, sleep=None):
+            self.config = config
+            self.uploads: list = []
+            state["clients"].append(self)
+
+        def capabilities(self):
+            if caps_error is not None:
+                raise bk_mod.BkError(caps_error)
+            if caps is not None:
+                return caps
+            return {
+                "contract_version": 1,
+                "mscribe_format_versions": [2],
+                "max_bundle_bytes": 52428800,
+            }
+
+        def upload_bundle(self, bundle_path, *, meeting_id, calendar_meeting_id=None):
+            if upload_error is not None:
+                raise bk_mod.BkError(upload_error)
+            self.uploads.append((str(bundle_path), meeting_id, calendar_meeting_id))
+            return {
+                "workflow_id": "wf_01j9",
+                "state_url": "/api/meetscribe/v1/workflows/wf_01j9",
+                "web_url": "https://bk.example.com/workflows/wf_01j9",
+            }
+
+    monkeypatch.setattr(bk_mod, "BkClient", FakeBkClient)
+    return state
+
+
+def test_run_upload_success_writes_ref_and_prints_workflow(tmp_path, monkeypatch, capsys):
+    from meetscribe import bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+    state = _fake_bk(monkeypatch)
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
+
+    (client,) = state["clients"]
+    assert client.config.base_url == "https://bk.example.com"
+    assert client.config.token == "tkn"
+    [(bundle_path, meeting_id, cal)] = client.uploads
+    assert bundle_path.endswith(f"meeting-{out.name}.mscribe")
+    assert meeting_id == out.name  # Idempotency-Key = the meeting id
+    assert cal is None  # ?meeting_id= is Phase 3
+
+    ref = bk_mod.read_workflow_ref(out)
+    assert ref is not None
+    assert ref["workflow_id"] == "wf_01j9"
+    assert ref["web_url"] == "https://bk.example.com/workflows/wf_01j9"
+    assert ref["state_url"] == "/api/meetscribe/v1/workflows/wf_01j9"
+    assert ref["state"] == "processing"
+    assert ref["uploaded_at"] and ref["checked_at"]
+
+    printed = capsys.readouterr().out
+    assert "wf_01j9" in printed
+    assert "https://bk.example.com/workflows/wf_01j9" in printed
+
+
+def test_run_upload_off_by_default_never_constructs_client(tmp_path, monkeypatch):
+    # No [bk] config, upload=None → byte-identical behavior: no client, no ref.
+    import meetscribe.bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise AssertionError("BkClient must not be constructed when upload is off")
+
+    monkeypatch.setattr(bk_mod, "BkClient", boom)
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 0
+    assert bk_mod.read_workflow_ref(out) is None
+
+
+def test_run_upload_flag_false_beats_config(tmp_path, monkeypatch):
+    # --no-upload (upload=False) wins over [bk].auto_upload = true.
+    import meetscribe.bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+
+    def boom(*a, **k):
+        raise AssertionError("--no-upload must win over [bk].auto_upload")
+
+    monkeypatch.setattr(bk_mod, "BkClient", boom)
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        upload=False) == 0
+
+
+def test_run_upload_flag_true_beats_config_off(tmp_path, monkeypatch):
+    # --upload (upload=True) wins over [bk].auto_upload = false.
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch, auto_upload=False)
+    state = _fake_bk(monkeypatch)
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out"),
+                        upload=True) == 0
+    assert state["clients"] and state["clients"][0].uploads
+
+
+def test_run_upload_missing_bk_config_exits_2(tmp_path, monkeypatch, capsys):
+    # Matrix row 1: auto-upload on, base_url/token missing → exit 2, fail fast.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text("[bk]\nauto_upload = true\n")
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 2
+    printed = capsys.readouterr().out
+    assert "[bk].base_url" in printed and "MEETSCRIBE_BK_TOKEN" in printed
+    assert not (out / "transcript.json").exists()  # nothing was processed
+
+
+def test_run_upload_failing_token_cmd_exits_2(tmp_path, monkeypatch, capsys):
+    # The lazy token_cmd is fetched EAGERLY inside run()'s config guard (mirror of
+    # the deepgram api_key_cmd): failure is a clean exit 2, never a traceback.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text(
+        '[bk]\nauto_upload = true\nbase_url = "https://bk.example.com"\n'
+        'token_cmd = "echo kaboom >&2; exit 5"\n'
+    )
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out)) == 2
+    printed = capsys.readouterr().out
+    assert "token_cmd" in printed and "kaboom" in printed
+    assert not (out / "transcript.json").exists()  # nothing was processed
+
+
+def test_run_upload_token_cmd_supplies_material(tmp_path, monkeypatch):
+    # The BkConfig handed to the client must carry the fetched material, never the
+    # SecretCmd marker.
+    from meetscribe import pipeline
+
+    rec = _bundle_run_env(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text(
+        '[bk]\nauto_upload = true\nbase_url = "https://bk.example.com"\n'
+        'token_cmd = "echo tok_from_cmd"\n'
+    )
+    state = _fake_bk(monkeypatch)
+    assert pipeline.run(audio=str(rec), out_dir=str(tmp_path / "out")) == 0
+    assert state["clients"][0].config.token == "tok_from_cmd"
+
+
+def test_run_upload_with_no_bundle_exits_2(tmp_path, monkeypatch, capsys):
+    # Matrix row 2: auto-upload needs the bundle — the conflict exits 2 BEFORE any
+    # processing, and the message names both knobs.
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), bundle=False) == 2
+    printed = capsys.readouterr().out
+    assert "--no-bundle" in printed and "[bk].auto_upload" in printed
+    assert not (out / "transcript.json").exists()  # nothing was processed
+
+
+def test_run_upload_network_failure_warns_and_exits_0(tmp_path, monkeypatch, capsys):
+    # Matrix: upload network/5xx after retries → loud warn + retry hint, EXIT 0 —
+    # the artifacts are complete and local; the retry path is first-class.
+    from meetscribe import bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+    _fake_bk(monkeypatch,
+             upload_error="bk request failed after 3 attempts (network error: down)")
+    rep = RecordingReporter()
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), reporter=rep) == 0
+    assert any("upload" in w for w in rep.warns), rep.warns
+    assert f"meetscribe upload {out}" in capsys.readouterr().out  # the retry hint
+    # artifacts + bundle intact; no half-written workflow ref
+    assert (out / "transcript.json").exists()
+    assert (out / f"meeting-{out.name}.mscribe").exists()
+    assert bk_mod.read_workflow_ref(out) is None
+
+
+def test_run_upload_capabilities_failure_warns_and_exits_0(tmp_path, monkeypatch, capsys):
+    # A failing capabilities call (e.g. 404 — no bk API there) degrades identically.
+    from meetscribe import bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+    _fake_bk(monkeypatch, caps_error="bk request failed (HTTP 404: not found)")
+    rep = RecordingReporter()
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), reporter=rep) == 0
+    assert any("404" in w for w in rep.warns), rep.warns
+    assert f"meetscribe upload {out}" in capsys.readouterr().out
+    assert bk_mod.read_workflow_ref(out) is None
+
+
+def test_run_upload_preflight_failure_skips_upload_and_exits_0(tmp_path, monkeypatch, capsys):
+    # Matrix: preflight failure (unsupported format_version) → upload SKIPPED,
+    # warn + retry hint, exit 0.
+    from meetscribe import bk as bk_mod
+    from meetscribe import pipeline
+
+    rec = _bk_run_env(tmp_path, monkeypatch)
+    state = _fake_bk(monkeypatch,
+                     caps={"contract_version": 1, "mscribe_format_versions": [1]})
+    rep = RecordingReporter()
+    out = tmp_path / "out"
+    assert pipeline.run(audio=str(rec), out_dir=str(out), reporter=rep) == 0
+    assert state["clients"][0].uploads == []  # never POSTed
+    assert any("format_version" in w for w in rep.warns), rep.warns
+    assert f"meetscribe upload {out}" in capsys.readouterr().out
+    assert bk_mod.read_workflow_ref(out) is None

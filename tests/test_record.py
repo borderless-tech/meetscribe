@@ -38,7 +38,8 @@ def _isolated_config(monkeypatch, tmp_path):
     monkeypatch.setenv("MEETSCRIBE_CONFIG", str(tmp_path / "config.toml"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
-    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY"):
+    for var in ("STT_BACKEND", "STT_LANGUAGE", "DEEPGRAM_API_KEY",
+                "MEETSCRIBE_BK_URL", "MEETSCRIBE_BK_TOKEN"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -675,3 +676,86 @@ def test_run_deepgram_failing_key_cmd_fails_before_recording(tmp_path, monkeypat
     from meetscribe import record
     assert record.run(out_dir=str(tmp_path / "m"), backend="deepgram") == 2
     assert "api_key_cmd" in capsys.readouterr().out
+
+
+# ---- bk auto-upload preflight (fail BEFORE recording, mirror of the deepgram key) -----
+
+def test_run_upload_missing_bk_config_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # auto-upload on but no base_url/token: exit 2 BEFORE ffmpeg starts — not after
+    # an hour-long meeting was recorded.
+    (tmp_path / "config.toml").write_text("[bk]\nauto_upload = true\n")
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run without a usable bk config")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 2
+    printed = capsys.readouterr().out
+    assert "[bk].base_url" in printed and "MEETSCRIBE_BK_TOKEN" in printed
+    assert not (tmp_path / "m").exists()  # nothing was created either
+
+
+def test_run_upload_failing_token_cmd_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # [bk].token_cmd is executed eagerly at record start (pinentry there is fine —
+    # the user just initiated recording); a broken keyring command must fail
+    # BEFORE ffmpeg, not after the meeting (mirror of the deepgram api_key_cmd).
+    (tmp_path / "config.toml").write_text(
+        '[bk]\nauto_upload = true\nbase_url = "https://bk.example.com"\n'
+        'token_cmd = "echo kaboom >&2; exit 5"\n'
+    )
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run when the token cmd fails")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 2
+    printed = capsys.readouterr().out
+    assert "token_cmd" in printed and "kaboom" in printed
+    assert not (tmp_path / "m").exists()
+
+
+def _bk_config(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[bk]\nauto_upload = true\nbase_url = "https://bk.example.com"\ntoken = "t"\n'
+    )
+    cfg.chmod(0o600)  # keep the perms warning out of the way
+
+
+def test_run_upload_no_bundle_conflict_fails_before_recording(tmp_path, monkeypatch, capsys):
+    # auto-upload needs the bundle: the conflict must abort before recording, and
+    # the message names both knobs.
+    _bk_config(tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("record_tracks must not run with the upload/bundle conflict")
+
+    monkeypatch.setattr("meetscribe.record.record_tracks", boom)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m"), bundle=False) == 2
+    printed = capsys.readouterr().out
+    assert "--no-bundle" in printed and "[bk].auto_upload" in printed
+    assert not (tmp_path / "m").exists()
+
+
+def test_run_forwards_resolved_upload(tmp_path, monkeypatch):
+    # None = "resolve from config" (tri-state contract with the CLI): default OFF
+    # (uploading is never a surprise), config layer beneath, an explicit flag wins.
+    captured = {}
+    _stub_run(monkeypatch, captured)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["upload"] is False  # default off
+
+    _bk_config(tmp_path)  # auto_upload = true
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert captured["upload"] is True  # config layer
+
+    assert record.run(out_dir=str(tmp_path / "m"), upload=False) == 0
+    assert captured["upload"] is False  # --no-upload wins

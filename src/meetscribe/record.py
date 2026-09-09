@@ -446,6 +446,7 @@ def run(
     out_dir: str | None = None, bundle: bool | None = None, reporter=None,
     system_source: str | None = None, cleanup: bool | None = None,
     backend: str | None = None, language: str | None = None,
+    upload: bool | None = None,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -478,6 +479,12 @@ def run(
         system_source = config_mod.system_source(system_source, os.environ, cfg).value
         bundle = config_mod.bundle(bundle, os.environ, cfg).value
         cleanup = config_mod.cleanup(cleanup, os.environ, cfg).value
+        # bk auto-upload preflight, mirroring the deepgram key: when upload
+        # resolves on, base_url + token must resolve NOW and a [bk].token_cmd is
+        # executed eagerly (pinentry at record start is fine; a broken keyring
+        # command after the meeting is not). The upload itself happens in the
+        # pipeline.run hand-off — the fetched material is discarded here.
+        upload, _bk_url, _bk_token, bk_err = pipeline.check_bk_upload(upload, cfg=cfg)
         if out_dir is None:
             # Without -o, recordings land under the resolved meetings_dir
             # ($XDG_DATA_HOME/meetscribe/meetings by default) — never the CWD.
@@ -490,6 +497,14 @@ def run(
         return 2
     if backend_err:
         print(backend_err)
+        return 2
+    if bk_err:
+        print(bk_err)
+        return 2
+    if upload and not bundle:
+        # Same fail-fast rationale: pipeline.run would exit 2 on this conflict —
+        # but only AFTER the whole meeting was recorded. Catch it here.
+        print(pipeline.UPLOAD_NEEDS_BUNDLE_MSG)
         return 2
 
     root = Path(out_dir)
@@ -520,4 +535,5 @@ def run(
         bundle=bundle, started_at=started_at, reporter=reporter,
         num_speakers=num_speakers, cleanup=cleanup,
         backend=backend, language=language,  # resolution (flag > env > config > default) is run()'s job
+        upload=upload,  # resolved above (like bundle) — pipeline re-validates and uploads
     )

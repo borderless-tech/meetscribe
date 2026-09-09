@@ -12,6 +12,30 @@ bump always warrants at least a minor version bump here, and is called out in th
 ## [Unreleased]
 
 ### Added
+- **Auto-upload to borderless-knowledge (bk)**: after `record`/`process`, the `.mscribe`
+  bundle is uploaded to a bk server (API contract v1, see
+  `docs/meetscribe-bk-contract-v1.md`), and the returned async workflow reference is
+  persisted as `bk-workflow.json` next to the artifacts. **Strictly opt-in**: nothing is
+  ever uploaded unless `[bk].auto_upload = true` is set (or `--upload` is passed) — with
+  no `[bk]` config, behavior is unchanged and fully local. A failed upload never fails
+  the run: the artifacts are complete on disk, so `record`/`process` warn, print a
+  `meetscribe upload <dir>` retry hint, and still exit 0.
+- `upload <dir>` subcommand — the retry/backfill path: bundles the directory first if no
+  `.mscribe` exists, then uploads it to bk. Here the upload *is* the task, so failure is
+  exit 1 (config problems exit 2).
+- `status [dir] [--offline]` subcommand — lists every local meeting (id, start, duration,
+  backend, bundled?, upload state). Non-terminal workflows are refreshed from bk and the
+  local reference updated; `--offline` skips the refresh, and a failed refresh degrades
+  to the cached state with a stale marker (exit 0).
+- `[bk]` config section: `base_url`, `token`, `token_cmd`, `auto_upload` (env overrides
+  `MEETSCRIBE_BK_URL` / `MEETSCRIBE_BK_TOKEN`; flag `--upload/--no-upload` wins per run).
+  `token_cmd` follows the lazy keyring pattern of `[deepgram].api_key_cmd`: mutually
+  exclusive with `token`, executed only when the token is actually needed.
+- `doctor` preflights bk whenever `[bk].base_url` resolves or auto-upload is on: host
+  reachability (bare TCP/TLS, no request), token presence (a configured `token_cmd`
+  counts but is never executed), and — with a static token — a live `capabilities` call
+  verifying auth and bundle-format support before the first upload can fail on it.
+
 - TOML config file at `$XDG_CONFIG_HOME/meetscribe/config.toml` (`~/.config` fallback;
   `MEETSCRIBE_CONFIG=<path>` overrides). All keys optional; schema v1 covers
   `[stt] backend/language`, `[deepgram] api_key`, `[storage] meetings_dir`,
@@ -38,6 +62,12 @@ bump always warrants at least a minor version bump here, and is called out in th
   exactly like no config file (`meetscribe config` shows `(default)` everywhere
   until you uncomment something), and the header warns against syncing the file
   into public dotfiles once `api_key` is set.
+
+### Privacy
+- With `[bk].auto_upload` enabled the transcript, speaker embeddings, and metadata
+  (the `.mscribe` bundle — never the raw audio) **leave the machine** for the configured
+  bk server. This is explicit opt-in per the roadmap's privacy rule: uploading is never a
+  surprise, and the default remains fully local/offline.
 
 ### Changed
 - **Default recordings location:** `meetscribe record` without `-o` now writes to

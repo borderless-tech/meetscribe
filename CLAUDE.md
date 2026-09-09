@@ -127,6 +127,44 @@ terms as nova-3 `keyterm` boosts. Rules:
 - Real-API e2e: `tests/test_deepgram_e2e.py` (paid, ~$0.01/run; double-gated on
   `DEEPGRAM_API_KEY` + `MEETSCRIBE_MODELS`).
 
+## bk upload (borderless-knowledge)
+
+`bk.py` is the client for the bk server (API contract v1, `docs/meetscribe-bk-contract-v1.md` —
+**changed only in lockstep with bk's copy**; design: `docs/plans/2026-09-09-phase2-bk-upload-design.md`).
+It mirrors `deepgram.py` exactly: frozen `BkConfig`, stdlib `urllib` (no new deps), injected
+`opener`/`sleep` seams so every test stays offline, typed `BkError` whose message always names
+the knob to turn. Endpoints consumed: `capabilities` (pre-upload handshake), `POST /bundles`
+(the `.mscribe` zip, `Idempotency-Key` = meeting id so retries are always safe), and
+`GET /workflows/{id}`. `bk.preflight(caps, bundle_bytes)` checks contract version, that
+`output.FORMAT_VERSION` is in bk's `mscribe_format_versions`, and `max_bundle_bytes` —
+*before* the upload, so version/size problems are a clear message instead of a rejected POST.
+Fixtures in `tests/fixtures/bk/` are authored field-for-field from the contract doc and meant
+to be drop-in replaceable by bk's canonical set — divergence later = red test = contract bug.
+
+- **Auto-upload is strict opt-in** (`[bk].auto_upload` config / `--upload` flag; default
+  false). With no `[bk]` config, behavior is byte-identical to a bk-less build.
+- The returned workflow reference is persisted as **`bk-workflow.json`**
+  (`{workflow_id, state_url, web_url, uploaded_at, state, checked_at}`) *next to* the
+  artifacts — never inside the bundle (`BUNDLE_MEMBERS` is untouched).
+  `read_workflow_ref` returns `None` for an absent/corrupt file: a broken ref degrades to
+  "not uploaded", it must never crash `status`.
+- **Exit-code asymmetry is deliberate:** on `record`/`process` an upload failure
+  (preflight, network, 4xx/5xx) is a loud warning + a printed `meetscribe upload <dir>`
+  retry hint, and the run **exits 0** — the artifacts are complete and local, and a
+  non-zero exit would make automation treat a *processed* meeting as failed. On the
+  `upload <dir>` subcommand the upload IS the task, so the same failure is **exit 1**
+  (config problems are exit 2 everywhere). `status [dir] [--offline]` lists local
+  meetings with their upload state; a failed refresh shows the cached state marked stale
+  and still exits 0.
+- When auto-upload resolves on, config is validated eagerly: missing base_url/token (a
+  `token_cmd` is executed once here) or a `--no-bundle` conflict is exit 2 — at the top of
+  `record.run` *before ffmpeg starts*, same rationale as the Deepgram key check.
+- `doctor` appends bk checks when `bk_base_url` resolves or auto-upload is on: host
+  reachability (bare TCP/TLS via the injected `Connect` seam, never an HTTP request),
+  token presence (a `SecretCmd` marker counts but is **never executed** — no pinentry in
+  doctor), and a live capabilities/format check only when a *static* token exists
+  (injected opener; skipped for `token_cmd`).
+
 ## Configuration
 
 `config.py` owns all of it — the TOML file, the XDG paths, and the **one precedence rule
@@ -142,24 +180,32 @@ everywhere: flag > env > config > default**. Read-only stdlib `tomllib`; we neve
 - Glossary (unchanged): `$XDG_CONFIG_HOME/meetscribe/glossary.txt` (`glossary.py` uses
   `config.config_home()`).
 
-**Schema v1** (all keys optional; empty strings count as unset): `[stt]
-backend`/`language`, `[deepgram] api_key`/`api_key_cmd` (mutually exclusive; the cmd is a
-shell command printing the key, executed lazily via `config.fetch_api_key` only when the
-deepgram backend actually needs it — never by `config` display, `validate`, or doctor),
-`[storage] meetings_dir`, `[record]
-system_source`, `[output] bundle`/`cleanup`. `[bk]` is reserved for Phase 2 and never
-reported as unknown. Unknown keys warn; **malformed TOML is exit 2 with file + line**
-(`ConfigError`) — a typo'd config silently degrading to defaults is the worst failure mode.
-Booleans must be real TOML booleans (`"false"` is a `ConfigError`, never truthy).
+**Schema** (all keys optional; empty strings count as unset): `[stt]
+backend`/`language`, `[deepgram] api_key`/`api_key_cmd`, `[storage] meetings_dir`,
+`[record] system_source`, `[output] bundle`/`cleanup`, and `[bk]
+base_url`/`token`/`token_cmd`/`auto_upload` (env `MEETSCRIBE_BK_URL`/`MEETSCRIBE_BK_TOKEN`;
+`auto_upload` defaults false and has no env layer, like bundle/cleanup). Unknown keys
+warn; **malformed TOML is exit 2 with file + line** (`ConfigError`) — a typo'd config
+silently degrading to defaults is the worst failure mode. Booleans must be real TOML
+booleans (`"false"` is a `ConfigError`, never truthy).
+
+**Lazy secrets:** `*_cmd` keys (`[deepgram].api_key_cmd`, `[bk].token_cmd`) resolve to an
+unexecuted `config.SecretCmd` marker carrying its label for error messages; only
+`config.fetch_secret` runs the command — at the moment the secret is actually needed,
+never during `config` display, `validate`, or doctor (which may run headless; a keyring
+command could block on pinentry). A `*_cmd` and its static twin both set is a
+`ConfigError` (stale-secret trap). Secrets in a group/world-readable config file warn
+(`insecure_secret_perms` covers `[deepgram].api_key` AND `[bk].token`).
 
 Every resolver in `config.py` returns `Resolved(value, origin)` with origin ∈
 `flag|env|config|default`, so `meetscribe config` can show *why* each value is what it is
 (`config init` writes the 0600 template, `config path` prints the path). `doctor` runs a
-config check first (path + parse status red-with-line, unknown-key and api_key-permission
+config check first (path + parse status red-with-line, unknown-key and secret-permission
 warnings) that never aborts the audio checks.
 
 **The None-default flag pattern:** tri-state CLI flags (`--bundle/--no-bundle`,
-`--cleanup/--no-cleanup`, `--backend`, `--language`, `--system-source`) have parser default
+`--cleanup/--no-cleanup`, `--upload/--no-upload`, `--backend`, `--language`,
+`--system-source`) have parser default
 `None` = "flag not given → resolve env/config/default downstream" in
 `pipeline.run`/`record.run`. An explicit flag value always wins. When adding a config-backed
 option, keep this shape: never give the parser a concrete default, or the config layer

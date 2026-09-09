@@ -1,0 +1,64 @@
+{
+  "workflow_id": "wf_01j9",
+  "contract_version": 1,
+  "state": "awaiting_review",
+  "web_url": "https://bk.example.com/workflows/wf_01j9",
+  "error": null,
+  "tasks": [
+    {
+      "task_id": "task_a1",
+      "type": "speaker_annotation",
+      "revision": 3,
+      "submit_url": "/api/meetscribe/v1/workflows/wf_01j9/tasks/task_a1/submit",
+      "web_url": "https://bk.example.com/workflows/wf_01j9#task_a1",
+      "payload": {
+        "speakers": [
+          {
+            "label": "me",
+            "suggestions": [
+              {
+                "person_id": "p_owner",
+                "name": "Christian H.",
+                "confidence": "high",
+                "source": "owner"
+              }
+            ]
+          },
+          {
+            "label": "spk_0",
+            "suggestions": [
+              {
+                "person_id": "p_123",
+                "name": "Anna Meier",
+                "confidence": "high",
+                "source": "voice_match"
+              },
+              {
+                "person_id": "p_456",
+                "name": "Ben Otto",
+                "confidence": null,
+                "source": "roster"
+              }
+            ]
+          },
+          {
+            "label": "spk_1",
+            "suggestions": []
+          }
+        ],
+        "roster": [
+          {
+            "person_id": "p_123",
+            "email": "anna@example.com",
+            "name": "Anna Meier"
+          },
+          {
+            "person_id": "p_456",
+            "email": "ben@example.com",
+            "name": "Ben Otto"
+          }
+        ]
+      }
+    }
+  ]
+}

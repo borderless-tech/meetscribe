@@ -1,0 +1,8 @@
+{
+  "workflow_id": "wf_01j9",
+  "contract_version": 1,
+  "state": "processing",
+  "web_url": "https://bk.example.com/workflows/wf_01j9",
+  "error": null,
+  "tasks": []
+}
