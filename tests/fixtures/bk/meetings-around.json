@@ -1,0 +1,14 @@
+{
+  "meetings": [
+    {
+      "id": "1f0e2d3c-4b5a-4968-8776-655443322110",
+      "title": "Weekly Sync",
+      "start": "2026-09-08T07:00:00.000Z",
+      "end": "2026-09-08T07:30:00.000Z",
+      "attendees": [
+        { "email": "anna@example.com", "name": "Anna Meier" },
+        { "email": "guest@other.org", "name": null }
+      ]
+    }
+  ]
+}

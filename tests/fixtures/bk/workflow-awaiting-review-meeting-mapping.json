@@ -1,0 +1,35 @@
+{
+  "workflow_id": "wf-22222222-2222-4222-8222-222222222222",
+  "contract_version": 1,
+  "state": "awaiting_review",
+  "web_url": "https://bk.example.com/transcripts/wf-22222222-2222-4222-8222-222222222222",
+  "error": null,
+  "tasks": [
+    {
+      "task_id": "task_1",
+      "type": "meeting_mapping",
+      "revision": 1,
+      "submit_url": "/api/meetscribe/v1/workflows/wf-22222222-2222-4222-8222-222222222222/tasks/task_1/submit",
+      "web_url": "https://bk.example.com/transcripts/wf-22222222-2222-4222-8222-222222222222#task_1",
+      "payload": {
+        "candidates": [
+          {
+            "meeting_id": "1f0e2d3c-4b5a-4968-8776-655443322110",
+            "title": "Weekly Sync",
+            "start": "2026-09-08T07:00:00.000Z",
+            "end": "2026-09-08T07:30:00.000Z",
+            "match": "high"
+          },
+          {
+            "meeting_id": "2a1b3c4d-5e6f-4a80-9b1c-2d3e4f5a6b7c",
+            "title": "Planungsnotizen Q4",
+            "start": null,
+            "end": null,
+            "match": "low"
+          }
+        ],
+        "allow_create": true
+      }
+    }
+  ]
+}

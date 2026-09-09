@@ -694,13 +694,13 @@ def _fake_bk_client(
             self.upload_calls.append((str(bundle_path), meeting_id, calendar_meeting_id))
             if upload_error is not None:
                 raise upload_error
-            return accepted if accepted is not None else _bk_fixture("upload_accepted.json")
+            return accepted if accepted is not None else _bk_fixture("bundle-accepted.json")
 
         def workflow(self, workflow_id):
             self.workflow_calls.append(workflow_id)
             if workflow_error is not None:
                 raise workflow_error
-            return workflow if workflow is not None else _bk_fixture("workflow_processing.json")
+            return workflow if workflow is not None else _bk_fixture("workflow-processing.json")
 
     monkeypatch.setattr(bk, "BkClient", Fake)
     return created
@@ -790,8 +790,9 @@ def test_upload_command_happy_path_with_existing_bundle(
     assert main(["upload", str(src)]) == 0
 
     out = capsys.readouterr().out
-    assert "wf_01j9" in out
-    assert "https://bk.example.com/workflows/wf_01j9" in out
+    # the fixture's own (opaque) id + web_url must surface on stdout
+    assert "wf-3f9a1b2c-4d5e-4f60-8172-93a4b5c6d7e8" in out
+    assert "https://bk.example.com/transcripts/wf-3f9a1b2c-4d5e-4f60-8172-93a4b5c6d7e8" in out
 
     (client,) = created
     assert client.config.base_url == "https://bk.example.com"
@@ -804,9 +805,10 @@ def test_upload_command_happy_path_with_existing_bundle(
     assert [p.name for p in src.glob("*.mscribe")] == ["meeting-m1.mscribe"]
 
     ref = bk.read_workflow_ref(src)
-    assert ref["workflow_id"] == "wf_01j9"
-    assert ref["state_url"] == "/api/meetscribe/v1/workflows/wf_01j9"
-    assert ref["web_url"] == "https://bk.example.com/workflows/wf_01j9"
+    accepted = _bk_fixture("bundle-accepted.json")  # ids are opaque — compare to fixture
+    assert ref["workflow_id"] == accepted["workflow_id"]
+    assert ref["state_url"] == accepted["state_url"]
+    assert ref["web_url"] == accepted["web_url"]
     assert ref["state"] == "processing"
     # timestamps are tz-aware ISO 8601 with offset (the meta.json convention)
     assert datetime.fromisoformat(ref["uploaded_at"]).tzinfo is not None
@@ -1069,7 +1071,7 @@ def test_status_refreshes_non_terminal_ref_and_updates_file(
         },
     )
     _write_bk_config(isolated_config)
-    created = _fake_bk_client(monkeypatch, workflow=_bk_fixture("workflow_done.json"))
+    created = _fake_bk_client(monkeypatch, workflow=_bk_fixture("workflow-done.json"))
 
     assert main(["status", str(root)]) == 0
     line = next(l for l in capsys.readouterr().out.splitlines() if "m1" in l)
@@ -1104,18 +1106,20 @@ def test_status_refreshes_awaiting_review_ref_and_shows_web_url(
     )
     _write_bk_config(isolated_config)
     created = _fake_bk_client(
-        monkeypatch, workflow=_bk_fixture("workflow_awaiting_review.json")
+        monkeypatch, workflow=_bk_fixture("workflow-awaiting-review-speaker-annotation.json")
     )
 
     assert main(["status", str(root)]) == 0
     line = next(l for l in capsys.readouterr().out.splitlines() if "m1" in l)
     assert "awaiting_review" in line
-    assert "https://bk.example.com/workflows/wf_01j9" in line
+    assert "https://bk.example.com/transcripts/wf-33333333-3333-4333-8333-333333333333" in line
 
     assert created[0].workflow_calls == ["wf_01j9"]
     ref = bk.read_workflow_ref(d)
     assert ref["state"] == "awaiting_review"
-    assert ref["web_url"] == "https://bk.example.com/workflows/wf_01j9"
+    # the refresh adopted the workflow response's web_url (fixture value)
+    wf = _bk_fixture("workflow-awaiting-review-speaker-annotation.json")
+    assert ref["web_url"] == wf["web_url"]
     assert ref["checked_at"] != "2026-09-09T10:00:00+02:00"  # refresh bumped it
 
 

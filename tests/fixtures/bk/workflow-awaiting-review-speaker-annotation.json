@@ -1,0 +1,66 @@
+{
+  "workflow_id": "wf-33333333-3333-4333-8333-333333333333",
+  "contract_version": 1,
+  "state": "awaiting_review",
+  "web_url": "https://bk.example.com/transcripts/wf-33333333-3333-4333-8333-333333333333",
+  "error": null,
+  "tasks": [
+    {
+      "task_id": "task_3",
+      "type": "speaker_annotation",
+      "revision": 3,
+      "submit_url": "/api/meetscribe/v1/workflows/wf-33333333-3333-4333-8333-333333333333/tasks/task_3/submit",
+      "web_url": "https://bk.example.com/transcripts/wf-33333333-3333-4333-8333-333333333333#task_3",
+      "payload": {
+        "new_voice_model": false,
+        "speakers": [
+          {
+            "label": "me",
+            "suggestions": [
+              {
+                "person_id": "7c0a9d8e-1f2b-4c3d-8e4f-5a6b7c8d9e0f",
+                "name": "Alice Anders",
+                "confidence": "high",
+                "source": "owner",
+                "preselected": true
+              }
+            ]
+          },
+          {
+            "label": "spk_0",
+            "suggestions": [
+              {
+                "person_id": "3b2c4d5e-6f70-4182-9394-a5b6c7d8e9f0",
+                "name": "Anna Meier",
+                "confidence": "high",
+                "source": "voice_match",
+                "preselected": false
+              },
+              {
+                "person_id": "4c3d5e6f-7081-4293-a4b5-c6d7e8f9a0b1",
+                "name": "Ben Otto",
+                "confidence": null,
+                "source": "roster",
+                "preselected": false
+              }
+            ]
+          },
+          { "label": "spk_1", "suggestions": [] },
+          { "label": "spk_2", "suggestions": [] }
+        ],
+        "roster": [
+          {
+            "person_id": "3b2c4d5e-6f70-4182-9394-a5b6c7d8e9f0",
+            "email": "anna@example.com",
+            "name": "Anna Meier"
+          },
+          {
+            "person_id": "4c3d5e6f-7081-4293-a4b5-c6d7e8f9a0b1",
+            "email": "ben@example.com",
+            "name": null
+          }
+        ]
+      }
+    }
+  ]
+}

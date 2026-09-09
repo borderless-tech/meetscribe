@@ -1,6 +1,6 @@
 {
   "error": {
-    "code": "unsupported_format_version",
-    "message": "bundle format_version 3 is not supported"
+    "code": "not_found",
+    "message": "unknown workflow"
   }
 }

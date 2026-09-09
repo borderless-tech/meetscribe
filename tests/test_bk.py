@@ -171,12 +171,12 @@ def _bundle(tmp_path):
 
 
 def test_upload_request_shape(tmp_path):
-    opener = SeqOpener([FakeResponse(_fixture("upload_accepted.json"))])
+    opener = SeqOpener([FakeResponse(_fixture("bundle-accepted.json"))])
     client, _ = _client(opener)
 
     out = client.upload_bundle(_bundle(tmp_path), meeting_id="20260909-100000")
 
-    assert out == _fixture("upload_accepted.json")
+    assert out == _fixture("bundle-accepted.json")
     req, timeout = opener.calls[0]
     assert req.get_method() == "POST"
     assert req.full_url == "https://bk.example.com/api/meetscribe/v1/bundles"
@@ -188,7 +188,7 @@ def test_upload_request_shape(tmp_path):
 
 
 def test_upload_appends_meeting_id_query_only_when_given(tmp_path):
-    opener = SeqOpener([FakeResponse(_fixture("upload_accepted.json"))])
+    opener = SeqOpener([FakeResponse(_fixture("bundle-accepted.json"))])
     client, _ = _client(opener)
 
     client.upload_bundle(
@@ -201,27 +201,29 @@ def test_upload_appends_meeting_id_query_only_when_given(tmp_path):
 
 
 def test_upload_202_body_parses_to_the_workflow_reference(tmp_path):
-    accepted = _fixture("upload_accepted.json")
+    accepted = _fixture("bundle-accepted.json")
     opener = SeqOpener([FakeResponse(accepted)])
     client, _ = _client(opener)
 
     out = client.upload_bundle(_bundle(tmp_path), meeting_id="m")
 
-    assert out["workflow_id"] == "wf_01j9"
-    assert out["state_url"] == "/api/meetscribe/v1/workflows/wf_01j9"
-    assert out["web_url"] == "https://bk.example.com/workflows/wf_01j9"
+    # ids are opaque (contract): assert self-consistency, not example values
+    wf_id = out["workflow_id"]
+    assert wf_id and isinstance(wf_id, str)
+    assert out["state_url"] == f"/api/meetscribe/v1/workflows/{wf_id}"
+    assert out["web_url"].startswith("https://")
 
 
 # ---- retry / backoff ----------------------------------------------------------------
 
 
 def test_upload_retries_on_429_then_succeeds(tmp_path):
-    opener = SeqOpener([_http_error(429), FakeResponse(_fixture("upload_accepted.json"))])
+    opener = SeqOpener([_http_error(429), FakeResponse(_fixture("bundle-accepted.json"))])
     client, sleeps = _client(opener)
 
     out = client.upload_bundle(_bundle(tmp_path), meeting_id="m")
 
-    assert out == _fixture("upload_accepted.json")
+    assert out == _fixture("bundle-accepted.json")
     assert len(opener.calls) == 2
     assert sleeps and all(s > 0 for s in sleeps)  # backed off before the retry
 
@@ -304,7 +306,7 @@ def test_upload_non_retryable_status_surfaces_the_contract_error_message(tmp_pat
     opener = SeqOpener([_http_error(422)])
     client, _ = _client(opener)
 
-    with pytest.raises(BkError, match="bundle format_version 3 is not supported"):
+    with pytest.raises(BkError, match="unknown workflow"):
         client.upload_bundle(_bundle(tmp_path), meeting_id="m")
     assert len(opener.calls) == 1
 
@@ -328,12 +330,12 @@ def test_non_json_200_body_is_a_bk_error():
 
 
 def test_workflow_request_shape_and_parse():
-    opener = SeqOpener([FakeResponse(_fixture("workflow_processing.json"))])
+    opener = SeqOpener([FakeResponse(_fixture("workflow-processing.json"))])
     client, _ = _client(opener)
 
     out = client.workflow("wf_01j9")
 
-    assert out == _fixture("workflow_processing.json")
+    assert out == _fixture("workflow-processing.json")
     req, _ = opener.calls[0]
     assert req.get_method() == "GET"
     assert req.full_url == "https://bk.example.com/api/meetscribe/v1/workflows/wf_01j9"
@@ -343,58 +345,69 @@ def test_workflow_request_shape_and_parse():
 @pytest.mark.parametrize(
     "name, state",
     [
-        ("workflow_processing.json", "processing"),
-        ("workflow_awaiting_review.json", "awaiting_review"),
-        ("workflow_done.json", "done"),
-        ("workflow_failed.json", "failed"),
+        ("workflow-processing.json", "processing"),
+        ("workflow-awaiting-review-speaker-annotation.json", "awaiting_review"),
+        ("workflow-done.json", "done"),
+        ("workflow-failed.json", "failed"),
     ],
 )
 def test_workflow_fixtures_carry_web_url_in_every_state(name, state):
-    # forward-compat rule 1: web_url is ALWAYS present — unknown states fall back to it
+    # forward-compat rule 1: web_url is ALWAYS present — unknown states fall back to it.
+    # The URL itself is opaque (bk serves /transcripts/... today) — shape only.
     wf = _fixture(name)
     assert wf["state"] == state
-    assert wf["web_url"] == "https://bk.example.com/workflows/wf_01j9"
+    assert wf["web_url"].startswith("https://")
     assert wf["contract_version"] == 1
 
 
 def test_awaiting_review_fixture_has_exactly_one_speaker_annotation_task():
     # the agreed single-gate semantics: at most ONE task, sequential gates only
-    wf = _fixture("workflow_awaiting_review.json")
+    wf = _fixture("workflow-awaiting-review-speaker-annotation.json")
     assert len(wf["tasks"]) == 1
     task = wf["tasks"][0]
     assert task["type"] == "speaker_annotation"
-    assert set(task) == {"task_id", "type", "revision", "submit_url", "web_url", "payload"}
-    assert [s["label"] for s in task["payload"]["speakers"]] == ["me", "spk_0", "spk_1"]
-    assert {p["person_id"] for p in task["payload"]["roster"]} == {"p_123", "p_456"}
+    # REQUIRED keys must be present; extra keys are fine — the contract's additive
+    # rule obliges clients to ignore unknown fields, so these are subset asserts,
+    # never equality (bk already ships additive `preselected`/`new_voice_model`).
+    assert {"task_id", "type", "revision", "submit_url", "web_url", "payload"} <= set(task)
+    assert task["submit_url"].endswith(f"/tasks/{task['task_id']}/submit")
 
-    # Pin the payload interior too: Phase 4 task rendering consumes exactly these
-    # fields, and a dropped-in canonical bk fixture that renames/drops one must go
-    # red HERE (the fixtures' whole purpose is divergence detection).
+    labels = [s["label"] for s in task["payload"]["speakers"]]
+    assert len(labels) == len(set(labels))  # unique
+    assert "me" in labels
+    assert all(lbl == "me" or lbl.startswith("spk_") for lbl in labels)
+
     for speaker in task["payload"]["speakers"]:
-        assert set(speaker) == {"label", "suggestions"}
+        assert {"label", "suggestions"} <= set(speaker)
         for s in speaker["suggestions"]:
-            assert set(s) == {"person_id", "name", "confidence", "source"}
+            assert {"person_id", "name", "confidence", "source"} <= set(s)
             assert s["source"] in {"owner", "voice_match", "roster"}  # the contract enum
-    # the "me" owner suggestion and the contract's null-confidence roster suggestion
-    me, spk_0, _ = task["payload"]["speakers"]
-    assert [(s["source"], s["confidence"]) for s in me["suggestions"]] == [("owner", "high")]
-    assert [(s["source"], s["confidence"]) for s in spk_0["suggestions"]] == [
-        ("voice_match", "high"),
-        ("roster", None),
-    ]
+            if "preselected" in s:  # additive (bk-implemented nice-to-have)
+                assert isinstance(s["preselected"], bool)
+    # "me" carries an owner-source suggestion (the uploading user)
+    me = next(s for s in task["payload"]["speakers"] if s["label"] == "me")
+    assert any(s["source"] == "owner" for s in me["suggestions"])
+
+    roster_ids = set()
     for person in task["payload"]["roster"]:
-        assert set(person) == {"person_id", "email", "name"}
-    assert {p["email"] for p in task["payload"]["roster"]} == {
-        "anna@example.com",
-        "ben@example.com",
-    }
+        assert {"person_id", "email", "name"} <= set(person)
+        assert person["person_id"]  # opaque but non-empty
+        roster_ids.add(person["person_id"])
+    assert len(roster_ids) == len(task["payload"]["roster"])  # unique
+    # every roster-sourced suggestion refers back into the roster (cross-consistency)
+    for speaker in task["payload"]["speakers"]:
+        for s in speaker["suggestions"]:
+            if s["source"] == "roster":
+                assert s["person_id"] in roster_ids
 
 
 def test_failed_fixture_carries_the_standard_error_shape():
-    wf = _fixture("workflow_failed.json")
+    # code values are bk's (opaque examples) — the SHAPE is the contract
+    wf = _fixture("workflow-failed.json")
     assert wf["tasks"] == []
     assert set(wf["error"]) == {"code", "message"}
-    assert wf["error"]["code"] == "gate_timeout"
+    assert wf["error"]["code"] and isinstance(wf["error"]["code"], str)
+    assert wf["error"]["message"] and isinstance(wf["error"]["message"], str)
 
 
 # ---- workflow reference file --------------------------------------------------------

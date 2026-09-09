@@ -1,0 +1,11 @@
+{
+  "workflow_id": "wf-55555555-5555-4555-8555-555555555555",
+  "contract_version": 1,
+  "state": "failed",
+  "web_url": "https://bk.example.com/transcripts/wf-55555555-5555-4555-8555-555555555555",
+  "error": {
+    "code": "processing_failed",
+    "message": "timed out waiting for meeting input"
+  },
+  "tasks": []
+}
