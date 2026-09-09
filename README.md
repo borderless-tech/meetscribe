@@ -71,6 +71,12 @@ system_source = ""       # fixed system-audio source (auto-detected when empty)
 [output]
 bundle = true            # write the .mscribe bundle
 cleanup = true           # run the LLM cleanup pass
+
+[bk]
+base_url = ""            # borderless-knowledge server (env MEETSCRIBE_BK_URL wins)
+token = ""               # bk API token; keep this file 0600 when set
+token_cmd = ""           # or: shell command printing the token ("pass show bk")
+auto_upload = false      # upload the bundle after record/process (explicit opt-in)
 ```
 
 Recordings land under `$XDG_DATA_HOME/meetscribe/meetings/` by default (`-o` overrides per
@@ -95,6 +101,35 @@ ids. `doctor` checks the key and API reachability when `STT_BACKEND=deepgram` is
 `--speakers` (and the post-recording participant count) only steers the local diarizer —
 Deepgram infers the speaker count itself, so remotely it is warned about and ignored
 (participant *names* still help: they feed the glossary, which is sent as keyterm boosts).
+
+### Uploading to borderless-knowledge (opt-in)
+
+meetscribe can hand every finished meeting to a [borderless-knowledge](docs/meetscribe-bk-contract-v1.md)
+(bk) server: the `.mscribe` bundle (transcript + embeddings + metadata — never the raw
+audio) is uploaded after `record`/`process`, and bk's async workflow reference is kept
+next to the meeting. Quickstart:
+
+```bash
+meetscribe config init      # writes the commented template, then fill in [bk]:
+```
+
+```toml
+[bk]
+base_url = "https://bk.example.com"
+token = "..."               # or token_cmd = "pass show bk" — never both
+auto_upload = true          # upload after every record/process
+```
+
+```bash
+nix run .#doctor            # bk checks: reachability, token, capabilities/format support
+meetscribe status           # every local meeting + its upload/workflow state
+meetscribe upload ./meeting-dir   # retry a failed upload / backfill an old meeting
+```
+
+Uploading is **strictly opt-in** (`auto_upload` defaults to false; `--upload`/`--no-upload`
+override per run) — without a `[bk]` config nothing ever leaves the machine. A failed
+upload never loses a meeting: the artifacts stay complete on disk, the run still succeeds,
+and `meetscribe upload <dir>` retries whenever bk is reachable again.
 
 ## Terminal output
 

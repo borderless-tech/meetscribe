@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
@@ -56,7 +57,8 @@ def config_checks(path: str | os.PathLike | None = None) -> list[Check]:
     Malformed TOML (or an unreadable file) is red with the detail; wrongly-typed
     values — valid TOML that every record/process run would reject with exit 2 —
     are red too (the resolvers run here); unknown keys (typo detection) and a
-    group/world-readable file with ``[deepgram].api_key`` set are warnings.
+    group/world-readable file with a secret set (``[deepgram].api_key`` /
+    ``[bk].token``) are warnings.
     """
     from . import config as config_mod
 
@@ -97,13 +99,14 @@ def config_checks(path: str | os.PathLike | None = None) -> list[Check]:
                 warn=True,
             )
         )
-    if config_mod.insecure_api_key_perms(p):
+    exposed = config_mod.insecure_secret_perms(p)
+    if exposed:
         out.append(
             Check(
                 "Config permissions",
                 True,
-                f"[deepgram].api_key is set but {p} is group/world-readable — "
-                f"chmod 0600 {p}",
+                f"{' and '.join(exposed)} {'are' if len(exposed) > 1 else 'is'} set "
+                f"but {p} is group/world-readable — chmod 0600 {p}",
                 warn=True,
             )
         )
@@ -221,6 +224,146 @@ def remote_checks(
     ]
 
 
+# --- bk (borderless-knowledge) checks ---------------------------------------------------------
+# Appended only when [bk].base_url resolves or auto-upload is on. Reachability reuses the
+# injected ``Connect`` seam (bare TCP/TLS, never an HTTP request). The token check accepts a
+# :class:`~meetscribe.config.SecretCmd` marker WITHOUT executing it — doctor may run headless
+# and a keyring command could block on pinentry — which is also why the live capabilities call
+# (auth + bundle-format support, a free endpoint) runs only when a *static* token exists.
+
+
+def _tcp_connect(host: str, port: int, timeout_s: float = 5.0) -> None:
+    with socket.create_connection((host, port), timeout=timeout_s):
+        pass
+
+
+def bk_token_check(token) -> Check:
+    from . import config as config_mod
+
+    # A SecretCmd marker counts as "token available" but is NOT executed here.
+    if isinstance(token, config_mod.SecretCmd):
+        ok = bool(token.cmd.strip())
+    else:
+        ok = bool(token and str(token).strip())
+    return Check(
+        "bk token set",
+        ok,
+        None
+        if ok
+        else (
+            f"set [bk].token or [bk].token_cmd in {config_mod.config_path()} "
+            "(or export MEETSCRIBE_BK_TOKEN) — uploads to bk require it"
+        ),
+    )
+
+
+def bk_reachability_check(base_url: str, connect: Connect | None = None) -> Check:
+    split = urllib.parse.urlsplit(base_url)
+    host = split.hostname
+    if not host:
+        return Check(
+            f"bk reachable ({base_url})",
+            False,
+            f"bk base URL {base_url!r} has no host — use an absolute URL "
+            "like https://bk.example.com ([bk].base_url / MEETSCRIBE_BK_URL)",
+        )
+    port = split.port or (80 if split.scheme == "http" else 443)
+    if connect is None:
+        connect = _tcp_connect if split.scheme == "http" else _tls_connect
+    name = f"bk reachable ({host}:{port})"
+    try:
+        connect(host, port)
+    except Exception:
+        return Check(
+            name,
+            False,
+            f"cannot reach {host}:{port} — offline, DNS/proxy problem, or bk down? "
+            "recording/processing still work; upload later with `meetscribe upload <dir>`",
+        )
+    return Check(name, True)
+
+
+def bk_capabilities_check(base_url: str, token: str, opener=None) -> Check:
+    """Live ``GET /capabilities`` (free, no side effects): validates the token AND that bk
+    accepts our bundle ``format_version`` — the pre-flight message beats a rejected upload."""
+    from . import bk as bk_mod
+    from .output import FORMAT_VERSION
+
+    client = bk_mod.BkClient(
+        bk_mod.BkConfig(base_url=base_url, token=token, timeout_s=10.0), opener=opener
+    )
+    name = "bk capabilities (auth + bundle format)"
+    try:
+        caps = client.capabilities()
+    except bk_mod.BkError as e:
+        return Check(name, False, str(e))
+    problem = bk_mod.preflight(caps, 0)
+    if problem:
+        return Check(name, False, problem)
+    return Check(
+        f"bk capabilities (contract v{bk_mod.CONTRACT_VERSION}, "
+        f"bundle format {FORMAT_VERSION} accepted)",
+        True,
+    )
+
+
+def bk_checks(
+    env: Mapping[str, str] | None = None,
+    connect: Connect | None = None,
+    opener=None,
+    cfg: dict | None = None,
+) -> list[Check]:
+    """bk upload preflight; empty unless ``bk_base_url`` resolves or auto-upload is on.
+
+    Resolution is env > config > default (doctor has no flags), mirroring
+    :func:`remote_checks` — including the fall-back to env-only resolution when the
+    config is broken (``config_checks`` already reports the file red)."""
+    from . import config as config_mod
+
+    env = os.environ if env is None else env
+    if cfg is None:
+        try:
+            cfg = config_mod.load()
+        except config_mod.ConfigError:
+            cfg = {}
+    try:
+        base_url = config_mod.bk_base_url(None, env, cfg).value
+        token = config_mod.bk_token(None, env, cfg).value
+        auto_upload = config_mod.bk_auto_upload(None, env, cfg).value
+    except config_mod.ConfigError:
+        base_url = config_mod.bk_base_url(None, env, {}).value
+        token = config_mod.bk_token(None, env, {}).value
+        auto_upload = config_mod.bk_auto_upload(None, env, {}).value
+    if base_url is None and not auto_upload:
+        return []
+    if base_url is None:
+        # auto_upload on without a URL: every record/process run would exit 2 on this.
+        return [
+            Check(
+                "bk base URL set",
+                False,
+                "[bk].auto_upload is on but no bk URL is configured — set "
+                f"[bk].base_url in {config_mod.config_path()} or export MEETSCRIBE_BK_URL",
+            ),
+            bk_token_check(token),
+        ]
+    out = [bk_reachability_check(base_url, connect), bk_token_check(token)]
+    if isinstance(token, config_mod.SecretCmd):
+        out.append(
+            Check(
+                "bk capabilities (auth + bundle format)",
+                True,
+                "live check skipped — doctor never executes [bk].token_cmd (a keyring "
+                "command could block on pinentry); `meetscribe upload <dir>` verifies "
+                "auth for real",
+                warn=True,
+            )
+        )
+    elif isinstance(token, str) and token.strip():
+        out.append(bk_capabilities_check(base_url, token, opener))
+    return out
+
+
 class Probe(Protocol):
     def checks(self) -> list[Check]: ...
 
@@ -271,6 +414,7 @@ class RealProbe:
             out += self._linux_audio()
         out.append(self._mic_rms())
         out += remote_checks()  # no-op unless the backend resolves to deepgram (env/config)
+        out += bk_checks()  # no-op unless [bk].base_url resolves or auto-upload is on
         return out
 
     def _ffmpeg(self) -> Check:

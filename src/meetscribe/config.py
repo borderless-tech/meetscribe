@@ -30,8 +30,8 @@ TEMPLATE = """\
 # meetscribe config — flags > environment > this file > built-in defaults.
 # Everything ships commented out: absent keys use the built-in default
 # (`meetscribe config` shows every effective value and where it came from).
-# If you set [deepgram].api_key this file holds a secret — keep it 0600 and
-# out of synced/public dotfile repos.
+# If you set [deepgram].api_key or [bk].token this file holds a secret — keep
+# it 0600 and out of synced/public dotfile repos.
 
 #[stt]
 #backend = "local"        # "local" | "deepgram"      (flag --backend, env STT_BACKEND)
@@ -53,20 +53,29 @@ TEMPLATE = """\
 #bundle = true            # flag --bundle/--no-bundle wins
 #cleanup = true           # flag --no-cleanup wins
 
-#[bk]                     # reserved for Phase 2 (base_url, token, upload policy)
+#[bk]
+#base_url = ""            # e.g. "https://bk.example.com"  (env MEETSCRIBE_BK_URL wins)
+#token = ""               # personal bk API key            (env MEETSCRIBE_BK_TOKEN wins)
+#token_cmd = ""           # shell command printing the token; mutually exclusive with token
+#auto_upload = false      # upload the bundle to bk after record/process (explicit opt-in;
+#                         # flag --upload/--no-upload wins per run)
 """
 
-#: Config schema v1 — section -> allowed keys. ``bk`` is reserved for Phase 2 and
-#: deliberately absent here (its keys are never reported as unknown).
+#: Config schema — section -> allowed keys. ``bk`` stopped being reserved in
+#: Phase 2: its keys are real schema now, so unknown ``bk.*`` keys warn like
+#: any other typo.
 _SCHEMA: dict[str, frozenset[str]] = {
     "stt": frozenset({"backend", "language"}),
     "deepgram": frozenset({"api_key", "api_key_cmd"}),
     "storage": frozenset({"meetings_dir"}),
     "record": frozenset({"system_source"}),
     "output": frozenset({"bundle", "cleanup"}),
+    "bk": frozenset({"base_url", "token", "token_cmd", "auto_upload"}),
 }
 
-_RESERVED_SECTIONS = frozenset({"bk"})
+#: Sections excluded from unknown-key reporting. Empty since ``[bk]`` graduated
+#: into the schema; kept so a future reserved section has an obvious home.
+_RESERVED_SECTIONS: frozenset[str] = frozenset()
 
 
 class ConfigError(Exception):
@@ -91,13 +100,27 @@ class Resolved(NamedTuple):
     origin: str
 
 
-class ApiKeyCmd(NamedTuple):
-    """Marker for a *lazily fetched* API key: ``[deepgram].api_key_cmd`` resolved
-    but deliberately not executed. Only :func:`fetch_api_key` runs the command —
-    at the moment the key material is actually needed, never during ``config``
-    display, :func:`validate`, or doctor."""
+class SecretCmd(NamedTuple):
+    """Marker for a *lazily fetched* secret: a ``*_cmd`` config key resolved but
+    deliberately not executed. Only :func:`fetch_secret` runs the command — at
+    the moment the secret material is actually needed, never during ``config``
+    display, :func:`validate`, or doctor. ``label`` is the config key the
+    command came from (e.g. ``[bk].token_cmd``), used in error messages so
+    failures name the knob to turn."""
 
     cmd: str
+    label: str
+
+
+class ApiKeyCmd(SecretCmd):
+    """Thin alias of :class:`SecretCmd` for ``[deepgram].api_key_cmd`` — one
+    positional argument, the label pre-filled. Kept so existing call sites
+    (``isinstance`` checks, constructors) work unchanged."""
+
+    __slots__ = ()
+
+    def __new__(cls, cmd: str) -> "ApiKeyCmd":
+        return super().__new__(cls, cmd, "[deepgram].api_key_cmd")
 
 
 # --------------------------------------------------------------------- paths
@@ -149,9 +172,9 @@ def load(path: str | Path | None = None) -> dict:
 
 
 def unknown_keys(cfg: dict) -> list[str]:
-    """Dotted paths in ``cfg`` that are not in the v1 schema (typo detection for
-    the load-time warning and ``doctor``). The reserved ``[bk]`` section is never
-    reported. Order follows appearance in the file."""
+    """Dotted paths in ``cfg`` that are not in the schema (typo detection for
+    the load-time warning and ``doctor``). Order follows appearance in the
+    file."""
     out: list[str] = []
     for key, val in cfg.items():
         if key in _RESERVED_SECTIONS:
@@ -178,30 +201,51 @@ def load_warnings(cfg: dict, path: str | Path | None = None) -> list[str]:
             f"config {p}: unknown key{'s' if len(unknown) > 1 else ''} "
             f"{', '.join(unknown)} — typo? (ignored)"
         )
-    if insecure_api_key_perms(p):
+    bad = insecure_secret_perms(p)
+    if bad:
         msgs.append(
-            f"config {p}: [deepgram].api_key is set but the file is "
-            f"group/world-readable — chmod 0600 {p}"
+            f"config {p}: {' and '.join(bad)} {'are' if len(bad) > 1 else 'is'} "
+            f"set but the file is group/world-readable — chmod 0600 {p}"
         )
     return msgs
 
 
-def insecure_api_key_perms(path: str | Path) -> bool:
-    """True iff the config at ``path`` sets ``[deepgram].api_key`` (non-empty) while
-    the file is group- or world-accessible (mode has any of the 0o077 bits) — the
-    warn-once secret-hygiene check."""
+#: Config keys that hold secret material — the perms check covers all of them.
+_SECRET_KEYS: tuple[tuple[str, str], ...] = (
+    ("deepgram", "api_key"),
+    ("bk", "token"),
+)
+
+
+def insecure_secret_perms(path: str | Path) -> list[str]:
+    """The secret config keys (``[deepgram].api_key``, ``[bk].token``) that are
+    set (non-empty) at ``path`` while the file is group- or world-accessible
+    (mode has any of the 0o077 bits) — the warn-once secret-hygiene check.
+    Empty list when the perms are tight, no secret is set, or the file is
+    missing/unparseable."""
     p = Path(path)
     try:
         mode = p.stat().st_mode
     except OSError:
-        return False
+        return []
+    if not mode & 0o077:
+        return []
     try:
-        key = _cfg_str(load(p), "deepgram", "api_key")
+        cfg = load(p)
+        return [
+            f"[{section}].{key}"
+            for section, key in _SECRET_KEYS
+            if _cfg_str(cfg, section, key)
+        ]
     except ConfigError:
-        return False
-    if not key:
-        return False
-    return bool(mode & 0o077)
+        return []
+
+
+def insecure_api_key_perms(path: str | Path) -> bool:
+    """Backwards-compat alias for :func:`insecure_secret_perms`: True iff ANY
+    secret key is set in a group/world-accessible file (not just the deepgram
+    one it was named after)."""
+    return bool(insecure_secret_perms(path))
 
 
 # ------------------------------------------------------------------ resolvers
@@ -293,13 +337,14 @@ def api_key(flag_value: str | None, env: Mapping, cfg: dict) -> Resolved:
     return Resolved(None, "default")
 
 
-def fetch_api_key(value: object, timeout_s: float = 30.0) -> str | None:
-    """Turn a resolved api-key value into key material. Plain strings and ``None``
-    pass through; an :class:`ApiKeyCmd` is executed HERE and only here — via the
-    shell (the command comes from the user's own 0600 config, same trust model as
-    git config commands), stdout stripped. Failure, timeout, or empty output is a
-    :class:`ConfigError` (exit-2 material with the command's stderr included)."""
-    if not isinstance(value, ApiKeyCmd):
+def fetch_secret(value: object, timeout_s: float = 30.0) -> str | None:
+    """Turn a resolved secret value into secret material. Plain strings and
+    ``None`` pass through; a :class:`SecretCmd` is executed HERE and only here —
+    via the shell (the command comes from the user's own 0600 config, same trust
+    model as git config commands), stdout stripped. Failure, timeout, or empty
+    output is a :class:`ConfigError` naming the marker's ``label`` (exit-2
+    material with the command's stderr included)."""
+    if not isinstance(value, SecretCmd):
         return value  # type: ignore[return-value]
     import subprocess
 
@@ -309,20 +354,25 @@ def fetch_api_key(value: object, timeout_s: float = 30.0) -> str | None:
         )
     except subprocess.TimeoutExpired:
         raise ConfigError(
-            f"[deepgram].api_key_cmd timed out after {timeout_s:.0f}s: {value.cmd}"
+            f"{value.label} timed out after {timeout_s:.0f}s: {value.cmd}"
         ) from None
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
         raise ConfigError(
-            f"[deepgram].api_key_cmd failed (exit {proc.returncode})"
+            f"{value.label} failed (exit {proc.returncode})"
             + (f": {stderr}" if stderr else "")
         )
-    key = proc.stdout.strip()
-    if not key:
+    secret = proc.stdout.strip()
+    if not secret:
         raise ConfigError(
-            "[deepgram].api_key_cmd produced empty output — expected the key on stdout"
+            f"{value.label} produced empty output — expected the secret on stdout"
         )
-    return key
+    return secret
+
+
+#: Thin alias — the deepgram-era name; :class:`ApiKeyCmd` markers carry their
+#: label, so the generic executor needs no wrapper.
+fetch_api_key = fetch_secret
 
 
 def meetings_dir(
@@ -371,6 +421,60 @@ def cleanup(flag_value: bool | None, env: Mapping, cfg: dict) -> Resolved:
     return Resolved(True, "default")
 
 
+def bk_base_url(flag_value: str | None, env: Mapping, cfg: dict) -> Resolved:
+    """borderless-knowledge base URL: ``MEETSCRIBE_BK_URL`` env >
+    ``[bk].base_url`` > ``None`` (bk not configured). Normalized with the
+    trailing slash stripped so path-joining in the client is uniform. There is
+    no flag today; the parameter keeps the uniform resolver shape."""
+    if flag_value and flag_value.strip():
+        return Resolved(flag_value.strip().rstrip("/"), "flag")
+    e = (env.get("MEETSCRIBE_BK_URL") or "").strip()
+    if e:
+        return Resolved(e.rstrip("/"), "env")
+    c = _cfg_str(cfg, "bk", "base_url")
+    if c:
+        return Resolved(c.rstrip("/"), "config")
+    return Resolved(None, "default")
+
+
+def bk_token(flag_value: str | None, env: Mapping, cfg: dict) -> Resolved:
+    """bk API token: ``MEETSCRIBE_BK_TOKEN`` env > ``[bk].token`` >
+    ``[bk].token_cmd`` (as an unexecuted :class:`SecretCmd` marker) > ``None``.
+    Same rules as :func:`api_key`: both config keys set is a
+    :class:`ConfigError` — a leftover static token silently shadowing the
+    keyring command is the stale-secret trap, so the ambiguity fails loudly."""
+    if flag_value and flag_value.strip():
+        return Resolved(flag_value.strip(), "flag")
+    e = (env.get("MEETSCRIBE_BK_TOKEN") or "").strip()
+    if e:
+        return Resolved(e, "env")
+    c = _cfg_str(cfg, "bk", "token")
+    cmd = _cfg_str(cfg, "bk", "token_cmd")
+    if c and cmd:
+        raise ConfigError(
+            "[bk].token and [bk].token_cmd are both set — "
+            "they are mutually exclusive, remove one"
+        )
+    if c:
+        return Resolved(c, "config")
+    if cmd:
+        return Resolved(SecretCmd(cmd, "[bk].token_cmd"), "config")
+    return Resolved(None, "default")
+
+
+def bk_auto_upload(flag_value: bool | None, env: Mapping, cfg: dict) -> Resolved:
+    """Whether to upload the bundle to bk after record/process.
+    ``flag_value=None`` means the flag (``--upload/--no-upload``) was not
+    given. Default **False** — uploading is never a surprise (privacy rule);
+    no env layer, like bundle/cleanup."""
+    if flag_value is not None:
+        return Resolved(bool(flag_value), "flag")
+    c = _cfg_bool(cfg, "bk", "auto_upload")
+    if c is not None:
+        return Resolved(c, "config")
+    return Resolved(False, "default")
+
+
 def validate(cfg: dict) -> None:
     """Exercise every resolver against ``cfg`` (flag ``None``, empty env, so the
     config layer is actually read) and raise :class:`ConfigError` on the first
@@ -379,5 +483,6 @@ def validate(cfg: dict) -> None:
     instead of a green check on a file that aborts every record/process run."""
     for resolver in (
         backend, language, api_key, meetings_dir, system_source, bundle, cleanup,
+        bk_base_url, bk_token, bk_auto_upload,
     ):
         resolver(None, {}, cfg)

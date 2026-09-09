@@ -1,0 +1,9 @@
+{
+  "revision": 3,
+  "assignments": [
+    { "label": "me", "person_id": "7c0a9d8e-1f2b-4c3d-8e4f-5a6b7c8d9e0f" },
+    { "label": "spk_0", "person_id": "3b2c4d5e-6f70-4182-9394-a5b6c7d8e9f0" },
+    { "label": "spk_1", "person": { "email": null, "name": "Externer Gast" } },
+    { "label": "spk_2", "person_id": null }
+  ]
+}

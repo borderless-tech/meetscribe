@@ -91,8 +91,9 @@ revisit trigger), merged-single-track cost mode.
 
 ## Cross-cutting rules
 
-- Every phase = at least a minor release, changelog fed as features land (the 0.2.1-style
-  patch trick stays an exception).
+- Versioning (user decision 2026-09-09): P1+P2 ship as **0.3.0**; P3–P5 land as **0.3.x
+  patch releases** (keeping the minor-bump count low during the bk-integration stretch).
+  Changelog fed as features land either way.
 - Contract/fixture lockstep discipline (see contract doc) from P2 on.
 - Nothing in P2–P5 may degrade the offline/local-only path: bk unreachable and
   `backend=local` must always yield a complete local artifact set.

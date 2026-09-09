@@ -358,9 +358,16 @@ def test_unknown_keys_reports_stray_top_level_key():
     assert config.unknown_keys({"backend": "local"}) == ["backend"]
 
 
-def test_unknown_keys_ignores_reserved_bk_section():
+def test_unknown_keys_accepts_known_bk_keys():
+    # [bk] stopped being reserved in Phase 2 — its keys are real schema now.
     cfg = {"bk": {"base_url": "https://example.invalid", "token": "t"}}
     assert config.unknown_keys(cfg) == []
+
+
+def test_unknown_keys_reports_typoed_bk_key():
+    # No longer reserved: unknown bk.* keys must warn like any other section.
+    cfg = {"bk": {"tokn": "t"}}
+    assert config.unknown_keys(cfg) == ["bk.tokn"]
 
 
 def test_unknown_keys_multiple_sorted_by_appearance():
@@ -519,6 +526,225 @@ def test_fetch_api_key_failing_cmd_raises_with_stderr():
 def test_fetch_api_key_empty_output_raises():
     with pytest.raises(ConfigError, match="empty"):
         config.fetch_api_key(config.ApiKeyCmd("true"))
+
+
+# ------------------------------------- SecretCmd / fetch_secret (shared helper)
+
+
+def test_secret_cmd_carries_cmd_and_label():
+    marker = config.SecretCmd("pass show bk", "[bk].token_cmd")
+    assert marker.cmd == "pass show bk"
+    assert marker.label == "[bk].token_cmd"
+
+
+def test_api_key_cmd_is_a_secret_cmd_with_deepgram_label():
+    # Thin alias: same machinery, pre-filled label, still one positional arg.
+    marker = config.ApiKeyCmd("pass show deepgram")
+    assert isinstance(marker, config.SecretCmd)
+    assert marker.cmd == "pass show deepgram"
+    assert marker.label == "[deepgram].api_key_cmd"
+
+
+def test_fetch_api_key_is_fetch_secret():
+    assert config.fetch_api_key is config.fetch_secret
+
+
+def test_fetch_secret_passes_through_plain_string_and_none():
+    assert config.fetch_secret("tok_plain") == "tok_plain"
+    assert config.fetch_secret(None) is None
+
+
+def test_fetch_secret_executes_cmd_and_strips():
+    marker = config.SecretCmd("echo '  bk_tok  '", "[bk].token_cmd")
+    assert config.fetch_secret(marker) == "bk_tok"
+
+
+def test_fetch_secret_failure_names_the_label():
+    marker = config.SecretCmd("echo boom >&2; exit 3", "[bk].token_cmd")
+    with pytest.raises(ConfigError, match=r"\[bk\]\.token_cmd") as exc:
+        config.fetch_secret(marker)
+    assert "boom" in str(exc.value)
+
+
+def test_fetch_secret_empty_output_names_the_label():
+    marker = config.SecretCmd("true", "[bk].token_cmd")
+    with pytest.raises(ConfigError, match=r"\[bk\]\.token_cmd.*empty"):
+        config.fetch_secret(marker)
+
+
+# -------------------------------------------------------- resolver: bk_base_url
+
+
+def test_bk_base_url_default_is_none():
+    assert config.bk_base_url(None, {}, {}) == Resolved(None, "default")
+
+
+def test_bk_base_url_from_config():
+    cfg = {"bk": {"base_url": "https://bk.example.com"}}
+    assert config.bk_base_url(None, {}, cfg) == Resolved(
+        "https://bk.example.com", "config"
+    )
+
+
+def test_bk_base_url_env_beats_config():
+    cfg = {"bk": {"base_url": "https://cfg.example.com"}}
+    env = {"MEETSCRIBE_BK_URL": "https://env.example.com"}
+    assert config.bk_base_url(None, env, cfg) == Resolved(
+        "https://env.example.com", "env"
+    )
+
+
+def test_bk_base_url_strips_trailing_slash():
+    cfg = {"bk": {"base_url": "https://bk.example.com/"}}
+    assert config.bk_base_url(None, {}, cfg).value == "https://bk.example.com"
+    env = {"MEETSCRIBE_BK_URL": "https://env.example.com//"}
+    assert config.bk_base_url(None, env, {}).value == "https://env.example.com"
+
+
+def test_bk_base_url_empty_layers_fall_through():
+    cfg = {"bk": {"base_url": ""}}
+    env = {"MEETSCRIBE_BK_URL": ""}
+    assert config.bk_base_url(None, env, cfg) == Resolved(None, "default")
+
+
+def test_bk_base_url_non_string_config_is_error():
+    with pytest.raises(ConfigError, match="base_url"):
+        config.bk_base_url(None, {}, {"bk": {"base_url": 5}})
+
+
+# ----------------------------------------------------------- resolver: bk_token
+
+
+def test_bk_token_default_is_none():
+    assert config.bk_token(None, {}, {}) == Resolved(None, "default")
+
+
+def test_bk_token_from_config():
+    cfg = {"bk": {"token": "bk_secret"}}
+    assert config.bk_token(None, {}, cfg) == Resolved("bk_secret", "config")
+
+
+def test_bk_token_env_beats_config():
+    cfg = {"bk": {"token": "bk_cfg"}}
+    env = {"MEETSCRIBE_BK_TOKEN": "bk_env"}
+    assert config.bk_token(None, env, cfg) == Resolved("bk_env", "env")
+
+
+def test_bk_token_empty_config_string_is_unset():
+    cfg = {"bk": {"token": ""}}
+    assert config.bk_token(None, {}, cfg) == Resolved(None, "default")
+
+
+def test_bk_token_cmd_resolves_to_marker_without_executing(tmp_path):
+    canary = tmp_path / "canary"
+    cfg = {"bk": {"token_cmd": f"touch {canary}"}}
+    resolved = config.bk_token(None, {}, cfg)
+    assert resolved == Resolved(
+        config.SecretCmd(f"touch {canary}", "[bk].token_cmd"), "config"
+    )
+    assert not canary.exists()  # resolving must NEVER run the command
+
+
+def test_bk_token_env_beats_cmd():
+    cfg = {"bk": {"token_cmd": "echo from-cmd"}}
+    env = {"MEETSCRIBE_BK_TOKEN": "bk_env"}
+    assert config.bk_token(None, env, cfg) == Resolved("bk_env", "env")
+
+
+def test_bk_token_and_cmd_both_set_is_config_error():
+    cfg = {"bk": {"token": "bk_static", "token_cmd": "pass show bk"}}
+    with pytest.raises(ConfigError, match="token_cmd"):
+        config.bk_token(None, {}, cfg)
+
+
+def test_bk_token_cmd_empty_string_is_unset():
+    cfg = {"bk": {"token_cmd": "  "}}
+    assert config.bk_token(None, {}, cfg) == Resolved(None, "default")
+
+
+# ----------------------------------------------------- resolver: bk_auto_upload
+
+
+def test_bk_auto_upload_default_is_false():
+    assert config.bk_auto_upload(None, {}, {}) == Resolved(False, "default")
+
+
+def test_bk_auto_upload_from_config():
+    cfg = {"bk": {"auto_upload": True}}
+    assert config.bk_auto_upload(None, {}, cfg) == Resolved(True, "config")
+
+
+def test_bk_auto_upload_flag_beats_config():
+    cfg = {"bk": {"auto_upload": True}}
+    assert config.bk_auto_upload(False, {}, cfg) == Resolved(False, "flag")
+    assert config.bk_auto_upload(True, {}, {"bk": {"auto_upload": False}}) == Resolved(
+        True, "flag"
+    )
+
+
+@pytest.mark.parametrize("bad", ["false", "true", 1, 0])
+def test_bk_auto_upload_config_string_or_int_is_error(bad):
+    with pytest.raises(ConfigError):
+        config.bk_auto_upload(None, {}, {"bk": {"auto_upload": bad}})
+
+
+# ------------------------------------------------------------ validate covers bk
+
+
+def test_validate_raises_on_wrongly_typed_bk_auto_upload():
+    with pytest.raises(ConfigError, match="auto_upload"):
+        config.validate({"bk": {"auto_upload": "true"}})
+
+
+def test_validate_raises_on_both_bk_token_keys():
+    with pytest.raises(ConfigError, match="token_cmd"):
+        config.validate({"bk": {"token": "t", "token_cmd": "pass show bk"}})
+
+
+def test_validate_raises_on_non_string_bk_base_url():
+    with pytest.raises(ConfigError, match="base_url"):
+        config.validate({"bk": {"base_url": 5}})
+
+
+def test_validate_does_not_execute_bk_token_cmd(tmp_path):
+    canary = tmp_path / "canary"
+    config.validate({"bk": {"token_cmd": f"touch {canary}"}})
+    assert not canary.exists()
+
+
+# --------------------------------------------- secret perms cover [bk].token too
+
+
+def test_insecure_secret_perms_lists_bk_token(tmp_path):
+    p = _write_cfg(tmp_path, '[bk]\ntoken = "bk_secret"\n', 0o644)
+    assert config.insecure_secret_perms(p) == ["[bk].token"]
+
+
+def test_insecure_secret_perms_lists_both_secrets(tmp_path):
+    p = _write_cfg(
+        tmp_path,
+        '[deepgram]\napi_key = "dg_secret"\n[bk]\ntoken = "bk_secret"\n',
+        0o644,
+    )
+    assert config.insecure_secret_perms(p) == ["[deepgram].api_key", "[bk].token"]
+
+
+def test_insecure_secret_perms_empty_when_mode_0600(tmp_path):
+    p = _write_cfg(tmp_path, '[bk]\ntoken = "bk_secret"\n', 0o600)
+    assert config.insecure_secret_perms(p) == []
+
+
+def test_insecure_api_key_perms_alias_covers_bk_token(tmp_path):
+    # Old name kept as a bool alias; it now flags either secret.
+    p = _write_cfg(tmp_path, '[bk]\ntoken = "bk_secret"\n', 0o644)
+    assert config.insecure_api_key_perms(p) is True
+
+
+def test_load_warnings_reports_insecure_bk_token_perms(tmp_path):
+    p = _write_cfg(tmp_path, '[bk]\ntoken = "bk_secret"\n', 0o644)
+    msgs = config.load_warnings(config.load(p), p)
+    assert any("0600" in m for m in msgs)
+    assert not any("bk_secret" in m for m in msgs)  # never echo the secret
 
 
 # ------------------------------------------------- template: all-commented-out

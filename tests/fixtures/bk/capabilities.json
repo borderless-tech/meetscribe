@@ -1,0 +1,6 @@
+{
+  "contract_version": 1,
+  "mscribe_format_versions": [2],
+  "max_bundle_bytes": 52428800,
+  "meeting_query_window_minutes": 30
+}

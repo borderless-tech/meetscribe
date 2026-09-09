@@ -294,6 +294,52 @@ def check_backend(
     return name, None
 
 
+#: The auto-upload/--no-bundle conflict (exit-2 material, shared by pipeline.run and
+#: record.run so both print the identical message naming BOTH knobs).
+UPLOAD_NEEDS_BUNDLE_MSG = (
+    "auto-upload needs the .mscribe bundle — drop --no-bundle (or set "
+    "[output].bundle = true), or turn uploading off (--no-upload / "
+    "[bk].auto_upload = false)"
+)
+
+
+def check_bk_upload(
+    flag: bool | None = None, env=None, cfg: dict | None = None
+) -> tuple[bool, str | None, str | None, str | None]:
+    """Resolve the bk auto-upload tri-state (flag > ``[bk].auto_upload`` > default
+    off) AND, when it is on, validate bk is usable *now*: base_url + token must
+    resolve, and a ``[bk].token_cmd`` marker is executed HERE, eagerly — a broken
+    keyring command must fail before recording/processing starts, exactly like the
+    deepgram ``api_key_cmd`` (it may raise :class:`config.ConfigError`, so callers
+    run this inside their exit-2 config guard). Returns
+    ``(upload_on, base_url, token, error)`` where ``error`` is a printable exit-2
+    message or ``None``. Shared by ``pipeline.run`` and ``record.run``."""
+    import os
+
+    from . import config as config_mod
+
+    env = os.environ if env is None else env
+    cfg = config_mod.load() if cfg is None else cfg
+    upload_on = config_mod.bk_auto_upload(flag, env, cfg).value
+    if not upload_on:
+        return False, None, None, None
+    base_url = config_mod.bk_base_url(None, env, cfg).value
+    token = config_mod.bk_token(None, env, cfg).value
+    missing = []
+    if not base_url:
+        missing.append("[bk].base_url (or MEETSCRIBE_BK_URL)")
+    if not token:
+        missing.append("[bk].token / [bk].token_cmd (or MEETSCRIBE_BK_TOKEN)")
+    if missing:
+        return True, base_url, None, (
+            "auto-upload is on but bk is not fully configured — set "
+            + " and ".join(missing)
+            + f" in {config_mod.config_path()}, or turn uploading off "
+            "(--no-upload / [bk].auto_upload = false)"
+        )
+    return True, base_url, config_mod.fetch_secret(token), None
+
+
 def resolve_language(flag: str | None = None, env=None, cfg: dict | None = None) -> str:
     """Remote-STT language: flag > ``STT_LANGUAGE`` env > ``[stt].language`` config >
     ``de`` (delegates to ``config.language``; the local backend is language-agnostic
@@ -401,6 +447,7 @@ def run(
     cleanup: bool | None = None,
     backend: str | None = None,
     language: str | None = None,
+    upload: bool | None = None,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -440,11 +487,23 @@ def run(
             # must never execute a keyring command). Failure lands in the same
             # exit-2 guard as every other config problem.
             dg_key = config_mod.fetch_api_key(dg_key)
+        # bk auto-upload: resolve the tri-state and, when on, require base_url +
+        # token NOW (a token_cmd is executed eagerly — its failure is exit-2
+        # config-guard material like every other config problem).
+        upload_on, bk_url, bk_token, bk_err = check_bk_upload(upload, cfg=cfg)
     except config_mod.ConfigError as e:
         print(config_error_message(e))
         return 2
     if backend_err:
         print(backend_err)
+        return 2
+    if bk_err:
+        print(bk_err)
+        return 2
+    if upload_on and not bundle:
+        # The upload ships the bundle; without it there is nothing to POST. Fail
+        # fast (before models load / anything is processed), naming both knobs.
+        print(UPLOAD_NEEDS_BUNDLE_MSG)
         return 2
 
     mic_wav, system_wav = resolve_inputs(audio)
@@ -533,10 +592,58 @@ def run(
         bundle_path = out / default_bundle_name(meta)
         bundle_dir(out, bundle_path)
         print(f"wrote {bundle_path.name}")
+        if upload_on:
+            _upload_to_bk(out, bundle_path, meeting_id, bk_url, bk_token, reporter)
 
     reporter.summary(summarize(result))
     print(f"wrote transcript.json, embeddings.npz, meta.json to {out}")
     return 0
+
+
+def _upload_to_bk(out, bundle_path, meeting_id, base_url, token, reporter) -> None:
+    """Post-process auto-upload: capabilities → preflight → upload → persist
+    ``bk-workflow.json`` → print ``workflow_id`` + ``web_url``.
+
+    ANY failure (preflight verdict, network, 4xx/5xx) is a loud ``reporter.warn``
+    plus a printed ``meetscribe upload <dir>`` retry hint — the run's exit code
+    stays 0: the artifacts are complete and local, and exit 2 would make
+    automation treat a *processed* meeting as failed; the retry path is
+    first-class instead (design § error-handling matrix)."""
+    from datetime import datetime
+
+    from . import bk as bk_mod
+
+    # Constructed via the bk.BkClient module symbol — the ONE seam tests patch.
+    client = bk_mod.BkClient(bk_mod.BkConfig(base_url=base_url, token=token))
+    error: str | None = None
+    response: dict | None = None
+    try:
+        with reporter.stage("upload (bk)"):
+            caps = client.capabilities()
+            error = bk_mod.preflight(caps, bundle_path.stat().st_size)
+            if error is None:
+                response = client.upload_bundle(bundle_path, meeting_id=meeting_id)
+    except bk_mod.BkError as e:
+        error = str(e)
+    if response is None:
+        reporter.warn(f"bk upload failed: {error}")
+        print(f"bk upload failed — retry later with: meetscribe upload {out}")
+        return
+    now = datetime.now().astimezone().isoformat()
+    bk_mod.write_workflow_ref(out, {
+        "workflow_id": response.get("workflow_id"),
+        "state_url": response.get("state_url"),
+        "web_url": response.get("web_url"),
+        "uploaded_at": now,
+        # 202 Accepted = the workflow just started; "processing" is non-terminal,
+        # so `meetscribe status` knows to refresh it.
+        "state": "processing",
+        "checked_at": now,
+    })
+    print(
+        f"uploaded to bk: workflow {response.get('workflow_id')}"
+        f" — {response.get('web_url')}"
+    )
 
 
 def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) -> int:
