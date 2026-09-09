@@ -7,4 +7,4 @@ downstream operates on 16 kHz mono WAV files and is identical on Linux and macOS
 
 # Kept in sync with pyproject.toml + uv.lock (enforced by tests/test_version.py);
 # release process in CLAUDE.md "Versioning & releases".
-__version__ = "0.2.1"
+__version__ = "0.3.0"

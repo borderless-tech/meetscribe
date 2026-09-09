@@ -11,6 +11,13 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-09
+
+The "installed application" release: a real config file, standard directories, and the
+first half of the borderless-knowledge integration (API contract v1, agreed 2026-09-09).
+Follow-up integration phases (review loop, calendar-aware recording, tray GUI) will land
+as 0.3.x releases.
+
 ### Added
 - **Auto-upload to borderless-knowledge (bk)**: after `record`/`process`, the `.mscribe`
   bundle is uploaded to a bk server (API contract v1, see
@@ -146,7 +153,8 @@ producing a diarized transcript with per-word timestamps and 192-dim speaker emb
 (per-turn + per-cluster centroid). Silero VAD, Parakeet TDT ASR, sherpa-onnx diarization,
 `doctor` preflight checks, reproducible Nix/uv2nix build with SHA-256-pinned models.
 
-[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/borderless-tech/meetscribe/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/borderless-tech/meetscribe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/borderless-tech/meetscribe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/borderless-tech/meetscribe/releases/tag/v0.1.0
