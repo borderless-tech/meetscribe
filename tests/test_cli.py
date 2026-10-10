@@ -1254,3 +1254,261 @@ def test_status_scans_a_single_meeting_dir_directly(isolated_config, tmp_path, c
 
     assert main(["status", str(d)]) == 0
     assert "m1" in capsys.readouterr().out
+
+
+# ---- review subcommand + post-upload auto-continue ------------------------------------
+
+
+def _patch_run_review(monkeypatch, rc=0):
+    """Swap the review engine for a recorder (the module-level ``review.run_review``
+    seam). Returns the list of ``(dir, client, interaction)`` calls; the fake returns
+    ``rc`` as the engine's exit code."""
+    from pathlib import Path
+
+    from meetscribe import review
+
+    calls = []
+
+    def fake(meeting_dir, client, interaction, reporter=None, **kwargs):
+        calls.append((Path(meeting_dir), client, interaction))
+        return rc
+
+    monkeypatch.setattr(review, "run_review", fake)
+    return calls
+
+
+def test_review_parser_dir_optional():
+    args = build_parser().parse_args(["review"])
+    assert args.command == "review"
+    assert args.dir is None
+
+    args = build_parser().parse_args(["review", "some/dir"])
+    assert args.dir == "some/dir"
+
+
+def test_review_command_malformed_config_exits_2(isolated_config, tmp_path, capsys):
+    from meetscribe.cli import main
+
+    _write_bk_config(isolated_config, "[bk\n")
+
+    assert main(["review", str(tmp_path)]) == 2
+    assert "config.toml" in capsys.readouterr().out
+
+
+def test_review_command_no_uploaded_meeting_exits_2(isolated_config, tmp_path, capsys):
+    # The default dir scan only counts meetings with a workflow ref — a meetings dir
+    # full of never-uploaded recordings is exit 2 with the upload hint.
+    from meetscribe.cli import main
+
+    root = tmp_path / "xdg-data" / "meetscribe" / "meetings"
+    _meeting_dir(root, "meetscribe-2026-01-01T10-00-00")
+
+    assert main(["review"]) == 2
+    assert "meetscribe upload" in capsys.readouterr().out
+
+
+def test_review_command_explicit_dir_without_ref_exits_2(isolated_config, tmp_path, capsys):
+    from meetscribe.cli import main
+
+    d = _meeting_dir(tmp_path, "a")
+
+    assert main(["review", str(d)]) == 2
+    assert f"meetscribe upload {d}" in capsys.readouterr().out
+
+
+def test_review_command_corrupt_ref_exits_2(isolated_config, tmp_path, capsys):
+    # A corrupt ref degrades to "not uploaded" (bk.read_workflow_ref contract):
+    # same exit-2 hint, never a crash.
+    from meetscribe.bk import WORKFLOW_REF_NAME
+    from meetscribe.cli import main
+
+    d = _meeting_dir(tmp_path, "a")
+    (d / WORKFLOW_REF_NAME).write_text("{not json")
+
+    assert main(["review", str(d)]) == 2
+    assert "meetscribe upload" in capsys.readouterr().out
+
+
+def test_review_command_unconfigured_bk_exits_2(isolated_config, tmp_path, capsys, monkeypatch):
+    # The ref exists but [bk] is unconfigured: the client cannot be built — exit 2
+    # naming the knob, and the engine is never entered.
+    from meetscribe import bk
+    from meetscribe.cli import main
+
+    d = _meeting_dir(tmp_path, "a")
+    bk.write_workflow_ref(d, {"workflow_id": "wf_01j9", "state": "processing"})
+    calls = _patch_run_review(monkeypatch)
+
+    assert main(["review", str(d)]) == 2
+    assert "[bk].base_url" in capsys.readouterr().out
+    assert calls == []
+
+
+def test_review_command_runs_engine_on_explicit_dir(isolated_config, tmp_path, monkeypatch):
+    # The engine gets the meeting dir, the configured client, and a terminal
+    # front-end; its exit code IS the command's exit code (review is the task).
+    from meetscribe import bk
+    from meetscribe.cli import main
+    from meetscribe.interaction import RichInteraction
+
+    d = _meeting_dir(tmp_path, "a")
+    bk.write_workflow_ref(d, {"workflow_id": "wf_01j9", "state": "processing"})
+    _write_bk_config(isolated_config)
+    created = _fake_bk_client(monkeypatch)
+    calls = _patch_run_review(monkeypatch, rc=1)
+
+    assert main(["review", str(d)]) == 1
+    ((got_dir, got_client, got_interaction),) = calls
+    assert got_dir == d
+    assert got_client is created[0]
+    assert created[0].config.base_url == "https://bk.example.com"
+    assert isinstance(got_interaction, RichInteraction)
+
+
+def test_review_default_dir_is_newest_uploaded_meeting(isolated_config, tmp_path, monkeypatch):
+    # Default = the newest meeting (names are timestamped → lexicographic order)
+    # under the configured meetings dir that HAS a workflow ref; a newer but
+    # never-uploaded meeting is skipped.
+    from meetscribe import bk
+    from meetscribe.cli import main
+
+    root = tmp_path / "xdg-data" / "meetscribe" / "meetings"
+    old = _meeting_dir(root, "meetscribe-2026-01-01T10-00-00")
+    new = _meeting_dir(root, "meetscribe-2026-02-02T10-00-00")
+    _meeting_dir(root, "meetscribe-2026-03-03T10-00-00")  # newest, but no ref
+    bk.write_workflow_ref(old, {"workflow_id": "wf_old", "state": "done"})
+    bk.write_workflow_ref(new, {"workflow_id": "wf_new", "state": "awaiting_review"})
+    _write_bk_config(isolated_config)
+    _fake_bk_client(monkeypatch)
+    calls = _patch_run_review(monkeypatch)
+
+    assert main(["review"]) == 0
+    assert [c[0] for c in calls] == [new]
+
+
+def test_stdio_isatty_requires_both_stderr_and_stdin(monkeypatch):
+    # The review loop renders on stderr but READS raw keys from stdin: with stdin
+    # redirected (e.g. `process dir < answers.txt`) the key reader would crash with
+    # termios.error AFTER a successful upload — so the gate must check both streams.
+    from meetscribe import cli
+
+    class Tty:
+        def isatty(self):
+            return True
+
+    class Pipe:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(cli.sys, "stderr", Tty())
+    monkeypatch.setattr(cli.sys, "stdin", Pipe())
+    assert cli._stdio_isatty() is False
+
+    monkeypatch.setattr(cli.sys, "stdin", Tty())
+    assert cli._stdio_isatty() is True
+
+    monkeypatch.setattr(cli.sys, "stderr", Pipe())
+    assert cli._stdio_isatty() is False
+
+
+def test_upload_non_tty_skips_review(isolated_config, tmp_path, monkeypatch):
+    # Under pytest stdin/stderr are pipes → isatty() is False: upload behaves exactly
+    # as before (exit 0, engine never entered). The untouched upload tests above
+    # assert the same byte-identical output.
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    _write_bk_config(isolated_config)
+    _fake_bk_client(monkeypatch)
+    calls = _patch_run_review(monkeypatch, rc=1)
+
+    assert main(["upload", str(src)]) == 0
+    assert calls == []
+
+
+def test_upload_on_tty_autocontinues_into_review(isolated_config, tmp_path, monkeypatch):
+    # With a human attached the review exit code becomes the command's (review is now
+    # the task), and the engine starts only AFTER the workflow ref was persisted —
+    # quitting the loop must leave a resumable meeting behind.
+    from pathlib import Path
+
+    from meetscribe import bk, cli, review
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    _write_bk_config(isolated_config)
+    _fake_bk_client(monkeypatch)
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
+
+    calls = []
+
+    def fake(meeting_dir, client, interaction, reporter=None, **kwargs):
+        calls.append((Path(meeting_dir), bk.read_workflow_ref(Path(meeting_dir))))
+        return 1
+
+    monkeypatch.setattr(review, "run_review", fake)
+
+    assert main(["upload", str(src)]) == 1
+    ((got_dir, ref_at_entry),) = calls
+    assert got_dir == src
+    assert ref_at_entry["state"] == "processing"  # ref on disk before the loop runs
+
+
+def test_upload_failure_on_tty_does_not_enter_review(
+    isolated_config, tmp_path, capsys, monkeypatch
+):
+    # Auto-continue is a SUCCESS path: a failed upload keeps today's exit 1 and
+    # never opens the review loop (there is no workflow to review).
+    from meetscribe import bk, cli
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    _write_bk_config(isolated_config)
+    _fake_bk_client(monkeypatch, upload_error=bk.BkError("network error: down"))
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
+    calls = _patch_run_review(monkeypatch)
+
+    assert main(["upload", str(src)]) == 1
+    assert calls == []
+
+
+def test_pipeline_auto_upload_runs_review_but_ignores_its_exit_code(
+    isolated_config, tmp_path, monkeypatch
+):
+    # record/process auto-upload: the loop runs on a tty, but its exit code must NOT
+    # flip a *processed* meeting to failed — _upload_to_bk stays fire-and-forget.
+    from meetscribe import cli, pipeline
+    from meetscribe.output import bundle_dir
+    from meetscribe.progress import NullReporter
+
+    src = _meeting_dir(tmp_path)
+    bundle_path = src / "meeting-m1.mscribe"
+    bundle_dir(src, bundle_path)
+    _fake_bk_client(monkeypatch)
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
+    calls = _patch_run_review(monkeypatch, rc=1)
+
+    result = pipeline._upload_to_bk(
+        src, bundle_path, "m1", "https://bk.example.com", "tok-secret", NullReporter()
+    )
+
+    assert result is None  # the caller's exit 0 cannot depend on the review outcome
+    assert [c[0] for c in calls] == [src]
+
+
+def test_pipeline_auto_upload_non_tty_skips_review(isolated_config, tmp_path, monkeypatch):
+    from meetscribe import pipeline
+    from meetscribe.output import bundle_dir
+    from meetscribe.progress import NullReporter
+
+    src = _meeting_dir(tmp_path)
+    bundle_path = src / "meeting-m1.mscribe"
+    bundle_dir(src, bundle_path)
+    _fake_bk_client(monkeypatch)
+    calls = _patch_run_review(monkeypatch, rc=1)
+
+    pipeline._upload_to_bk(
+        src, bundle_path, "m1", "https://bk.example.com", "tok-secret", NullReporter()
+    )
+
+    assert calls == []

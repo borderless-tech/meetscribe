@@ -11,6 +11,35 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+### Added
+- `review [dir]` subcommand — walks an uploaded meeting's bk review gates in the
+  terminal (API contract v1): speaker annotation with one-key confirm of bk's
+  suggestions (Enter), numbered picks, roster browsing, new-person creation, leaving
+  speakers unassigned, and audio snippet playback via ffplay (`p`, longest segments
+  from `raw/`); meeting mapping to a calendar event (or ad-hoc create when bk allows
+  it). Submits are revision-guarded: a 409 conflict re-fetches and re-renders the gate
+  with the fresh payload, a 422 shows the server's message and re-asks. `w` opens bk's
+  web UI as fallback (also used for task types this version doesn't know); `q`/Ctrl-C
+  quits cleanly with a resume hint — gates wait 7 days, quitting is legitimate. With no
+  `dir` the newest uploaded meeting is picked. Exit codes: done/quit/web-handoff 0,
+  workflow `failed` or bk unreachable 1, config problems, no uploaded meeting, or a
+  rejected token (HTTP 401/403, never retried — contract rule) 2. Stdout carries one
+  machine-useful line (`<workflow_id> <state>`); all gate rendering goes to stderr,
+  with a spinner while bk is still processing.
+- Auto-continue into the review loop after a successful upload (`upload` subcommand,
+  and auto-upload in `record`/`process`) — only when stderr AND stdin are ttys (the
+  gates read raw keypresses from stdin); non-interactive runs keep the previous
+  print-URL-and-exit behavior byte-identically. On `upload` the review's exit code
+  becomes the command's (review is now the task); `record`/`process` still exit 0
+  regardless (the artifacts are complete and local).
+- `bk-workflow.json` is refreshed after every observed state change during the loop,
+  so `meetscribe status` stays accurate for free.
+- Typed `bk.BkAuthError` (subclass of `BkError`) for HTTP 401/403, so callers can
+  treat a bad token as final instead of a transient network blip.
+- A network failure while submitting a gate's answers keeps them in memory and offers
+  a retry of the same body (`Enter`/`r`) or quit (`q`) — no re-walking the gate after
+  a transient blip.
+
 ## [0.3.0] - 2026-09-09
 
 The "installed application" release: a real config file, standard directories, and the

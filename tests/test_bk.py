@@ -17,9 +17,12 @@ import pytest
 
 from meetscribe.bk import (
     WORKFLOW_REF_NAME,
+    BkAuthError,
     BkClient,
     BkConfig,
     BkError,
+    BkInvalidSubmission,
+    BkRevisionConflict,
     build_url,
     preflight,
     read_workflow_ref,
@@ -280,12 +283,25 @@ def test_upload_third_failure_raises_bk_error(tmp_path):
 
 
 def test_upload_401_names_both_token_knobs_and_does_not_retry(tmp_path):
+    # Typed as BkAuthError so callers can treat a bad token as FINAL (contract:
+    # "401 → actionable client error, never a retry loop") — a generic BkError
+    # handler would conflate it with a transient network blip and retry.
     opener = SeqOpener([_http_error(401)])
     client, sleeps = _client(opener)
 
-    with pytest.raises(BkError, match="MEETSCRIBE_BK_TOKEN") as excinfo:
+    with pytest.raises(BkAuthError, match="MEETSCRIBE_BK_TOKEN") as excinfo:
         client.upload_bundle(_bundle(tmp_path), meeting_id="m")
     assert "[bk].token" in str(excinfo.value)
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_submit_task_401_is_a_typed_final_auth_error():
+    opener = SeqOpener([_http_error(401)])
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkAuthError, match=r"\[bk\]\.token"):
+        client.submit_task(_submit_url(), _fixture("task-submit-speaker-annotation.json"))
     assert len(opener.calls) == 1
     assert sleeps == []
 
@@ -408,6 +424,77 @@ def test_failed_fixture_carries_the_standard_error_shape():
     assert set(wf["error"]) == {"code", "message"}
     assert wf["error"]["code"] and isinstance(wf["error"]["code"], str)
     assert wf["error"]["message"] and isinstance(wf["error"]["message"], str)
+
+
+# ---- task submit --------------------------------------------------------------------
+# submit_url in the workflow fixtures is a HOST-RELATIVE path that already carries the
+# contract prefix (contract: the client never builds task URLs itself), so the full URL
+# is base_url + submit_url — not build_url().
+
+
+def _submit_url():
+    wf = _fixture("workflow-awaiting-review-speaker-annotation.json")
+    return wf["tasks"][0]["submit_url"]
+
+
+def test_submit_task_posts_the_body_and_returns_the_fresh_workflow_state():
+    opener = SeqOpener([FakeResponse(_fixture("workflow-processing.json"))])
+    client, _ = _client(opener)
+    body = _fixture("task-submit-speaker-annotation.json")
+
+    out = client.submit_task(_submit_url(), body)
+
+    # 200 returns the FULL fresh workflow state — the engine feeds it straight back
+    assert out == _fixture("workflow-processing.json")
+    req, timeout = opener.calls[0]
+    assert req.get_method() == "POST"
+    assert req.full_url == "https://bk.example.com" + _submit_url()
+    assert req.get_header("Authorization") == "Bearer tok-secret"
+    assert req.get_header("Content-type") == "application/json"
+    # the wire body, parsed back, IS the contract fixture (revision echo included)
+    assert json.loads(req.data.decode("utf-8")) == body
+    assert timeout == 120.0
+
+
+def test_submit_task_409_is_a_typed_final_revision_conflict():
+    # 409 means the task moved under us — a HUMAN must re-answer, so a transport
+    # retry would be wrong: exactly one call, no backoff, typed exception.
+    opener = SeqOpener([_http_error(409)])
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkRevisionConflict):
+        client.submit_task(_submit_url(), _fixture("task-submit-speaker-annotation.json"))
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_submit_task_422_is_a_typed_final_invalid_submission_with_the_server_message():
+    opener = SeqOpener([_http_error(422)])  # default body = error.json
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkInvalidSubmission, match="unknown workflow"):
+        client.submit_task(_submit_url(), _fixture("task-submit-speaker-annotation.json"))
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_submit_task_typed_errors_are_bk_errors():
+    # generic `except BkError` handlers (warn + retry hint) must still catch all three
+    assert issubclass(BkRevisionConflict, BkError)
+    assert issubclass(BkInvalidSubmission, BkError)
+    assert issubclass(BkAuthError, BkError)
+
+
+def test_submit_task_retries_on_500_then_succeeds():
+    # 429/5xx keep the existing retry discipline — only 409/422 are final
+    opener = SeqOpener([_http_error(500), FakeResponse(_fixture("workflow-processing.json"))])
+    client, sleeps = _client(opener)
+
+    out = client.submit_task(_submit_url(), _fixture("task-submit-speaker-annotation.json"))
+
+    assert out == _fixture("workflow-processing.json")
+    assert len(opener.calls) == 2
+    assert sleeps and all(s > 0 for s in sleeps)
 
 
 # ---- workflow reference file --------------------------------------------------------
