@@ -124,7 +124,14 @@ auto_upload = true          # upload after every record/process
 nix run .#doctor            # bk checks: reachability, token, capabilities/format support
 meetscribe status           # every local meeting + its upload/workflow state
 meetscribe upload ./meeting-dir   # retry a failed upload / backfill an old meeting
+meetscribe review           # walk bk's review gates in the terminal (newest uploaded meeting)
 ```
+
+After a successful upload in a terminal, the **review loop** starts automatically: bk asks
+to map the meeting to a calendar event and to confirm who each detected speaker is.
+Enter confirms bk's suggestion, digits pick another, `p` plays an audio snippet (ffplay),
+`n` creates a new person, `w` opens bk's web UI instead, and `q` quits — gates stay open
+for days, so resume anytime with `meetscribe review [dir]`.
 
 Uploading is **strictly opt-in** (`auto_upload` defaults to false; `--upload`/`--no-upload`
 override per run) — without a `[bk]` config nothing ever leaves the machine. A failed

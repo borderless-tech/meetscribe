@@ -165,6 +165,47 @@ to be drop-in replaceable by bk's canonical set — divergence later = red test 
   doctor), and a live capabilities/format check only when a *static* token exists
   (injected opener; skipped for `token_cmd`).
 
+## Review loop (bk gates)
+
+`meetscribe review [dir]` walks bk's `awaiting_review` gates in the terminal; after a
+successful upload the loop auto-continues — **only when stderr is a TTY**
+(`cli._maybe_review`, injectable `isatty`). Design:
+`docs/plans/2026-10-10-phase4-review-loop-design.md`. Three seams keep every test offline:
+
+- `bk.submit_task(submit_url, body)` — POST with revision echo; `submit_url` from the
+  task payload is a **host-relative path** joined onto `base_url`, not an id. 409 →
+  `BkRevisionConflict`, **never retried** (each round needs a fresh human answer);
+  422 → `BkInvalidSubmission` carrying the server's message; 5xx retries like the
+  other calls.
+- `interaction.py` — the **task-level** front-end protocol (`Interaction`: one method
+  per gate type, exchanging frozen view-models for answers — deliberately not
+  prompt-level, so the later tray GUI renders one form per gate instead of a wizard).
+  `NullInteraction` is the default and raises on any question (a non-interactive path
+  blocking on input is a bug, not a user error); `ScriptedInteraction` is the test
+  double (canned answers in, shown views in `.seen`, notifies in `.messages`);
+  `RichInteraction` is the **only** rich/tty code (stderr, like `RichReporter`) and
+  owns ffplay playback — `ffplay_argv` is the pure, tested part, missing ffplay
+  degrades to a notify.
+- `review.py` — the pure engine: `run_review(meeting_dir, client, interaction,
+  reporter, *, sleep, open_url)`, all side effects injected. Polls 5 s (15 s after the
+  first minute); a submit's 200 response **is** the next state (no extra GET). Unknown
+  task types and `OpenWeb` answers hand off to the task's `web_url`. View-model
+  building (`build_speaker_view`/`build_mapping_view`) and submission translation
+  (`speaker_submission`/`mapping_submission`) are pure functions tested against the
+  contract fixtures in `tests/fixtures/bk/`.
+
+Exit codes: `done`, user quit (`q`/Ctrl-C — gates wait 7 days), and web-handoff are
+**0**; workflow `failed` or `POLL_FAILURE_LIMIT` (5) consecutive poll errors are **1**;
+config problems / no uploaded meeting are **2**. The upload exit-code asymmetry carries
+over: on `upload` the review's code becomes the command's (review is now the task), while
+`record`/`process` ignore it and stay exit 0. `bk-workflow.json` is rewritten after every
+state change, so `status` stays accurate for free.
+
+Testing recipe: a fake bk client returning fixture *sequences* + `ScriptedInteraction` +
+recording `sleep`/`open_url` fakes; assert submitted bodies by **full dict equality**
+against `task-submit-*.json`, plus exit codes and the ref file — never rendered strings
+or was-called checks on internals (asserting what an injected seam received is fine).
+
 ## Configuration
 
 `config.py` owns all of it — the TOML file, the XDG paths, and the **one precedence rule
