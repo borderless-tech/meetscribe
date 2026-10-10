@@ -645,6 +645,14 @@ def _upload_to_bk(out, bundle_path, meeting_id, base_url, token, reporter) -> No
         f" — {response.get('web_url')}"
     )
 
+    # Auto-continue straight into the review loop when a human is attached (stderr
+    # tty). The review's exit code is deliberately dropped here: the artifacts are
+    # complete and local, and a non-zero exit would make automation treat a
+    # *processed* meeting as failed (design §command-surface).
+    from .cli import _maybe_review
+
+    _maybe_review(out, client, reporter)
+
 
 def clean_existing(audio_dir: str, out_dir: str | None = None, reporter=None) -> int:
     """Run the LLM cleanup over an EXISTING transcript, non-destructively.

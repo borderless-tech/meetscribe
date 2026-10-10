@@ -151,6 +151,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="show cached workflow state only, never contact bk",
     )
 
+    p_review = sub.add_parser(
+        "review", help="walk an uploaded meeting's bk review gates in the terminal"
+    )
+    p_review.add_argument(
+        "dir", nargs="?", default=None,
+        help="meeting directory (default: the newest uploaded meeting under the "
+             "configured meetings dir)",
+    )
+
     sub.add_parser("doctor", help="check the audio setup is ready to record")
 
     p_config = sub.add_parser(
@@ -254,12 +263,99 @@ def _resolve_bk_client(env, cfg):
     return bk_mod.BkClient(bk_mod.BkConfig(base_url, token))
 
 
-def _run_upload(dir_arg: str) -> int:
+def _stderr_isatty() -> bool:
+    """A human is attached when stderr is a tty — the gate for auto-continuing
+    into the review loop. Module-level so tests can monkeypatch one symbol."""
+    return sys.stderr.isatty()
+
+
+def _maybe_review(meeting_dir, client, reporter, isatty=None):
+    """Post-upload auto-continue (design §command-surface): flow straight into the
+    review loop, but ONLY when a human is attached (stderr is a tty) — non-interactive
+    contexts keep the print-URL-and-exit behavior. Returns the review exit code, or
+    ``None`` when skipped; the CALLER decides what that means: ``upload`` adopts it
+    (review is now the task), record/process ignore it (the artifacts are complete,
+    a non-zero exit would make automation treat a *processed* meeting as failed)."""
+    if not (isatty or _stderr_isatty)():
+        return None
+    from . import review as review_mod
+    from .interaction import RichInteraction
+
+    return review_mod.run_review(meeting_dir, client, RichInteraction(), reporter)
+
+
+def _find_meetings(root) -> list:
+    """Meeting dirs under ``root``, sorted by name (they're timestamped, so the
+    newest sorts last). Pointing at a meeting dir itself also works."""
+    if (root / "meta.json").exists():
+        return [root]
+    if root.is_dir():
+        return sorted(
+            p for p in root.iterdir() if p.is_dir() and (p / "meta.json").exists()
+        )
+    return []
+
+
+def _run_review(dir_arg: str | None, reporter) -> int:
+    """The ``review [dir]`` subcommand: resume an uploaded meeting's bk review gates.
+
+    Exit codes (design §command-surface): config problems 2; no uploaded meeting or
+    unusable ref 2 with the ``meetscribe upload`` hint; otherwise the engine's own
+    code (0 = done/quit/web-handoff, 1 = failed/unreachable)."""
+    import os
+    from pathlib import Path
+
+    from . import bk as bk_mod
+    from . import config as config_mod
+    from . import review as review_mod
+    from .interaction import RichInteraction
+    from .pipeline import config_error_message
+
+    env = os.environ
+    try:
+        cfg = config_mod.load()
+    except config_mod.ConfigError as e:
+        print(config_error_message(e))
+        return 2
+
+    if dir_arg:
+        meeting_dir = Path(dir_arg)
+        # read_workflow_ref returns None for absent AND corrupt refs — both degrade
+        # to "not uploaded", pointing at the retry path instead of crashing.
+        if bk_mod.read_workflow_ref(meeting_dir) is None:
+            print(
+                f"no uploaded workflow found in {meeting_dir}"
+                f" — run: meetscribe upload {meeting_dir}"
+            )
+            return 2
+    else:
+        root = config_mod.meetings_dir(None, env, cfg).value
+        uploaded = [d for d in _find_meetings(root) if bk_mod.read_workflow_ref(d)]
+        if not uploaded:
+            print(
+                f"no uploaded meetings found in {root}"
+                " — upload one first: meetscribe upload <dir>"
+            )
+            return 2
+        meeting_dir = uploaded[-1]  # newest uploaded meeting
+
+    try:
+        client = _resolve_bk_client(env, cfg)
+    except config_mod.ConfigError as e:
+        print(config_error_message(e))
+        return 2
+
+    return review_mod.run_review(meeting_dir, client, RichInteraction(), reporter)
+
+
+def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
     """The ``upload <dir>`` subcommand — the retry/backfill path for auto-upload.
 
     Unlike the record/process auto-upload (which warns and exits 0 because the
     artifacts are the task), here the upload IS the task: config problems exit 2,
-    upload failures exit 1, with the actionable message on stdout."""
+    upload failures exit 1, with the actionable message on stdout. After a
+    successful upload on a tty the review loop takes over and ITS exit code is
+    returned (review is now the task)."""
     import json
     import os
     from datetime import datetime
@@ -319,7 +415,11 @@ def _run_upload(dir_arg: str) -> int:
     )
     print(f"uploaded: workflow {accepted.get('workflow_id')}")
     print(accepted.get("web_url"))
-    return 0
+
+    from .progress import NullReporter
+
+    rc = _maybe_review(src, client, reporter or NullReporter(), isatty=isatty)
+    return 0 if rc is None else rc
 
 
 #: Workflow states that never change again — `status` shows them without asking bk.
@@ -349,14 +449,7 @@ def _run_status(dir_arg: str | None, offline: bool = False) -> int:
         print(config_error_message(e))
         return 2
 
-    if (root / "meta.json").exists():
-        meetings = [root]
-    elif root.is_dir():
-        meetings = sorted(
-            p for p in root.iterdir() if p.is_dir() and (p / "meta.json").exists()
-        )
-    else:
-        meetings = []
+    meetings = _find_meetings(root)
     if not meetings:
         print(f"no meetings found in {root}")
         return 0
@@ -492,11 +585,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "config":
         return _run_config(getattr(args, "action", None))
     if command == "upload":
-        return _run_upload(args.dir)
+        return _run_upload(args.dir, reporter=reporter)
     if command == "status":
         return _run_status(
             getattr(args, "dir", None), offline=getattr(args, "offline", False)
         )
+    if command == "review":
+        return _run_review(getattr(args, "dir", None), reporter=reporter)
     if command == "bundle":
         import json
         from pathlib import Path
