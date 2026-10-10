@@ -36,6 +36,17 @@ class BkError(RuntimeError):
     The message is always actionable — it names the knob to turn."""
 
 
+class BkRevisionConflict(BkError):
+    """409 on a task submit: the task's revision moved under us. Final — the caller
+    must re-fetch the workflow and re-ask the human; a transport retry would resend
+    a stale answer."""
+
+
+class BkInvalidSubmission(BkError):
+    """422 on a task submit: bk rejected the answer body. Final — the message carries
+    the contract's ``error.message`` so the front-end can re-ask with context."""
+
+
 @dataclass(frozen=True)
 class BkConfig:
     base_url: str  # e.g. "https://bk.example.com"; a trailing slash is tolerated
@@ -115,11 +126,38 @@ class BkClient:
         """``GET /workflows/{id}`` — the async workflow state (read-only in Phase 2)."""
         return self._request("GET", build_url(self.config, f"/workflows/{workflow_id}"))
 
-    def _request(self, method: str, url: str, *, data=None, headers=None) -> dict:
+    def submit_task(self, submit_url: str, body: dict) -> dict:
+        """``POST <submit_url>`` (the task's host-relative path — it already carries
+        the contract prefix, so the client never builds task URLs itself) with the
+        revision-echoing JSON ``body``; 200 returns the FULL fresh workflow state.
+
+        409/422 are final typed errors (a human must re-answer — retrying would
+        resend a stale/invalid body); 429/5xx keep the usual retry discipline."""
+        url = f"{self.config.base_url.rstrip('/')}{submit_url}"
+        return self._request(
+            "POST",
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            final_codes={
+                409: lambda detail: BkRevisionConflict(
+                    f"bk reports a revision conflict (HTTP 409: {detail})"
+                    " — the task changed; re-fetch the workflow and answer again"
+                ),
+                422: lambda detail: BkInvalidSubmission(
+                    f"bk rejected the submission (HTTP 422: {detail})"
+                ),
+            },
+        )
+
+    def _request(self, method: str, url: str, *, data=None, headers=None, final_codes=None) -> dict:
         """One request with the deepgram.py retry discipline: ×3 with exponential
         backoff on 429/5xx and transport failures — URLError, plus the response-phase
         timeouts/resets/truncated reads that urllib does NOT wrap in URLError; 401/403
-        (token) and 413 (bundle size) are final with an actionable message."""
+        (token) and 413 (bundle size) are final with an actionable message.
+        ``final_codes`` (code → exception factory taking the error detail) lets a
+        caller declare extra never-retried statuses with typed results (task submits:
+        409/422)."""
         last_error = "unknown error"
         for attempt in range(RETRY_ATTEMPTS):
             if attempt:
@@ -138,6 +176,8 @@ class BkClient:
                 raw = response.read()
             except urllib.error.HTTPError as e:
                 detail = _error_detail(e)
+                if final_codes and e.code in final_codes:
+                    raise final_codes[e.code](detail or e.reason) from e
                 if e.code in (401, 403):
                     raise BkError(
                         f"bk rejected the request (HTTP {e.code}: {detail or e.reason})"
