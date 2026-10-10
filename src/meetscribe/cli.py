@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="upload the .mscribe bundle to borderless-knowledge after processing "
              "(default: off, or [bk].auto_upload in the config; --no-upload to skip)",
     )
+    p_record.add_argument(
+        "--calendar", action=argparse.BooleanOptionalAction, default=None,
+        help="look up the meeting in bk's calendar at record start — opportunistic, "
+             "never delays recording (default: on when bk is configured, or "
+             "[bk].calendar in the config; --no-calendar to skip)",
+    )
     _add_backend_flags(p_record)
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
@@ -137,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_upload.add_argument(
         "dir", help="meeting directory (bundled first if no .mscribe exists yet)"
+    )
+    p_upload.add_argument(
+        "--meeting-id", default=None,
+        help="bk calendar meeting id to attach (?meeting_id=); overrides a pick "
+             "cached in bk-calendar.json",
     )
 
     p_status = sub.add_parser(
@@ -213,6 +224,7 @@ def _run_config(action: str | None) -> int:
             ("bk_base_url", config_mod.bk_base_url(None, env, cfg)),
             ("bk_token", config_mod.bk_token(None, env, cfg)),
             ("bk_auto_upload", config_mod.bk_auto_upload(None, env, cfg)),
+            ("bk_calendar", config_mod.bk_calendar(None, env, cfg)),
         ]
     except config_mod.ConfigError as e:
         print(f"config: {path} (invalid)", file=sys.stderr)
@@ -351,7 +363,9 @@ def _run_review(dir_arg: str | None, reporter) -> int:
     return review_mod.run_review(meeting_dir, client, RichInteraction(), reporter)
 
 
-def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
+def _run_upload(
+    dir_arg: str, reporter=None, *, isatty=None, meeting_id: str | None = None
+) -> int:
     """The ``upload <dir>`` subcommand — the retry/backfill path for auto-upload.
 
     Unlike the record/process auto-upload (which warns and exits 0 because the
@@ -398,7 +412,13 @@ def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
         if message:
             print(f"upload refused: {message}")
             return 1
-        accepted = client.upload_bundle(bundle_path, meeting_id=meta["meeting_id"])
+        accepted = client.upload_bundle(
+            bundle_path,
+            meeting_id=meta["meeting_id"],
+            # --meeting-id flag > the pick cached by the record flow > nothing. bk
+            # re-verifies the id server-side, so forwarding it is always safe.
+            calendar_meeting_id=meeting_id or _picked_calendar_id(bk_mod, src),
+        )
     except bk_mod.BkError as e:
         print(f"upload failed: {e}")
         return 1
@@ -423,6 +443,15 @@ def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
 
     rc = _maybe_review(src, client, reporter or NullReporter(), isatty=isatty)
     return 0 if rc is None else rc
+
+
+def _picked_calendar_id(bk_mod, meeting_dir) -> str | None:
+    """The calendar event id picked after recording (``bk-calendar.json``), or
+    ``None`` — an absent/corrupt ref or a skipped pick degrades to "no id" and bk
+    falls back to its server-side matching, never an error. Shared by the upload
+    subcommand and the auto-upload path (`pipeline._upload_to_bk`)."""
+    picked = (bk_mod.read_calendar_ref(meeting_dir) or {}).get("picked_meeting_id")
+    return picked if isinstance(picked, str) and picked else None
 
 
 #: Workflow states that never change again — `status` shows them without asking bk.
@@ -550,6 +579,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "record":
         from . import record
 
+        # The calendar pick reads raw keypresses, so a front-end is attached only
+        # when stdin AND stderr are ttys (same rule as the post-upload review
+        # auto-continue); None skips the pick entirely.
+        interaction = None
+        if _stdio_isatty():
+            from .interaction import RichInteraction
+
+            interaction = RichInteraction()
         return record.run(
             out_dir=getattr(args, "out", None),
             # Bare `meetscribe` never runs the subparser, so the fallbacks must
@@ -561,6 +598,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             backend=getattr(args, "backend", None),
             language=getattr(args, "language", None),
             upload=getattr(args, "upload", None),
+            calendar=getattr(args, "calendar", None),
+            interaction=interaction,
         )
     if command == "process":
         from . import pipeline
@@ -588,7 +627,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "config":
         return _run_config(getattr(args, "action", None))
     if command == "upload":
-        return _run_upload(args.dir, reporter=reporter)
+        return _run_upload(
+            args.dir, reporter=reporter, meeting_id=getattr(args, "meeting_id", None)
+        )
     if command == "status":
         return _run_status(
             getattr(args, "dir", None), offline=getattr(args, "offline", False)

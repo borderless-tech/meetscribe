@@ -28,6 +28,9 @@ RETRY_ATTEMPTS = 3
 BACKOFF_BASE_S = 1.0
 
 WORKFLOW_REF_NAME = "bk-workflow.json"
+CALENDAR_REF_NAME = "bk-calendar.json"
+
+CALENDAR_TIMEOUT_S = 3.0  # the opportunistic record-start lookup may cost at most this
 
 
 class BkError(RuntimeError):
@@ -128,6 +131,17 @@ class BkClient:
             },
         )
 
+    def meetings_around(self, around_iso: str, timeout_s: float = CALENDAR_TIMEOUT_S) -> dict:
+        """``GET /meetings?around=<iso>`` — calendar candidates near a timestamp.
+
+        This is the opportunistic record-start lookup (Phase 3): a SINGLE attempt
+        with a short timeout, never the upload retry discipline — a slow or down bk
+        must cost the recording at most ``timeout_s``, once. Callers swallow every
+        ``BkError`` and degrade to a calendar-less recording."""
+        url = build_url(self.config, "/meetings")
+        url += "?" + urllib.parse.urlencode({"around": around_iso})
+        return self._request("GET", url, attempts=1, timeout_s=timeout_s)
+
     def workflow(self, workflow_id: str) -> dict:
         """``GET /workflows/{id}`` — the async workflow state (read-only in Phase 2)."""
         return self._request("GET", build_url(self.config, f"/workflows/{workflow_id}"))
@@ -156,16 +170,27 @@ class BkClient:
             },
         )
 
-    def _request(self, method: str, url: str, *, data=None, headers=None, final_codes=None) -> dict:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        data=None,
+        headers=None,
+        final_codes=None,
+        attempts: int = RETRY_ATTEMPTS,
+        timeout_s: float | None = None,
+    ) -> dict:
         """One request with the deepgram.py retry discipline: ×3 with exponential
         backoff on 429/5xx and transport failures — URLError, plus the response-phase
         timeouts/resets/truncated reads that urllib does NOT wrap in URLError; 401/403
         (token) and 413 (bundle size) are final with an actionable message.
         ``final_codes`` (code → exception factory taking the error detail) lets a
         caller declare extra never-retried statuses with typed results (task submits:
-        409/422)."""
+        409/422). ``attempts``/``timeout_s`` (None → the config value) exist for the
+        opportunistic calendar lookup; every other call keeps the defaults."""
         last_error = "unknown error"
-        for attempt in range(RETRY_ATTEMPTS):
+        for attempt in range(attempts):
             if attempt:
                 self._sleep(BACKOFF_BASE_S * 2 ** (attempt - 1))
             request = urllib.request.Request(
@@ -178,7 +203,9 @@ class BkClient:
                 method=method,
             )
             try:
-                response = self._opener(request, self.config.timeout_s)
+                response = self._opener(
+                    request, self.config.timeout_s if timeout_s is None else timeout_s
+                )
                 raw = response.read()
             except urllib.error.HTTPError as e:
                 detail = _error_detail(e)
@@ -219,7 +246,8 @@ class BkClient:
                     f"bk returned a success response that is not JSON ({snippet!r})"
                     f" — is a proxy or captive portal intercepting {host}?"
                 ) from e
-        raise BkError(f"bk request failed after {RETRY_ATTEMPTS} attempts ({last_error})")
+        plural = "s" if attempts != 1 else ""
+        raise BkError(f"bk request failed after {attempts} attempt{plural} ({last_error})")
 
 
 # ---- preflight ----------------------------------------------------------------------
@@ -269,6 +297,31 @@ def read_workflow_ref(meeting_dir) -> dict | None:
     """The persisted reference, or ``None`` when absent or corrupt — a broken ref
     file must degrade to "not uploaded", never crash ``status``."""
     path = Path(meeting_dir) / WORKFLOW_REF_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# ---- calendar reference persistence --------------------------------------------------
+# `bk-calendar.json` caches the record-start candidate list next to the artifacts
+# (never a bundle member): {queried_at, around, meetings: [...]} plus, once the user
+# picked an event after the recording, `picked_meeting_id`.
+
+
+def write_calendar_ref(meeting_dir, ref: dict) -> Path:
+    """Persist the calendar reference; simply overwrites (the post-recording pick
+    rewrites the ref with ``picked_meeting_id`` added)."""
+    path = Path(meeting_dir) / CALENDAR_REF_NAME
+    path.write_text(json.dumps(ref, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def read_calendar_ref(meeting_dir) -> dict | None:
+    """The persisted reference, or ``None`` when absent or corrupt — a broken ref
+    file must degrade to "no calendar info", never crash the flow."""
+    path = Path(meeting_dir) / CALENDAR_REF_NAME
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

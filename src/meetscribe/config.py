@@ -59,6 +59,8 @@ TEMPLATE = """\
 #token_cmd = ""           # shell command printing the token; mutually exclusive with token
 #auto_upload = false      # upload the bundle to bk after record/process (explicit opt-in;
 #                         # flag --upload/--no-upload wins per run)
+#calendar = true          # look up the current meeting in bk's calendar at record start
+#                         # (flag --calendar/--no-calendar wins per run)
 """
 
 #: Config schema — section -> allowed keys. ``bk`` stopped being reserved in
@@ -70,7 +72,7 @@ _SCHEMA: dict[str, frozenset[str]] = {
     "storage": frozenset({"meetings_dir"}),
     "record": frozenset({"system_source"}),
     "output": frozenset({"bundle", "cleanup"}),
-    "bk": frozenset({"base_url", "token", "token_cmd", "auto_upload"}),
+    "bk": frozenset({"base_url", "token", "token_cmd", "auto_upload", "calendar"}),
 }
 
 #: Sections excluded from unknown-key reporting. Empty since ``[bk]`` graduated
@@ -475,6 +477,20 @@ def bk_auto_upload(flag_value: bool | None, env: Mapping, cfg: dict) -> Resolved
     return Resolved(False, "default")
 
 
+def bk_calendar(flag_value: bool | None, env: Mapping, cfg: dict) -> Resolved:
+    """Whether to look up the current meeting in bk's calendar at record start.
+    ``flag_value=None`` means the flag (``--calendar/--no-calendar``) was not
+    given. Default **True** — the query only happens when bk is already
+    configured, and only metadata flows, never audio; no env layer, like
+    auto_upload."""
+    if flag_value is not None:
+        return Resolved(bool(flag_value), "flag")
+    c = _cfg_bool(cfg, "bk", "calendar")
+    if c is not None:
+        return Resolved(c, "config")
+    return Resolved(True, "default")
+
+
 def validate(cfg: dict) -> None:
     """Exercise every resolver against ``cfg`` (flag ``None``, empty env, so the
     config layer is actually read) and raise :class:`ConfigError` on the first
@@ -483,6 +499,6 @@ def validate(cfg: dict) -> None:
     instead of a green check on a file that aborts every record/process run."""
     for resolver in (
         backend, language, api_key, meetings_dir, system_source, bundle, cleanup,
-        bk_base_url, bk_token, bk_auto_upload,
+        bk_base_url, bk_token, bk_auto_upload, bk_calendar,
     ):
         resolver(None, {}, cfg)

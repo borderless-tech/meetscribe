@@ -11,6 +11,31 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+Calendar-aware recording: transition-roadmap phase 3
+(design: `docs/plans/2026-10-10-phase3-calendar-design.md`).
+
+### Added
+- `record` asks bk's calendar which meeting is happening right now: one opportunistic
+  `GET /meetings?around=<now>` before ffmpeg starts — single attempt, 3 s timeout, no
+  retries. **The recording never blocks on bk**: every failure (bk unconfigured, broken
+  token command, network, 4xx/5xx, bad JSON) silently degrades to today's calendar-less
+  flow. Candidates are cached as `bk-calendar.json` next to the artifacts (tolerant
+  reader like `bk-workflow.json`, never a bundle member).
+- Post-recording meeting confirm (TTY only): when candidates were cached, the user picks
+  the matching event (Enter accepts a sole candidate, digits pick, `s` skips). A pick
+  appends the event's named attendees to the glossary (spelling hints → LLM cleanup +
+  nova-3 keyterms, exactly what the manual name prompts did), makes the attendee count
+  the Enter-default of the "how many people?" prompt, and skips the manual name prompts.
+  Skipping — or no candidates, or no TTY — leaves the previous flow byte-identical.
+- The picked event id travels with the upload as `?meeting_id=` on **both** paths (the
+  `upload` subcommand and record/process auto-upload); bk re-verifies attendance
+  server-side, so sending it is always safe. New `upload --meeting-id <id>` flag
+  overrides the cached pick (manual escape hatch).
+- `[bk].calendar` config key (default **true** — the lookup only fires when bk is
+  already configured, so no new opt-in is needed; the key is the off switch) and
+  `--calendar/--no-calendar` on `record` (flag wins per run; no env layer, like
+  `auto_upload`).
+
 ## [0.3.1] - 2026-10-10
 
 The second half of the bk integration's interactive side: transition-roadmap phase 4

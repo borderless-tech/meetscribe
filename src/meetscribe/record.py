@@ -409,13 +409,15 @@ def participants_to_speakers(answer: str) -> int:
     return speakers_from_count(n)
 
 
-def ask_participant_names(count: int, input_fn=input) -> list[str]:
+def ask_participant_names(count: int, input_fn=None) -> list[str]:
     """Optionally collect participant names — spelling hints appended to the glossary.
 
     Only prompts when ``count`` >= 2 (a known meeting size). Each entry is optional; a blank
     line stops early, and at most ``count`` names are collected. Any decline (blank/EOF/Ctrl-C)
     never blocks — returns whatever was entered so far. Callers append the result to the
     persistent glossary; names are flat spelling hints, never mapped to ``spk_N``."""
+    if input_fn is None:
+        input_fn = input  # resolved at call time, so tests can patch builtins.input
     if count < 2:
         return []
     names: list[str] = []
@@ -430,23 +432,140 @@ def ask_participant_names(count: int, input_fn=input) -> list[str]:
     return names
 
 
-def ask_participants(input_fn=input) -> int:
+def ask_participants(input_fn=None, default_count: int | None = None) -> int:
     """Post-recording prompt for the participant count → system-track speaker count.
 
-    Any way of declining (empty answer, EOF, Ctrl-C) falls back to automatic
-    clustering, so the question can never block a script or abort processing."""
+    ``default_count`` (the picked calendar event's attendee count) turns Enter into
+    accepting that size instead of skipping; an explicit answer still wins. Any way
+    of declining (empty answer without a default, EOF, Ctrl-C) falls back to
+    automatic clustering, so the question can never block a script or abort
+    processing."""
+    if input_fn is None:
+        input_fn = input  # resolved at call time, so tests can patch builtins.input
+    hint = f"(Enter = {default_count})" if default_count is not None else "(Enter to skip)"
     try:
-        answer = input_fn("How many people were in the meeting, including you? (Enter to skip) ")
+        answer = input_fn(f"How many people were in the meeting, including you? {hint} ")
     except (EOFError, KeyboardInterrupt):
         return -1
+    if default_count is not None and not answer.strip():
+        return speakers_from_count(default_count)
     return participants_to_speakers(answer)
+
+
+# ---- calendar lookup (bk, opportunistic) -------------------------------------------------
+
+def query_calendar(
+    cfg, reporter=None, *, now_iso: str, calendar_flag: bool | None = None,
+    token: str | None = None, client_factory=None,
+):
+    """One opportunistic ``GET /meetings?around=`` at record start — the recording
+    NEVER blocks on bk beyond the client's single 3 s attempt.
+
+    Returns the raw candidate list, or ``None`` when the lookup is off
+    (``--no-calendar`` / ``[bk].calendar``), bk is not configured, or anything at
+    all failed (broken config, failing token_cmd, network, 4xx/5xx, bad JSON):
+    every failure degrades silently — at most one ``reporter.info`` breadcrumb —
+    to today's calendar-less recording. ``token`` is an already-fetched bk token
+    (the auto-upload preflight executes ``[bk].token_cmd`` eagerly); passing it
+    skips the second fetch — one pinentry per recording, never two.
+    ``client_factory`` (``BkConfig → client``) is the test seam; the default
+    builds the real :class:`bk.BkClient`."""
+    import os
+
+    from . import bk as bk_mod
+    from . import config as config_mod
+    from .progress import NullReporter
+
+    reporter = reporter or NullReporter()
+    env = os.environ
+    try:
+        if not config_mod.bk_calendar(calendar_flag, env, cfg).value:
+            return None
+        base_url = config_mod.bk_base_url(None, env, cfg).value
+        if not base_url:
+            return None  # bk unconfigured — the common case, byte-identical to no bk
+        if token is None:
+            # A [bk].token_cmd runs HERE (pinentry at record start is fine — the
+            # user just initiated recording), unless the caller already holds the
+            # auto-upload preflight's token; unlike that preflight its failure
+            # must never abort: the calendar is optional, the recording is not.
+            token = config_mod.fetch_secret(config_mod.bk_token(None, env, cfg).value)
+        if not token:
+            return None
+        factory = client_factory or (lambda c: bk_mod.BkClient(c))
+        meetings = factory(bk_mod.BkConfig(base_url, token)).meetings_around(now_iso)
+        # bk's contract says {"meetings": [...]}, but _request hands back whatever
+        # JSON the wire carried — a valid-JSON-but-non-dict 200 (captive portal,
+        # bk regression) must degrade like bad JSON, not AttributeError past here.
+        meetings = meetings.get("meetings") if isinstance(meetings, dict) else None
+    except (config_mod.ConfigError, bk_mod.BkError) as e:
+        reporter.info(f"calendar lookup skipped ({e})")
+        return None
+    return meetings if isinstance(meetings, list) else None
+
+
+def _str_or_none(value) -> str | None:
+    """Field coercion for untrusted bk/ref data: a non-string start/end/name/email
+    (a JSON number, null, …) degrades to None — the candidate dataclasses promise
+    ``str | None`` and the renderer must never crash on ref contents."""
+    return value if isinstance(value, str) else None
+
+
+def confirm_calendar_meeting(meeting_dir, interaction) -> dict | None:
+    """Post-recording pick from the cached ``bk-calendar.json`` candidates.
+
+    Returns the picked meeting dict (after rewriting the ref with
+    ``picked_meeting_id``), or ``None`` on skip / no usable candidates — in which
+    case the caller keeps today's manual prompt flow untouched. Tolerant of a
+    missing/corrupt ref and malformed entries, like every bk ref reader."""
+    from . import bk as bk_mod
+    from .interaction import CalendarCandidate, MeetingPickView, RosterEntry
+
+    ref = bk_mod.read_calendar_ref(meeting_dir)
+    meetings = (ref or {}).get("meetings")
+    if not isinstance(meetings, list):
+        return None
+    candidates: list[CalendarCandidate] = []
+    by_id: dict[str, dict] = {}
+    for m in meetings:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        attendees = tuple(
+            RosterEntry(
+                person_id="", email=_str_or_none(a.get("email")),
+                name=_str_or_none(a.get("name")),
+            )
+            for a in m.get("attendees") or []
+            if isinstance(a, dict)
+        )
+        candidate = CalendarCandidate(
+            meeting_id=str(m["id"]), title=str(m.get("title") or ""),
+            start=_str_or_none(m.get("start")), end=_str_or_none(m.get("end")),
+            attendees=attendees,
+        )
+        candidates.append(candidate)
+        by_id[candidate.meeting_id] = m
+    if not candidates:
+        return None
+    picked = interaction.pick_meeting(MeetingPickView(candidates=tuple(candidates)))
+    if picked is None:
+        return None
+    try:
+        bk_mod.write_calendar_ref(meeting_dir, {**ref, "picked_meeting_id": picked})
+    except OSError:
+        # ENOSPC/ACL after the WAVs were captured: the pick still steers glossary
+        # and speaker count — only the upload's ?meeting_id= hint is lost. Losing
+        # the whole processing pass over a cache write would be far worse.
+        pass
+    return by_id.get(picked)
 
 
 def run(
     out_dir: str | None = None, bundle: bool | None = None, reporter=None,
     system_source: str | None = None, cleanup: bool | None = None,
     backend: str | None = None, language: str | None = None,
-    upload: bool | None = None,
+    upload: bool | None = None, calendar: bool | None = None,
+    interaction=None,
 ) -> int:
     import os
     from datetime import datetime, timezone
@@ -483,8 +602,9 @@ def run(
         # resolves on, base_url + token must resolve NOW and a [bk].token_cmd is
         # executed eagerly (pinentry at record start is fine; a broken keyring
         # command after the meeting is not). The upload itself happens in the
-        # pipeline.run hand-off — the fetched material is discarded here.
-        upload, _bk_url, _bk_token, bk_err = pipeline.check_bk_upload(upload, cfg=cfg)
+        # pipeline.run hand-off — the fetched material is only reused by the
+        # calendar lookup below (one token_cmd execution, never two).
+        upload, _bk_url, bk_token, bk_err = pipeline.check_bk_upload(upload, cfg=cfg)
         if out_dir is None:
             # Without -o, recordings land under the resolved meetings_dir
             # ($XDG_DATA_HOME/meetscribe/meetings by default) — never the CWD.
@@ -513,6 +633,29 @@ def run(
     mic_out = str(raw / "mic.wav")
     system_out = str(raw / "system.wav")
 
+    # Opportunistic calendar lookup (Phase 3): one single-attempt, 3 s-bounded query;
+    # EVERY failure degrades silently to a calendar-less recording — the recording
+    # never blocks on bk. Candidates are cached for the post-recording pick (and the
+    # upload's ?meeting_id=); an empty answer leaves no ref at all.
+    queried_at = datetime.now().astimezone()
+    meetings = query_calendar(
+        cfg, reporter, now_iso=queried_at.isoformat(), calendar_flag=calendar,
+        token=bk_token,
+    )
+    if meetings:
+        from . import bk as bk_mod
+
+        try:
+            bk_mod.write_calendar_ref(root, {
+                "queried_at": queried_at.isoformat(),
+                "around": queried_at.isoformat(),
+                "meetings": meetings,
+            })
+        except OSError as e:
+            # Quota/ACL/ENOSPC on the meetings dir: the cache is optional, the
+            # recording is not — degrade to a calendar-less run, never abort.
+            reporter.info(f"calendar cache not written ({e})")
+
     print(f"Recording to {root} — press Ctrl-C to stop.")
     started_at = datetime.now().astimezone()  # tz-aware wall-clock, real meeting start
     record_tracks(mic_out, system_out, reporter=reporter, system_source=system_source)
@@ -522,13 +665,36 @@ def run(
         if warning:
             print(f"⚠ {warning}")
 
-    num_speakers = ask_participants() if _stdin_is_tty() else -1
-    if _stdin_is_tty() and num_speakers >= 2:
-        # Optional spelling hints for the cleanup glossary; TTY-gated, never blocks.
+    # Post-recording prompts (TTY-gated, never block). When calendar candidates were
+    # cached AND a front-end is attached, the pick runs first: a picked event's
+    # roster answers both questions — named attendees → glossary (same spelling-hint
+    # role as the manual prompts), attendee count → the Enter-default of the count
+    # prompt — and the manual name prompts are skipped. Skip/no-pick keeps today's
+    # flow byte-identical.
+    picked = None
+    if _stdin_is_tty() and interaction is not None:
+        picked = confirm_calendar_meeting(root, interaction)
+    if picked is not None:
         from . import glossary
 
-        names = ask_participant_names(num_speakers)
-        glossary.append(glossary.default_path(), names)
+        attendees = [a for a in picked.get("attendees") or [] if isinstance(a, dict)]
+        glossary.append(
+            glossary.default_path(),
+            # The raw dict comes straight from bk/the ref — only string names are
+            # spelling hints; a malformed value must not crash the append.
+            [a["name"] for a in attendees if isinstance(a.get("name"), str)],
+        )
+        num_speakers = ask_participants(default_count=len(attendees) or None)
+    elif _stdin_is_tty():
+        num_speakers = ask_participants()
+        if num_speakers >= 2:
+            # Optional spelling hints for the cleanup glossary; TTY-gated, never blocks.
+            from . import glossary
+
+            names = ask_participant_names(num_speakers)
+            glossary.append(glossary.default_path(), names)
+    else:
+        num_speakers = -1
 
     return pipeline.run(
         audio=str(root), out_dir=str(root),

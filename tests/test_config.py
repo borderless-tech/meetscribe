@@ -688,7 +688,42 @@ def test_bk_auto_upload_config_string_or_int_is_error(bad):
         config.bk_auto_upload(None, {}, {"bk": {"auto_upload": bad}})
 
 
+# ------------------------------------------------------- resolver: bk_calendar
+
+
+def test_bk_calendar_default_is_true():
+    assert config.bk_calendar(None, {}, {}) == Resolved(True, "default")
+
+
+def test_bk_calendar_from_config():
+    cfg = {"bk": {"calendar": False}}
+    assert config.bk_calendar(None, {}, cfg) == Resolved(False, "config")
+
+
+def test_bk_calendar_flag_beats_config():
+    cfg = {"bk": {"calendar": True}}
+    assert config.bk_calendar(False, {}, cfg) == Resolved(False, "flag")
+    assert config.bk_calendar(True, {}, {"bk": {"calendar": False}}) == Resolved(
+        True, "flag"
+    )
+
+
+@pytest.mark.parametrize("bad", ["false", "true", 1, 0])
+def test_bk_calendar_config_string_or_int_is_error(bad):
+    with pytest.raises(ConfigError):
+        config.bk_calendar(None, {}, {"bk": {"calendar": bad}})
+
+
+def test_unknown_keys_accepts_bk_calendar():
+    assert config.unknown_keys({"bk": {"calendar": False}}) == []
+
+
 # ------------------------------------------------------------ validate covers bk
+
+
+def test_validate_raises_on_wrongly_typed_bk_calendar():
+    with pytest.raises(ConfigError, match="calendar"):
+        config.validate({"bk": {"calendar": "true"}})
 
 
 def test_validate_raises_on_wrongly_typed_bk_auto_upload():

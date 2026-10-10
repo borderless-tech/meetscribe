@@ -15,14 +15,18 @@ from rich.console import Console
 
 from meetscribe.interaction import (
     Assignment,
+    CalendarCandidate,
     MappingAnswer,
     MappingCandidate,
     MappingReviewView,
+    MeetingPickView,
     NewPerson,
+    NullInteraction,
     OpenWeb,
     Quit,
     RichInteraction,
     RosterEntry,
+    ScriptedInteraction,
     Snippet,
     SpeakerAnswers,
     SpeakerReviewView,
@@ -278,6 +282,75 @@ def test_ask_retry_enter_or_r_retries_q_quits_unknown_keys_rereads():
     assert rich_interaction(["r"]).ask_retry("submit failed") is True
     assert rich_interaction([ENTER]).ask_retry("submit failed") is True
     assert rich_interaction(["x", "q"]).ask_retry("submit failed") is False
+
+
+# ---- calendar meeting pick gate ----------------------------------------------------------
+
+# Candidates mirroring the meetings-around.json fixture: tz-aware ISO times, one attendee
+# with a null name (rendered as the email), one all-null timed note.
+CAL_WEEKLY = CalendarCandidate(
+    meeting_id="1f0e2d3c-4b5a-4968-8776-655443322110",
+    title="Weekly Sync",
+    start="2026-09-08T07:00:00.000Z",
+    end="2026-09-08T07:30:00.000Z",
+    attendees=(
+        RosterEntry(person_id="", email="anna@example.com", name="Anna Meier"),
+        RosterEntry(person_id="", email="guest@other.org", name=None),
+    ),
+)
+CAL_NOTES = CalendarCandidate(
+    meeting_id="m-notes", title="Planungsnotizen Q4", start=None, end=None, attendees=()
+)
+
+
+def test_pick_meeting_enter_accepts_the_sole_candidate():
+    ia = rich_interaction([ENTER])
+    assert ia.pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY,))) == CAL_WEEKLY.meeting_id
+
+
+def test_pick_meeting_enter_skips_when_there_are_several_candidates():
+    ia = rich_interaction([ENTER])
+    assert ia.pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY, CAL_NOTES))) is None
+
+
+def test_pick_meeting_digit_picks_that_candidate():
+    ia = rich_interaction(["2"])
+    assert ia.pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY, CAL_NOTES))) == "m-notes"
+
+
+def test_pick_meeting_s_skips_even_with_a_sole_candidate():
+    ia = rich_interaction(["s"])
+    assert ia.pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY,))) is None
+
+
+def test_pick_meeting_out_of_range_digit_is_ignored_and_the_next_key_wins():
+    ia = rich_interaction(["9", "1"])
+    answer = ia.pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY, CAL_NOTES)))
+    assert answer == CAL_WEEKLY.meeting_id
+
+
+def test_pick_meeting_tolerates_unparsable_times():
+    # Ref contents are never trusted: a non-ISO start/end string must not crash the
+    # render (the recording was already captured) — the row loses its time range,
+    # the pick still answers.
+    weird = CalendarCandidate(
+        meeting_id="m-weird", title="Weird", start="yesterday-ish", end="soon",
+        attendees=(),
+    )
+    ia = rich_interaction([ENTER])
+    assert ia.pick_meeting(MeetingPickView(candidates=(weird,))) == "m-weird"
+
+
+def test_null_interaction_pick_meeting_raises():
+    with pytest.raises(RuntimeError):
+        NullInteraction().pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY,)))
+
+
+def test_scripted_interaction_pick_meeting_pops_the_answer_and_records_the_view():
+    view = MeetingPickView(candidates=(CAL_WEEKLY,))
+    scripted = ScriptedInteraction([CAL_WEEKLY.meeting_id])
+    assert scripted.pick_meeting(view) == CAL_WEEKLY.meeting_id
+    assert scripted.seen == [view]
 
 
 # ---- ffplay playback --------------------------------------------------------------------

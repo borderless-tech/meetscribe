@@ -123,6 +123,49 @@ def test_main_bare_invocation_forwards_bundle_none(monkeypatch):
     assert captured["cleanup"] is None
 
 
+def test_main_record_forwards_calendar_flag(monkeypatch):
+    # --calendar/--no-calendar is tri-state like bundle/cleanup: explicit flag →
+    # True/False, absent (incl. the bare invocation) → None = "resolve from config".
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["record", "--no-calendar"]) == 0
+    assert captured["calendar"] is False
+
+    assert main(["record", "--calendar"]) == 0
+    assert captured["calendar"] is True
+
+    assert main(["record"]) == 0
+    assert captured["calendar"] is None
+
+    assert main(["--quiet"]) == 0  # bare invocation skips the subparser
+    assert captured["calendar"] is None
+
+
+def test_main_record_interaction_follows_stdio_tty(monkeypatch):
+    # The calendar pick needs raw keypresses: record.run gets a RichInteraction only
+    # when stdin AND stderr are ttys (same rule as the post-upload review
+    # auto-continue); otherwise None, which skips the pick entirely.
+    import meetscribe.cli as cli
+    from meetscribe.cli import main
+    from meetscribe.interaction import RichInteraction
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: False)
+    assert main(["record"]) == 0
+    assert captured["interaction"] is None
+
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
+    assert main(["record"]) == 0
+    assert isinstance(captured["interaction"], RichInteraction)
+
+
 def test_bundle_parser_accepts_dir_and_out():
     args = build_parser().parse_args(["bundle", "some/dir", "-o", "x.mscribe"])
     assert args.command == "bundle"
@@ -531,6 +574,20 @@ def test_config_show_includes_bk_defaults(isolated_config, capsys):
     assert "(not set)" in token_line and "(default)" in token_line
     auto_line = next(l for l in lines if l.startswith("bk_auto_upload"))
     assert "false" in auto_line and "(default)" in auto_line
+    cal_line = next(l for l in lines if l.startswith("bk_calendar"))
+    assert "true" in cal_line and "(default)" in cal_line
+
+
+def test_config_show_bk_calendar_from_config(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[bk]\ncalendar = false\n")
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    cal_line = next(l for l in out.splitlines() if l.startswith("bk_calendar"))
+    assert "false" in cal_line and "(config)" in cal_line
 
 
 def test_config_show_bk_values_and_masked_token(isolated_config, capsys):
@@ -1512,3 +1569,98 @@ def test_pipeline_auto_upload_non_tty_skips_review(isolated_config, tmp_path, mo
     )
 
     assert calls == []
+
+
+# ---- ?meeting_id= on upload (phase 3 calendar) -----------------------------------------
+#
+# Precedence: --meeting-id flag > picked_meeting_id cached in bk-calendar.json > nothing.
+# bk re-verifies the id server-side, so forwarding is always safe; a broken/absent ref
+# must degrade to "no id", never block the upload.
+
+
+def test_upload_parser_accepts_meeting_id_flag():
+    args = build_parser().parse_args(["upload", "some/dir", "--meeting-id", "evt-7"])
+    assert args.meeting_id == "evt-7"
+    # None-default pattern: no flag → fall through to the cached pick downstream.
+    assert build_parser().parse_args(["upload", "some/dir"]).meeting_id is None
+
+
+def test_upload_forwards_picked_calendar_meeting_id(isolated_config, tmp_path, monkeypatch):
+    from meetscribe import bk
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    bk.write_calendar_ref(src, {
+        "queried_at": "2026-10-10T09:00:00+02:00",
+        "around": "2026-10-10T09:00:00+02:00",
+        "meetings": [{"id": "evt-123", "title": "Weekly"}],
+        "picked_meeting_id": "evt-123",
+    })
+    _write_bk_config(isolated_config)
+    created = _fake_bk_client(monkeypatch)
+
+    assert main(["upload", str(src)]) == 0
+    (_, _, calendar_id) = created[0].upload_calls[0]
+    assert calendar_id == "evt-123"
+
+
+def test_upload_ref_without_pick_sends_no_calendar_id(isolated_config, tmp_path, monkeypatch):
+    # Candidates were cached but the user skipped the pick: no picked_meeting_id key.
+    from meetscribe import bk
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    bk.write_calendar_ref(src, {"meetings": [{"id": "evt-123", "title": "Weekly"}]})
+    _write_bk_config(isolated_config)
+    created = _fake_bk_client(monkeypatch)
+
+    assert main(["upload", str(src)]) == 0
+    assert created[0].upload_calls[0][2] is None
+
+
+def test_upload_corrupt_calendar_ref_sends_no_calendar_id(
+    isolated_config, tmp_path, monkeypatch
+):
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    (src / "bk-calendar.json").write_text("{not json", encoding="utf-8")
+    _write_bk_config(isolated_config)
+    created = _fake_bk_client(monkeypatch)
+
+    assert main(["upload", str(src)]) == 0
+    assert created[0].upload_calls[0][2] is None
+
+
+def test_upload_meeting_id_flag_wins_over_cache(isolated_config, tmp_path, monkeypatch):
+    from meetscribe import bk
+    from meetscribe.cli import main
+
+    src = _meeting_dir(tmp_path)
+    bk.write_calendar_ref(src, {"meetings": [], "picked_meeting_id": "evt-cached"})
+    _write_bk_config(isolated_config)
+    created = _fake_bk_client(monkeypatch)
+
+    assert main(["upload", str(src), "--meeting-id", "evt-flag"]) == 0
+    assert created[0].upload_calls[0][2] == "evt-flag"
+
+
+def test_pipeline_auto_upload_forwards_picked_calendar_meeting_id(
+    isolated_config, tmp_path, monkeypatch
+):
+    # The record/process auto-upload path reads the same cache (out IS the meeting dir).
+    from meetscribe import bk, pipeline
+    from meetscribe.output import bundle_dir
+    from meetscribe.progress import NullReporter
+
+    src = _meeting_dir(tmp_path)
+    bundle_path = src / "meeting-m1.mscribe"
+    bundle_dir(src, bundle_path)
+    bk.write_calendar_ref(src, {"meetings": [], "picked_meeting_id": "evt-9"})
+    created = _fake_bk_client(monkeypatch)
+
+    pipeline._upload_to_bk(
+        src, bundle_path, "m1", "https://bk.example.com", "tok-secret", NullReporter()
+    )
+
+    assert created[0].upload_calls == [(str(bundle_path), "m1", "evt-9")]

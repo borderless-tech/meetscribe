@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from meetscribe.bk import (
+    CALENDAR_REF_NAME,
     WORKFLOW_REF_NAME,
     BkAuthError,
     BkClient,
@@ -25,7 +26,9 @@ from meetscribe.bk import (
     BkRevisionConflict,
     build_url,
     preflight,
+    read_calendar_ref,
     read_workflow_ref,
+    write_calendar_ref,
     write_workflow_ref,
 )
 from meetscribe.output import FORMAT_VERSION
@@ -497,6 +500,98 @@ def test_submit_task_retries_on_500_then_succeeds():
     assert sleeps and all(s > 0 for s in sleeps)
 
 
+# ---- meetings around (calendar lookup) ----------------------------------------------
+# Endpoint 2 of the contract: ONE opportunistic GET at record start. Single attempt and
+# a short timeout — a slow bk must cost at most the timeout, once; the retry discipline
+# exists for uploads, not here.
+
+
+def test_meetings_around_request_shape_and_parse():
+    opener = SeqOpener([FakeResponse(_fixture("meetings-around.json"))])
+    client, _ = _client(opener)
+
+    out = client.meetings_around("2026-09-08T09:00:25+02:00")
+
+    assert out == _fixture("meetings-around.json")
+    req, timeout = opener.calls[0]
+    assert req.get_method() == "GET"
+    split = urlsplit(req.full_url)
+    assert split.scheme == "https" and split.netloc == "bk.example.com"
+    assert split.path == "/api/meetscribe/v1/meetings"
+    # the iso timestamp must survive urlencoding (`+02:00` would otherwise decode to a space)
+    assert parse_qs(split.query) == {"around": ["2026-09-08T09:00:25+02:00"]}
+    assert req.get_header("Authorization") == "Bearer tok-secret"
+
+
+def test_meetings_around_empty_calendar_parses_to_empty_list():
+    opener = SeqOpener([FakeResponse(_fixture("meetings-around-empty.json"))])
+    client, _ = _client(opener)
+
+    assert client.meetings_around("2026-09-08T09:00:25+02:00") == {"meetings": []}
+
+
+def test_meetings_around_is_single_attempt():
+    # contrast with the upload calls (3 attempts): a 500 here fails after exactly ONE
+    # opener call and no backoff sleep — recording must never wait on bk.
+    opener = SeqOpener([_http_error(500)])
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkError, match="1 attempt"):
+        client.meetings_around("2026-09-08T09:00:25+02:00")
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_meetings_around_network_error_is_single_attempt_too():
+    opener = SeqOpener([urllib.error.URLError("no route to host")])
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkError):
+        client.meetings_around("2026-09-08T09:00:25+02:00")
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_meetings_around_defaults_to_a_3s_timeout():
+    opener = SeqOpener([FakeResponse(_fixture("meetings-around-empty.json"))])
+    client, _ = _client(opener)
+
+    client.meetings_around("2026-09-08T09:00:25+02:00")
+
+    assert opener.calls[0][1] == 3.0
+
+
+def test_meetings_around_timeout_is_caller_overridable():
+    opener = SeqOpener([FakeResponse(_fixture("meetings-around-empty.json"))])
+    client, _ = _client(opener)
+
+    client.meetings_around("2026-09-08T09:00:25+02:00", timeout_s=1.5)
+
+    assert opener.calls[0][1] == 1.5
+
+
+def test_meetings_around_401_is_a_typed_auth_error():
+    # callers of the opportunistic path swallow it like any BkError, but the type
+    # must stay consistent with the rest of the client
+    opener = SeqOpener([_http_error(401)])
+    client, _ = _client(opener)
+
+    with pytest.raises(BkAuthError):
+        client.meetings_around("2026-09-08T09:00:25+02:00")
+    assert len(opener.calls) == 1
+
+
+def test_other_calls_keep_the_config_timeout_and_retries(tmp_path):
+    # the new _request knobs must not leak into the existing calls
+    opener = SeqOpener([_http_error(500), FakeResponse(_fixture("bundle-accepted.json"))])
+    client, _ = _client(opener)
+
+    client.upload_bundle(_bundle(tmp_path), meeting_id="m")
+
+    assert len(opener.calls) == 2
+    assert [timeout for _, timeout in opener.calls] == [120.0, 120.0]
+
+
 # ---- workflow reference file --------------------------------------------------------
 
 
@@ -544,3 +639,49 @@ def test_write_workflow_ref_overwrites_existing(tmp_path):
     ref = read_workflow_ref(tmp_path)
     assert ref["workflow_id"] == "wf_02aa"
     assert ref["state"] == "done"
+
+
+# ---- calendar reference file ---------------------------------------------------------
+# `bk-calendar.json` is the cached record-start candidate list (+ later the picked id);
+# same tolerant-reader rules as bk-workflow.json, and never a bundle member.
+
+
+def _calendar_ref():
+    return {
+        "queried_at": "2026-09-08T09:00:25+02:00",
+        "around": "2026-09-08T09:00:25+02:00",
+        "meetings": _fixture("meetings-around.json")["meetings"],
+    }
+
+
+def test_calendar_ref_roundtrip(tmp_path):
+    path = write_calendar_ref(tmp_path, _calendar_ref())
+
+    assert path == tmp_path / CALENDAR_REF_NAME
+    assert CALENDAR_REF_NAME == "bk-calendar.json"
+    assert read_calendar_ref(tmp_path) == _calendar_ref()
+    # the file on disk is plain JSON (other tools may read it)
+    assert json.loads(path.read_text()) == _calendar_ref()
+
+
+def test_read_calendar_ref_absent_returns_none(tmp_path):
+    assert read_calendar_ref(tmp_path) is None
+
+
+def test_read_calendar_ref_tolerates_corrupt_json(tmp_path):
+    # a corrupt ref must degrade to "no calendar info", never crash the flow
+    (tmp_path / CALENDAR_REF_NAME).write_text("{not json", encoding="utf-8")
+    assert read_calendar_ref(tmp_path) is None
+
+
+def test_read_calendar_ref_tolerates_non_dict_json(tmp_path):
+    (tmp_path / CALENDAR_REF_NAME).write_text("[1, 2]", encoding="utf-8")
+    assert read_calendar_ref(tmp_path) is None
+
+
+def test_write_calendar_ref_overwrites_existing(tmp_path):
+    # the post-recording pick rewrites the ref with picked_meeting_id added
+    write_calendar_ref(tmp_path, _calendar_ref())
+    write_calendar_ref(tmp_path, {**_calendar_ref(), "picked_meeting_id": "cal_evt_8f3a"})
+
+    assert read_calendar_ref(tmp_path)["picked_meeting_id"] == "cal_evt_8f3a"

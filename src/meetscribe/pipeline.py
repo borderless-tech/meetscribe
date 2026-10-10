@@ -622,7 +622,14 @@ def _upload_to_bk(out, bundle_path, meeting_id, base_url, token, reporter) -> No
             caps = client.capabilities()
             error = bk_mod.preflight(caps, bundle_path.stat().st_size)
             if error is None:
-                response = client.upload_bundle(bundle_path, meeting_id=meeting_id)
+                from .cli import _picked_calendar_id
+
+                # `out` IS the meeting dir (record/process write in place), so the
+                # pick cached by the record flow rides along as ?meeting_id=.
+                response = client.upload_bundle(
+                    bundle_path, meeting_id=meeting_id,
+                    calendar_meeting_id=_picked_calendar_id(bk_mod, out),
+                )
     except bk_mod.BkError as e:
         error = str(e)
     if response is None:
