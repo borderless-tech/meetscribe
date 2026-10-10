@@ -20,7 +20,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol, Union
 
@@ -84,6 +84,23 @@ class MappingReviewView:
     web_url: str
 
 
+@dataclass(frozen=True)
+class CalendarCandidate:
+    """A calendar event near record start (bk ``/meetings?around=``). Attendees reuse
+    :class:`RosterEntry`; ``person_id`` is unused for calendar attendees and left ``""``."""
+
+    meeting_id: str
+    title: str
+    start: str | None  # tz-aware ISO, or None
+    end: str | None
+    attendees: tuple[RosterEntry, ...]
+
+
+@dataclass(frozen=True)
+class MeetingPickView:
+    candidates: tuple[CalendarCandidate, ...]
+
+
 # ---- Answers ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -131,6 +148,7 @@ MappingResult = Union[MappingAnswer, OpenWeb, Quit]
 class Interaction(Protocol):
     def review_speakers(self, view: SpeakerReviewView) -> SpeakerResult: ...
     def review_mapping(self, view: MappingReviewView) -> MappingResult: ...
+    def pick_meeting(self, view: MeetingPickView) -> str | None: ...  # id | None = skip
     def ask_retry(self, message: str) -> bool: ...
     def notify(self, message: str) -> None: ...
 
@@ -148,6 +166,9 @@ class NullInteraction:
     def review_mapping(self, view: MappingReviewView) -> MappingResult:
         raise RuntimeError(self._MSG)
 
+    def pick_meeting(self, view: MeetingPickView) -> str | None:
+        raise RuntimeError(self._MSG)
+
     def ask_retry(self, message: str) -> bool:
         raise RuntimeError(self._MSG)
 
@@ -162,7 +183,7 @@ class ScriptedInteraction:
 
     def __init__(self, answers: list) -> None:
         self._answers = list(answers)
-        self.seen: list[SpeakerReviewView | MappingReviewView] = []
+        self.seen: list[SpeakerReviewView | MappingReviewView | MeetingPickView] = []
         self.messages: list[str] = []
 
     def review_speakers(self, view: SpeakerReviewView) -> SpeakerResult:
@@ -170,6 +191,10 @@ class ScriptedInteraction:
         return self._answers.pop(0)
 
     def review_mapping(self, view: MappingReviewView) -> MappingResult:
+        self.seen.append(view)
+        return self._answers.pop(0)
+
+    def pick_meeting(self, view: MeetingPickView) -> str | None:
         self.seen.append(view)
         return self._answers.pop(0)
 
@@ -227,6 +252,15 @@ def _read_key() -> str:
 def _fmt_talk_time(seconds: float) -> str:
     m, s = divmod(int(round(seconds)), 60)
     return f"{m}:{s:02d}"
+
+
+def _fmt_local_range(start: str | None, end: str | None) -> str | None:
+    """``HH:MM–HH:MM`` in local time, or ``None`` when either bound is missing."""
+    if not start or not end:
+        return None
+    def hhmm(iso: str) -> str:
+        return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
+    return f"{hhmm(start)}–{hhmm(end)}"
 
 
 def _preselection(suggestions: tuple[Suggestion, ...]) -> Suggestion | None:
@@ -425,6 +459,40 @@ class RichInteraction:
                     create_title=title or f"Meeting {date.today().isoformat()}"
                 )
             # unknown key (incl. a hidden "n") — ignore, re-read
+
+    # -- calendar meeting pick (record flow, not a bk gate) --
+
+    def pick_meeting(self, view: MeetingPickView) -> str | None:
+        self._render_pick(view)
+        while True:
+            key = self._readkey()
+            if key == "s":
+                return None
+            if key in _ENTER_KEYS:
+                if len(view.candidates) == 1:
+                    return view.candidates[0].meeting_id
+                return None  # several candidates — Enter won't guess, skip
+            if key.isdigit() and key != "0":
+                i = int(key) - 1
+                if i < len(view.candidates):
+                    return view.candidates[i].meeting_id
+                continue
+            # unknown key — ignore, re-read
+
+    def _render_pick(self, view: MeetingPickView) -> None:
+        self.console.print("\n[bold]calendar match?[/bold]")
+        for i, c in enumerate(view.candidates, start=1):
+            when = _fmt_local_range(c.start, c.end)
+            extra = f"  [dim]{when}[/dim]" if when else ""
+            names = ", ".join(a.name or a.email or "" for a in c.attendees)
+            if names:
+                extra += f"  [dim]{names}[/dim]"
+            self.console.print(f"  {i}) {c.title}{extra}")
+        if len(view.candidates) == 1:
+            actions = "Enter confirm · 1 pick · s skip"
+        else:
+            actions = "1-9 pick · Enter/s skip"
+        self.console.print(f"  [dim]{actions}[/dim]")
 
     def _render_mapping(self, view: MappingReviewView) -> None:
         self.console.print("\n[bold]which meeting is this?[/bold]")
