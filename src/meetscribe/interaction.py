@@ -255,12 +255,17 @@ def _fmt_talk_time(seconds: float) -> str:
 
 
 def _fmt_local_range(start: str | None, end: str | None) -> str | None:
-    """``HH:MM–HH:MM`` in local time, or ``None`` when either bound is missing."""
+    """``HH:MM–HH:MM`` in local time, or ``None`` when either bound is missing or
+    unparsable — the values come from an untrusted bk ref, and a bad timestamp must
+    cost the row its time range, never the pick."""
     if not start or not end:
         return None
     def hhmm(iso: str) -> str:
         return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
-    return f"{hhmm(start)}–{hhmm(end)}"
+    try:
+        return f"{hhmm(start)}–{hhmm(end)}"
+    except (TypeError, ValueError):
+        return None
 
 
 def _preselection(suggestions: tuple[Suggestion, ...]) -> Suggestion | None:

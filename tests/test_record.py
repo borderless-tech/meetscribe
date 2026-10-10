@@ -901,6 +901,51 @@ def test_query_calendar_failing_token_cmd_degrades(tmp_path):
     ) is None
 
 
+def test_query_calendar_non_dict_json_degrades(tmp_path):
+    # A 200 whose body is valid JSON but not an object (captive portal, proxy, bk
+    # regression — the not-JSON guard in bk._request only catches json.loads
+    # failures) must degrade exactly like bad JSON: None, never an AttributeError
+    # that would abort record.run before ffmpeg starts.
+    _calendar_config(tmp_path)
+    from meetscribe import config as config_mod
+    from meetscribe import record
+
+    cfg = config_mod.load()
+    for body in ([], "ok", 42, None):
+        client = _FakeBkClient(result=body)
+        assert record.query_calendar(
+            cfg, now_iso="x", client_factory=lambda c: client
+        ) is None
+
+
+def test_query_calendar_reuses_a_prefetched_token(tmp_path):
+    # When the auto-upload preflight already executed [bk].token_cmd eagerly, the
+    # calendar lookup must reuse that material instead of running the command a
+    # second time (double pinentry per recording): with token= given, even a
+    # failing token_cmd is never run and the client sees the prefetched token.
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        '[bk]\nbase_url = "https://bk.example.com"\ntoken_cmd = "exit 5"\n'
+    )
+    cfg_file.chmod(0o600)
+    from meetscribe import config as config_mod
+    from meetscribe import record
+
+    fixture = _around_fixture()
+    client = _FakeBkClient(result=fixture)
+    seen = {}
+
+    def factory(bk_config):
+        seen["config"] = bk_config
+        return client
+
+    out = record.query_calendar(
+        config_mod.load(), now_iso="x", token="prefetched", client_factory=factory
+    )
+    assert out == fixture["meetings"]
+    assert seen["config"].token == "prefetched"
+
+
 def test_ask_participants_default_count_enter_accepts():
     # A picked calendar event turns Enter into "accept the roster size" instead of
     # "skip": blank → speakers_from_count(default), an explicit answer still wins,
@@ -1097,3 +1142,165 @@ def test_run_candidates_without_interaction_skip_pick(tmp_path, monkeypatch):
     assert captured["num_speakers"] == -1  # Enter still means skip without a roster
     ref = json.loads((tmp_path / "m" / "bk-calendar.json").read_text())
     assert "picked_meeting_id" not in ref
+
+
+def test_run_calendar_cache_write_failure_degrades(tmp_path, monkeypatch):
+    # A failing bk-calendar.json write (quota, ACL on the meetings dir, ENOSPC)
+    # must degrade to a calendar-less recording, not abort the run before ffmpeg:
+    # exit 0, no ref, pipeline kwargs identical to a bk-less run.
+    import meetscribe.bk as bk_mod
+
+    captured = {}
+    _stub_run(monkeypatch, captured)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m0")) == 0  # no [bk] at all
+    skip = ("audio", "out_dir", "started_at", "reporter")
+    baseline = {k: v for k, v in captured.items() if k not in skip}
+
+    _calendar_config(tmp_path)
+    monkeypatch.setattr(bk_mod, "BkClient", _fake_bk_client_cls(result=_around_fixture()))
+
+    def refuse(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(bk_mod, "write_calendar_ref", refuse)
+    captured.clear()
+    assert record.run(out_dir=str(tmp_path / "m1")) == 0
+    assert not (tmp_path / "m1" / "bk-calendar.json").exists()
+    assert {k: v for k, v in captured.items() if k not in skip} == baseline
+
+
+def test_run_pick_rewrite_failure_keeps_roster_and_processing(tmp_path, monkeypatch):
+    # The post-pick ref rewrite failing (e.g. ENOSPC after the WAVs filled the
+    # disk) must not lose the processing pass: the roster still feeds glossary +
+    # the Enter-default, the run exits 0 — only the upload's ?meeting_id= hint is
+    # lost (the ref keeps its candidates without a pick).
+    import json
+
+    import meetscribe.bk as bk_mod
+
+    captured = {}
+    _stub_run(monkeypatch, captured)
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: True)
+    _calendar_config(tmp_path)
+    monkeypatch.setattr(bk_mod, "BkClient", _fake_bk_client_cls(result=_around_fixture()))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    real_write = bk_mod.write_calendar_ref
+    writes = []
+
+    def second_write_fails(meeting_dir, ref):
+        writes.append(ref)
+        if len(writes) > 1:  # the record-start cache succeeds, the rewrite fails
+            raise OSError(28, "No space left on device")
+        return real_write(meeting_dir, ref)
+
+    monkeypatch.setattr(bk_mod, "write_calendar_ref", second_write_fails)
+
+    from meetscribe import record
+    from meetscribe.interaction import ScriptedInteraction
+    from meetscribe.record import speakers_from_count
+
+    inter = ScriptedInteraction(["1f0e2d3c-4b5a-4968-8776-655443322110"])
+    assert record.run(out_dir=str(tmp_path / "m"), interaction=inter) == 0
+
+    from meetscribe import glossary
+    assert glossary.load(glossary.default_path()) == ["Anna Meier"]
+    assert captured["num_speakers"] == speakers_from_count(2)
+    ref = json.loads((tmp_path / "m" / "bk-calendar.json").read_text())
+    assert "picked_meeting_id" not in ref  # the rewrite failed; the run survived
+
+
+def test_confirm_calendar_meeting_tolerates_malformed_fields(tmp_path):
+    # A hand-edited (or bk-regressed) ref with non-string timestamps/attendee
+    # fields must not crash the pick after the audio was captured: non-str values
+    # degrade to None in the candidate (the dataclass contract is str | None) and
+    # the pick still returns the raw meeting dict.
+    import json
+
+    from meetscribe import record
+    from meetscribe.interaction import ScriptedInteraction
+
+    (tmp_path / "bk-calendar.json").write_text(json.dumps({
+        "meetings": [{
+            "id": "m-1", "title": "Weekly", "start": 1759900000, "end": "yesterday-ish",
+            "attendees": [
+                {"email": None, "name": 42},
+                {"email": "anna@example.com", "name": "Anna"},
+            ],
+        }],
+    }))
+    inter = ScriptedInteraction(["m-1"])
+    picked = record.confirm_calendar_meeting(tmp_path, inter)
+    assert picked["id"] == "m-1"
+    (view,) = inter.seen
+    (cand,) = view.candidates
+    assert cand.start is None  # an int is not a timestamp
+    assert cand.end == "yesterday-ish"  # strings pass; the renderer tolerates non-ISO
+    assert cand.attendees[0].name is None and cand.attendees[0].email is None
+    assert cand.attendees[1].name == "Anna"
+
+
+def test_run_picked_meeting_with_malformed_fields_survives(tmp_path, monkeypatch):
+    # Malformed attendee names straight from the server (only isinstance(list) is
+    # checked before caching) must not crash the glossary append after the pick:
+    # string names land in the glossary, everything else is dropped.
+    import meetscribe.bk as bk_mod
+
+    captured = {}
+    _stub_run(monkeypatch, captured)
+    monkeypatch.setattr("meetscribe.record._stdin_is_tty", lambda: True)
+    _calendar_config(tmp_path)
+    result = {"meetings": [{
+        "id": "m-1", "title": "Weekly", "start": 1759900000, "end": "soon-ish",
+        "attendees": [
+            {"email": "x@example.com", "name": 42},
+            {"email": "anna@example.com", "name": "Anna Meier"},
+        ],
+    }]}
+    monkeypatch.setattr(bk_mod, "BkClient", _fake_bk_client_cls(result=result))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    from meetscribe import record
+    from meetscribe.interaction import ScriptedInteraction
+    from meetscribe.record import speakers_from_count
+
+    assert record.run(out_dir=str(tmp_path / "m"), interaction=ScriptedInteraction(["m-1"])) == 0
+    from meetscribe import glossary
+    assert glossary.load(glossary.default_path()) == ["Anna Meier"]
+    assert captured["num_speakers"] == speakers_from_count(2)
+
+
+def test_run_token_cmd_runs_once_with_auto_upload_and_calendar(tmp_path, monkeypatch):
+    # With auto-upload on, check_bk_upload already executes [bk].token_cmd eagerly;
+    # the calendar lookup must reuse that token — one pinentry per recording, not
+    # two — and the calendar client sees the fetched material.
+    import meetscribe.bk as bk_mod
+
+    captured = {}
+    _stub_run(monkeypatch, captured)
+    count = tmp_path / "count"
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        '[bk]\nbase_url = "https://bk.example.com"\n'
+        f'token_cmd = "echo x >> {count}; echo sekrit"\n'
+        "auto_upload = true\n"
+    )
+    cfg_file.chmod(0o600)
+    tokens = []
+
+    class FakeBkClient:
+        def __init__(self, config, opener=None, sleep=None):
+            tokens.append(config.token)
+
+        def meetings_around(self, around_iso, timeout_s=3.0):
+            return _around_fixture()
+
+    monkeypatch.setattr(bk_mod, "BkClient", FakeBkClient)
+
+    from meetscribe import record
+    assert record.run(out_dir=str(tmp_path / "m")) == 0
+    assert count.read_text().splitlines() == ["x"]  # executed exactly once
+    assert tokens == ["sekrit"]  # ...and its material reached the calendar client
+    assert captured["upload"] is True

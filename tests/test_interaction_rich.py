@@ -329,6 +329,18 @@ def test_pick_meeting_out_of_range_digit_is_ignored_and_the_next_key_wins():
     assert answer == CAL_WEEKLY.meeting_id
 
 
+def test_pick_meeting_tolerates_unparsable_times():
+    # Ref contents are never trusted: a non-ISO start/end string must not crash the
+    # render (the recording was already captured) — the row loses its time range,
+    # the pick still answers.
+    weird = CalendarCandidate(
+        meeting_id="m-weird", title="Weird", start="yesterday-ish", end="soon",
+        attendees=(),
+    )
+    ia = rich_interaction([ENTER])
+    assert ia.pick_meeting(MeetingPickView(candidates=(weird,))) == "m-weird"
+
+
 def test_null_interaction_pick_meeting_raises():
     with pytest.raises(RuntimeError):
         NullInteraction().pick_meeting(MeetingPickView(candidates=(CAL_WEEKLY,)))
