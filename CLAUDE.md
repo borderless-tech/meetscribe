@@ -165,6 +165,34 @@ to be drop-in replaceable by bk's canonical set — divergence later = red test 
   doctor), and a live capabilities/format check only when a *static* token exists
   (injected opener; skipped for `token_cmd`).
 
+**Calendar-aware recording** (phase 3, design:
+`docs/plans/2026-10-10-phase3-calendar-design.md`) — the rule is **recording NEVER blocks
+on bk**:
+
+- At record start, `record.query_calendar` fires one opportunistic
+  `bk.meetings_around(now_iso)` (`GET /meetings?around=`) — **single attempt, 3 s
+  timeout** via `_request`'s `attempts`/`timeout_s` knobs (every other bk call keeps the
+  3× retry + config timeout). EVERY failure path (bk unconfigured, `ConfigError`, a
+  failing `token_cmd`, `BkError` incl. auth) returns `None` after at most one
+  `reporter.info` breadcrumb — the recording proceeds calendar-less. Unlike the
+  auto-upload preflight, a `token_cmd` failure here must never abort.
+- Toggle: `[bk].calendar` (default **true** — the lookup only fires when bk is already
+  configured) / `--calendar/--no-calendar` on `record` (None-default pattern, no env
+  layer, like `auto_upload`).
+- Candidates are cached as **`bk-calendar.json`** (`{queried_at, around, meetings}`),
+  sibling of `bk-workflow.json`, same rules: tolerant reader (`read_calendar_ref` →
+  `None` on absent/corrupt), **never** a bundle member.
+- Post-recording (same TTY gate as the participant prompts, and only when the CLI passed
+  a `RichInteraction`): `Interaction.pick_meeting(MeetingPickView)` — digits pick, Enter
+  accepts the sole candidate when there is exactly one, `s`/Enter skip. A pick rewrites
+  the ref with `picked_meeting_id`, appends the roster's non-null names to the glossary,
+  and makes the attendee count the Enter-default of the count prompt (manual name
+  prompts are skipped). Skip/no-TTY/no candidates keeps today's flow byte-identical.
+- Uploads forward the picked id as `?meeting_id=`
+  (`upload_bundle(..., calendar_meeting_id=)`) on **both** paths; precedence:
+  `upload --meeting-id` flag > cached `picked_meeting_id` > nothing. bk re-verifies
+  attendance server-side (params never widen scope), so sending it is always safe.
+
 ## Review loop (bk gates)
 
 `meetscribe review [dir]` walks bk's `awaiting_review` gates in the terminal; after a
@@ -181,7 +209,8 @@ Design:
   `BkAuthError` (final everywhere — the contract forbids retry loops on auth
   failures); 5xx retries like the other calls.
 - `interaction.py` — the **task-level** front-end protocol (`Interaction`: one method
-  per gate type, exchanging frozen view-models for answers — deliberately not
+  per gate type, plus the record flow's `pick_meeting` which is gate-shaped but not a
+  bk gate, exchanging frozen view-models for answers — deliberately not
   prompt-level, so the later tray GUI renders one form per gate instead of a wizard).
   `NullInteraction` is the default and raises on any question (a non-interactive path
   blocking on input is a bug, not a user error); `ScriptedInteraction` is the test
@@ -233,8 +262,9 @@ everywhere: flag > env > config > default**. Read-only stdlib `tomllib`; we neve
 **Schema** (all keys optional; empty strings count as unset): `[stt]
 backend`/`language`, `[deepgram] api_key`/`api_key_cmd`, `[storage] meetings_dir`,
 `[record] system_source`, `[output] bundle`/`cleanup`, and `[bk]
-base_url`/`token`/`token_cmd`/`auto_upload` (env `MEETSCRIBE_BK_URL`/`MEETSCRIBE_BK_TOKEN`;
-`auto_upload` defaults false and has no env layer, like bundle/cleanup). Unknown keys
+base_url`/`token`/`token_cmd`/`auto_upload`/`calendar` (env
+`MEETSCRIBE_BK_URL`/`MEETSCRIBE_BK_TOKEN`; `auto_upload` (default false) and `calendar`
+(default true) have no env layer, like bundle/cleanup). Unknown keys
 warn; **malformed TOML is exit 2 with file + line** (`ConfigError`) — a typo'd config
 silently degrading to defaults is the worst failure mode. Booleans must be real TOML
 booleans (`"false"` is a `ConfigError`, never truthy).
@@ -254,8 +284,8 @@ config check first (path + parse status red-with-line, unknown-key and secret-pe
 warnings) that never aborts the audio checks.
 
 **The None-default flag pattern:** tri-state CLI flags (`--bundle/--no-bundle`,
-`--cleanup/--no-cleanup`, `--upload/--no-upload`, `--backend`, `--language`,
-`--system-source`) have parser default
+`--cleanup/--no-cleanup`, `--upload/--no-upload`, `--calendar/--no-calendar`,
+`--backend`, `--language`, `--system-source`) have parser default
 `None` = "flag not given → resolve env/config/default downstream" in
 `pipeline.run`/`record.run`. An explicit flag value always wins. When adding a config-backed
 option, keep this shape: never give the parser a concrete default, or the config layer

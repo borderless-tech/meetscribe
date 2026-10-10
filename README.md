@@ -77,6 +77,7 @@ base_url = ""            # borderless-knowledge server (env MEETSCRIBE_BK_URL wi
 token = ""               # bk API token; keep this file 0600 when set
 token_cmd = ""           # or: shell command printing the token ("pass show bk")
 auto_upload = false      # upload the bundle after record/process (explicit opt-in)
+calendar = true          # look up the current meeting in bk's calendar at record start
 ```
 
 Recordings land under `$XDG_DATA_HOME/meetscribe/meetings/` by default (`-o` overrides per
@@ -126,6 +127,15 @@ meetscribe status           # every local meeting + its upload/workflow state
 meetscribe upload ./meeting-dir   # retry a failed upload / backfill an old meeting
 meetscribe review           # walk bk's review gates in the terminal (newest uploaded meeting)
 ```
+
+With bk configured, `record` also asks bk's **calendar** which meeting is happening right
+now — one quick lookup that can never delay or fail the recording (disable with
+`--no-calendar` or `calendar = false`). After Ctrl-C you confirm the match (Enter accepts,
+`s` skips): the event's attendee names feed the glossary as spelling hints, the attendee
+count becomes the default answer of the participant prompt, and the picked event is
+attached to the upload so bk skips its own calendar-matching question.
+`meetscribe upload --meeting-id <id>` overrides the pick manually. The candidates are
+cached next to the meeting as `bk-calendar.json` (never part of the bundle).
 
 After a successful upload in a terminal, the **review loop** starts automatically: bk asks
 to map the meeting to a calendar event and to confirm who each detected speaker is.
