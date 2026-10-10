@@ -144,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_upload.add_argument(
         "dir", help="meeting directory (bundled first if no .mscribe exists yet)"
     )
+    p_upload.add_argument(
+        "--meeting-id", default=None,
+        help="bk calendar meeting id to attach (?meeting_id=); overrides a pick "
+             "cached in bk-calendar.json",
+    )
 
     p_status = sub.add_parser(
         "status", help="list local meetings and their bk upload state"
@@ -358,7 +363,9 @@ def _run_review(dir_arg: str | None, reporter) -> int:
     return review_mod.run_review(meeting_dir, client, RichInteraction(), reporter)
 
 
-def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
+def _run_upload(
+    dir_arg: str, reporter=None, *, isatty=None, meeting_id: str | None = None
+) -> int:
     """The ``upload <dir>`` subcommand — the retry/backfill path for auto-upload.
 
     Unlike the record/process auto-upload (which warns and exits 0 because the
@@ -405,7 +412,13 @@ def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
         if message:
             print(f"upload refused: {message}")
             return 1
-        accepted = client.upload_bundle(bundle_path, meeting_id=meta["meeting_id"])
+        accepted = client.upload_bundle(
+            bundle_path,
+            meeting_id=meta["meeting_id"],
+            # --meeting-id flag > the pick cached by the record flow > nothing. bk
+            # re-verifies the id server-side, so forwarding it is always safe.
+            calendar_meeting_id=meeting_id or _picked_calendar_id(bk_mod, src),
+        )
     except bk_mod.BkError as e:
         print(f"upload failed: {e}")
         return 1
@@ -430,6 +443,15 @@ def _run_upload(dir_arg: str, reporter=None, *, isatty=None) -> int:
 
     rc = _maybe_review(src, client, reporter or NullReporter(), isatty=isatty)
     return 0 if rc is None else rc
+
+
+def _picked_calendar_id(bk_mod, meeting_dir) -> str | None:
+    """The calendar event id picked after recording (``bk-calendar.json``), or
+    ``None`` — an absent/corrupt ref or a skipped pick degrades to "no id" and bk
+    falls back to its server-side matching, never an error. Shared by the upload
+    subcommand and the auto-upload path (`pipeline._upload_to_bk`)."""
+    picked = (bk_mod.read_calendar_ref(meeting_dir) or {}).get("picked_meeting_id")
+    return picked if isinstance(picked, str) and picked else None
 
 
 #: Workflow states that never change again — `status` shows them without asking bk.
@@ -605,7 +627,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "config":
         return _run_config(getattr(args, "action", None))
     if command == "upload":
-        return _run_upload(args.dir, reporter=reporter)
+        return _run_upload(
+            args.dir, reporter=reporter, meeting_id=getattr(args, "meeting_id", None)
+        )
     if command == "status":
         return _run_status(
             getattr(args, "dir", None), offline=getattr(args, "offline", False)
