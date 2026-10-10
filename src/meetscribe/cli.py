@@ -213,6 +213,7 @@ def _run_config(action: str | None) -> int:
             ("bk_base_url", config_mod.bk_base_url(None, env, cfg)),
             ("bk_token", config_mod.bk_token(None, env, cfg)),
             ("bk_auto_upload", config_mod.bk_auto_upload(None, env, cfg)),
+            ("bk_calendar", config_mod.bk_calendar(None, env, cfg)),
         ]
     except config_mod.ConfigError as e:
         print(f"config: {path} (invalid)", file=sys.stderr)

@@ -531,6 +531,20 @@ def test_config_show_includes_bk_defaults(isolated_config, capsys):
     assert "(not set)" in token_line and "(default)" in token_line
     auto_line = next(l for l in lines if l.startswith("bk_auto_upload"))
     assert "false" in auto_line and "(default)" in auto_line
+    cal_line = next(l for l in lines if l.startswith("bk_calendar"))
+    assert "true" in cal_line and "(default)" in cal_line
+
+
+def test_config_show_bk_calendar_from_config(isolated_config, capsys):
+    from meetscribe.cli import main
+
+    isolated_config.parent.mkdir(parents=True)
+    isolated_config.write_text("[bk]\ncalendar = false\n")
+
+    assert main(["config"]) == 0
+    out = capsys.readouterr().out
+    cal_line = next(l for l in out.splitlines() if l.startswith("bk_calendar"))
+    assert "false" in cal_line and "(config)" in cal_line
 
 
 def test_config_show_bk_values_and_masked_token(isolated_config, capsys):
