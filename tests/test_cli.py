@@ -123,6 +123,49 @@ def test_main_bare_invocation_forwards_bundle_none(monkeypatch):
     assert captured["cleanup"] is None
 
 
+def test_main_record_forwards_calendar_flag(monkeypatch):
+    # --calendar/--no-calendar is tri-state like bundle/cleanup: explicit flag →
+    # True/False, absent (incl. the bare invocation) → None = "resolve from config".
+    from meetscribe.cli import main
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    assert main(["record", "--no-calendar"]) == 0
+    assert captured["calendar"] is False
+
+    assert main(["record", "--calendar"]) == 0
+    assert captured["calendar"] is True
+
+    assert main(["record"]) == 0
+    assert captured["calendar"] is None
+
+    assert main(["--quiet"]) == 0  # bare invocation skips the subparser
+    assert captured["calendar"] is None
+
+
+def test_main_record_interaction_follows_stdio_tty(monkeypatch):
+    # The calendar pick needs raw keypresses: record.run gets a RichInteraction only
+    # when stdin AND stderr are ttys (same rule as the post-upload review
+    # auto-continue); otherwise None, which skips the pick entirely.
+    import meetscribe.cli as cli
+    from meetscribe.cli import main
+    from meetscribe.interaction import RichInteraction
+
+    captured = {}
+    import meetscribe.record as rec
+    monkeypatch.setattr(rec, "run", lambda **k: captured.update(k) or 0)
+
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: False)
+    assert main(["record"]) == 0
+    assert captured["interaction"] is None
+
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
+    assert main(["record"]) == 0
+    assert isinstance(captured["interaction"], RichInteraction)
+
+
 def test_bundle_parser_accepts_dir_and_out():
     args = build_parser().parse_args(["bundle", "some/dir", "-o", "x.mscribe"])
     assert args.command == "bundle"

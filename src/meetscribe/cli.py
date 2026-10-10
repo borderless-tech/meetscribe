@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="upload the .mscribe bundle to borderless-knowledge after processing "
              "(default: off, or [bk].auto_upload in the config; --no-upload to skip)",
     )
+    p_record.add_argument(
+        "--calendar", action=argparse.BooleanOptionalAction, default=None,
+        help="look up the meeting in bk's calendar at record start — opportunistic, "
+             "never delays recording (default: on when bk is configured, or "
+             "[bk].calendar in the config; --no-calendar to skip)",
+    )
     _add_backend_flags(p_record)
 
     p_process = sub.add_parser("process", help="process existing audio into artifacts")
@@ -551,6 +557,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "record":
         from . import record
 
+        # The calendar pick reads raw keypresses, so a front-end is attached only
+        # when stdin AND stderr are ttys (same rule as the post-upload review
+        # auto-continue); None skips the pick entirely.
+        interaction = None
+        if _stdio_isatty():
+            from .interaction import RichInteraction
+
+            interaction = RichInteraction()
         return record.run(
             out_dir=getattr(args, "out", None),
             # Bare `meetscribe` never runs the subparser, so the fallbacks must
@@ -562,6 +576,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             backend=getattr(args, "backend", None),
             language=getattr(args, "language", None),
             upload=getattr(args, "upload", None),
+            calendar=getattr(args, "calendar", None),
+            interaction=interaction,
         )
     if command == "process":
         from . import pipeline
