@@ -11,6 +11,11 @@ bump always warrants at least a minor version bump here, and is called out in th
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-10
+
+The second half of the bk integration's interactive side: transition-roadmap phase 4
+(design: `docs/plans/2026-10-10-phase4-review-loop-design.md`).
+
 ### Added
 - `review [dir]` subcommand — walks an uploaded meeting's bk review gates in the
   terminal (API contract v1): speaker annotation with one-key confirm of bk's
@@ -182,7 +187,8 @@ producing a diarized transcript with per-word timestamps and 192-dim speaker emb
 (per-turn + per-cluster centroid). Silero VAD, Parakeet TDT ASR, sherpa-onnx diarization,
 `doctor` preflight checks, reproducible Nix/uv2nix build with SHA-256-pinned models.
 
-[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/borderless-tech/meetscribe/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/borderless-tech/meetscribe/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/borderless-tech/meetscribe/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/borderless-tech/meetscribe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/borderless-tech/meetscribe/compare/v0.1.0...v0.2.0
