@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .bk import (
+    BkAuthError,
     BkError,
     BkInvalidSubmission,
     BkRevisionConflict,
@@ -208,12 +209,18 @@ def run_review(
     *,
     sleep=time.sleep,
     open_url=webbrowser.open,
+    emit=print,
 ) -> int:
     """Walk the uploaded meeting's bk review gates to a terminal state.
 
     Returns a process exit code: 0 for ``done``, a user quit, Ctrl-C, or a web
     handoff (quitting is legitimate — gates wait 7 days); 1 for ``failed`` or an
-    unreachable bk; 2 when the meeting has no usable workflow reference."""
+    unreachable bk; 2 when the meeting has no usable workflow reference or bk
+    rejects the token.
+
+    ``emit`` receives the single machine-useful stdout line
+    (``<workflow_id> <state>``, design §gate-rendering) — all human rendering goes
+    to stderr via the interaction/reporter seams, so scripts read the outcome here."""
     meeting_dir = Path(meeting_dir)
     ref = read_workflow_ref(meeting_dir)
     if ref is None or not ref.get("workflow_id"):
@@ -223,10 +230,13 @@ def run_review(
         )
         return 2
     try:
-        return _loop(meeting_dir, ref, client, interaction, reporter, sleep, open_url)
+        return _loop(meeting_dir, ref, client, interaction, reporter, sleep, open_url, emit)
     except KeyboardInterrupt:
         # Gates wait 7 days — quitting mid-poll is a legitimate, clean outcome.
         interaction.notify(f"review paused — resume with: meetscribe review {meeting_dir}")
+        # The loop may have persisted fresher state than our pre-loop snapshot.
+        current = read_workflow_ref(meeting_dir) or ref
+        emit(f"{ref['workflow_id']} {current.get('state') or 'unknown'}")
         return 0
 
 
@@ -238,11 +248,13 @@ def _loop(
     reporter: Reporter,
     sleep,
     open_url,
+    emit,
 ) -> int:
     workflow_id = ref["workflow_id"]
     wf: dict | None = None  # None = needs a fetch; a submit's 200 body fills it directly
     failures = 0
     stint_slept_s = 0.0  # how long the current processing stint has been polling
+    stage = None  # an open Reporter.stage spanning the current processing stint
 
     def poll_wait() -> None:
         nonlocal stint_slept_s
@@ -254,79 +266,132 @@ def _loop(
         sleep(interval)
         stint_slept_s += interval
 
-    while True:
-        if wf is None:
-            try:
-                wf = client.workflow(workflow_id)
-            except BkError as e:
-                failures += 1
-                if failures >= POLL_FAILURE_LIMIT:
-                    reporter.warn(
-                        f"giving up after {failures} consecutive failures ({e})"
-                        f" — resume with: meetscribe review {meeting_dir}"
-                    )
-                    return 1
-                reporter.warn(f"could not refresh workflow state ({e}) — retrying")
+    def finish(code: int) -> int:
+        # The one machine-useful stdout line (design §gate-rendering): everything
+        # human-facing renders to stderr, so scripts read the outcome from here.
+        emit(f"{workflow_id} {ref.get('state') or 'unknown'}")
+        return code
+
+    def end_stage() -> None:
+        nonlocal stage
+        if stage is not None:
+            stage.__exit__(None, None, None)
+            stage = None
+
+    try:
+        while True:
+            if wf is None:
+                try:
+                    wf = client.workflow(workflow_id)
+                except BkAuthError as e:
+                    # Contract: "401 → actionable client error, never a retry loop" —
+                    # re-sending a known-bad token only wastes the human's time.
+                    interaction.notify(str(e))
+                    return finish(2)
+                except BkError as e:
+                    failures += 1
+                    if failures >= POLL_FAILURE_LIMIT:
+                        reporter.warn(
+                            f"giving up after {failures} consecutive failures ({e})"
+                            f" — resume with: meetscribe review {meeting_dir}"
+                        )
+                        return finish(1)
+                    reporter.warn(f"could not refresh workflow state ({e}) — retrying")
+                    poll_wait()
+                    continue
+                failures = 0
+                ref = _persist_state(meeting_dir, ref, wf)
+
+            state = str(wf.get("state") or "")
+            if state != "processing":
+                end_stage()  # the stint (if any) is over — close the spinner
+            if state == "done":
+                reporter.info(f"review complete — {ref.get('web_url')}")
+                return finish(0)
+            if state == "failed":
+                error = wf.get("error") or {}
+                reporter.warn(
+                    f"bk processing failed ({error.get('code', 'unknown')}):"
+                    f" {error.get('message', '')}"
+                )
+                return finish(1)
+            if state == "processing":
+                # Design §engine: a spinner shows the loop is alive during the whole
+                # (potentially minutes-long) stint — one stage, not one per poll.
+                if stage is None:
+                    stage = reporter.stage("waiting for bk to process the meeting")
+                    stage.__enter__()
                 poll_wait()
+                wf = None
                 continue
-            failures = 0
+            if state != "awaiting_review":
+                # An unknown state means bk grew a workflow step this client predates.
+                return finish(
+                    _web_fallback(wf.get("web_url") or ref.get("web_url"), interaction, open_url)
+                )
+
+            stint_slept_s = 0.0  # a later processing stint starts fresh at 5 s
+            task = wf["tasks"][0]  # contract: awaiting_review carries exactly one task
+            task_type = task.get("type")
+            if task_type == "meeting_mapping":
+                answer = interaction.review_mapping(build_mapping_view(task))
+            elif task_type == "speaker_annotation":
+                answer = interaction.review_speakers(build_speaker_view(task, meeting_dir))
+            else:
+                return finish(
+                    _web_fallback(task.get("web_url") or wf.get("web_url"), interaction, open_url)
+                )
+
+            if isinstance(answer, Quit):
+                interaction.notify(
+                    f"review paused — resume with: meetscribe review {meeting_dir}"
+                )
+                return finish(0)
+            if isinstance(answer, OpenWeb):
+                return finish(
+                    _web_fallback(task.get("web_url") or wf.get("web_url"), interaction, open_url)
+                )
+
+            if task_type == "meeting_mapping":
+                body = mapping_submission(answer, task["revision"])
+            else:
+                body = speaker_submission(answer, task["revision"])
+            submitted: dict | None = None
+            while submitted is None:
+                try:
+                    submitted = client.submit_task(task["submit_url"], body)
+                except BkAuthError as e:
+                    # 401 is final everywhere (contract rule): surface the token
+                    # problem instead of re-asking for answers bk will reject again.
+                    interaction.notify(str(e))
+                    return finish(2)
+                except BkRevisionConflict as e:
+                    # The task moved under us: re-fetch and re-render the same gate
+                    # with the fresh payload/revision. No retry cap — each round
+                    # needs a human answer.
+                    interaction.notify(str(e))
+                    wf = None
+                    break
+                except BkInvalidSubmission as e:
+                    # bk rejected the answer body: show the server's message, re-ask
+                    # the gate (wf is unchanged, so the same gate re-renders).
+                    interaction.notify(str(e))
+                    break
+                except BkError as e:
+                    # Transport trouble during submit — the answers are still in
+                    # memory (design §errors), so offer re-sending the SAME body
+                    # instead of re-walking the gate. A lost submit that actually
+                    # landed answers the resend with a clean 409, so retrying is safe.
+                    if interaction.ask_retry(f"submit failed ({e}) — retry?"):
+                        continue
+                    interaction.notify(
+                        f"review paused — resume with: meetscribe review {meeting_dir}"
+                    )
+                    return finish(0)
+            if submitted is None:
+                continue  # 409 (re-fetch) or 422 (re-ask) — nothing new to persist
+            wf = submitted
             ref = _persist_state(meeting_dir, ref, wf)
-
-        state = str(wf.get("state") or "")
-        if state == "done":
-            reporter.info(f"review complete — {ref.get('web_url')}")
-            return 0
-        if state == "failed":
-            error = wf.get("error") or {}
-            reporter.warn(
-                f"bk processing failed ({error.get('code', 'unknown')}):"
-                f" {error.get('message', '')}"
-            )
-            return 1
-        if state == "processing":
-            poll_wait()
-            wf = None
-            continue
-        if state != "awaiting_review":
-            # An unknown state means bk grew a workflow step this client predates.
-            return _web_fallback(wf.get("web_url") or ref.get("web_url"), interaction, open_url)
-
-        stint_slept_s = 0.0  # a later processing stint starts fresh at 5 s
-        task = wf["tasks"][0]  # contract: awaiting_review carries exactly one task
-        task_type = task.get("type")
-        if task_type == "meeting_mapping":
-            answer = interaction.review_mapping(build_mapping_view(task))
-        elif task_type == "speaker_annotation":
-            answer = interaction.review_speakers(build_speaker_view(task, meeting_dir))
-        else:
-            return _web_fallback(task.get("web_url") or wf.get("web_url"), interaction, open_url)
-
-        if isinstance(answer, Quit):
-            interaction.notify(
-                f"review paused — resume with: meetscribe review {meeting_dir}"
-            )
-            return 0
-        if isinstance(answer, OpenWeb):
-            return _web_fallback(task.get("web_url") or wf.get("web_url"), interaction, open_url)
-
-        if task_type == "meeting_mapping":
-            body = mapping_submission(answer, task["revision"])
-        else:
-            body = speaker_submission(answer, task["revision"])
-        try:
-            wf = client.submit_task(task["submit_url"], body)
-        except BkRevisionConflict as e:
-            # The task moved under us: re-fetch and re-render the same gate with the
-            # fresh payload/revision. No retry cap — each round needs a human answer.
-            interaction.notify(str(e))
-            wf = None
-            continue
-        except BkInvalidSubmission as e:
-            # bk rejected the answer body: show the server's message, re-ask the gate.
-            interaction.notify(str(e))
-            continue
-        except BkError as e:
-            # Transport trouble during submit — the gate is still open, re-ask it.
-            interaction.notify(f"submit failed ({e}) — please answer again")
-            continue
-        ref = _persist_state(meeting_dir, ref, wf)
+    finally:
+        # Ctrl-C or an early return must never leave a spinner on screen.
+        end_stage()

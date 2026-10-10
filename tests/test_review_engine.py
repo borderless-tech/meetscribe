@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from meetscribe.bk import (
+    BkAuthError,
     BkError,
     BkInvalidSubmission,
     BkRevisionConflict,
@@ -48,10 +49,12 @@ class FakeBkClient:
         self._states = list(states)
         self._submit_results = list(submit_results)
         self.workflow_calls = 0
+        self.workflow_ids = []  # the id each poll asked for, in order
         self.submitted = []  # (submit_url, body) in order
 
     def workflow(self, workflow_id):
         self.workflow_calls += 1
+        self.workflow_ids.append(workflow_id)
         item = self._states.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -79,12 +82,25 @@ class RecordingSleep:
 class RecordingReporter:
     def __init__(self):
         self.warnings = []
+        self.stages = []  # ("enter"/"exit", label) events, in order
 
     def info(self, msg):
         pass
 
     def warn(self, msg):
         self.warnings.append(msg)
+
+    def stage(self, label):
+        events = self.stages
+
+        class _Stage:
+            def __enter__(self):
+                events.append(("enter", label))
+
+            def __exit__(self, *exc):
+                events.append(("exit", label))
+
+        return _Stage()
 
 
 class RecordingOpen:
@@ -97,6 +113,7 @@ class RecordingOpen:
 
 
 SEEDED_CHECKED_AT = "2026-10-09T08:00:00+00:00"
+WF_ID = "wf-11111111-1111-4111-8111-111111111111"
 
 # Minimal transcript backing the speaker gate (spk_2 stays payload-only, as in
 # test_review_views): derivation itself is covered there, the engine only needs
@@ -114,9 +131,9 @@ def _meeting_dir(tmp_path, with_transcript=False):
     write_workflow_ref(
         meeting,
         {
-            "workflow_id": "wf-11111111-1111-4111-8111-111111111111",
-            "state_url": "/api/meetscribe/v1/workflows/wf-11111111-1111-4111-8111-111111111111",
-            "web_url": "https://bk.example.com/transcripts/wf-11111111-1111-4111-8111-111111111111",
+            "workflow_id": WF_ID,
+            "state_url": f"/api/meetscribe/v1/workflows/{WF_ID}",
+            "web_url": f"https://bk.example.com/transcripts/{WF_ID}",
             "uploaded_at": "2026-10-09T07:00:00+00:00",
             "state": "processing",
             "checked_at": SEEDED_CHECKED_AT,
@@ -160,10 +177,16 @@ def test_happy_path_walks_both_gates_and_submits_the_contract_bodies(tmp_path):
     )
     interaction = ScriptedInteraction([MAPPING_ANSWER, SPEAKER_ANSWERS])
     sleep = RecordingSleep()
+    emitted = []
 
-    code = run_review(meeting, client, interaction, sleep=sleep, open_url=RecordingOpen())
+    code = run_review(
+        meeting, client, interaction, sleep=sleep, open_url=RecordingOpen(),
+        emit=emitted.append,
+    )
 
     assert code == 0
+    # Every poll asked bk for THIS meeting's workflow — the id from the persisted ref.
+    assert client.workflow_ids == [WF_ID] * 5
     # THE contract test: both submitted bodies equal the canonical fixtures, and each
     # went to its task's own submit_url.
     assert client.submitted == [
@@ -181,6 +204,8 @@ def test_happy_path_walks_both_gates_and_submits_the_contract_bodies(tmp_path):
     ref = read_workflow_ref(meeting)
     assert ref["state"] == "done"
     assert ref["checked_at"] != SEEDED_CHECKED_AT
+    # The single machine-useful stdout line (design §gate-rendering).
+    assert emitted == [f"{WF_ID} done"]
 
 
 def test_submit_response_is_used_directly_as_the_next_state(tmp_path):
@@ -316,28 +341,33 @@ def test_quit_answer_exits_cleanly_without_submitting_or_opening(tmp_path):
         states=[_fixture("workflow-awaiting-review-meeting-mapping.json")]
     )
     open_url = RecordingOpen()
+    emitted = []
 
     code = run_review(
         meeting, client, ScriptedInteraction([Quit()]), sleep=RecordingSleep(),
-        open_url=open_url,
+        open_url=open_url, emit=emitted.append,
     )
 
     assert code == 0
     assert client.submitted == []
     assert open_url.urls == []
+    # Quitting still leaves the machine-usable outcome on stdout.
+    assert emitted == [f"{WF_ID} awaiting_review"]
 
 
 def test_failed_workflow_exits_1(tmp_path):
     meeting = _meeting_dir(tmp_path)
     client = FakeBkClient(states=[_fixture("workflow-failed.json")])
+    emitted = []
 
     code = run_review(
         meeting, client, ScriptedInteraction([]), sleep=RecordingSleep(),
-        open_url=RecordingOpen(),
+        open_url=RecordingOpen(), emit=emitted.append,
     )
 
     assert code == 1
     assert read_workflow_ref(meeting)["state"] == "failed"
+    assert emitted == [f"{WF_ID} failed"]
 
 
 def test_done_immediately_exits_0_and_persists_the_state(tmp_path):
@@ -388,6 +418,102 @@ def test_five_consecutive_poll_failures_abort_with_exit_1(tmp_path):
 
     assert code == 1
     assert client.workflow_calls == 5
+
+
+def test_auth_error_while_polling_exits_2_without_retrying(tmp_path):
+    # Contract rule: "401 → actionable client error, never a retry loop" — a revoked
+    # token must not be re-sent, and the message (naming the token knobs) must surface.
+    meeting = _meeting_dir(tmp_path)
+    message = "bk rejected the request (HTTP 401) — check [bk].token"
+    client = FakeBkClient(states=[BkAuthError(message)] * 5)
+    interaction = ScriptedInteraction([])
+    sleep = RecordingSleep()
+
+    code = run_review(
+        meeting, client, interaction, RecordingReporter(), sleep=sleep,
+        open_url=RecordingOpen(),
+    )
+
+    assert code == 2
+    assert client.workflow_calls == 1  # never re-sent the known-bad token
+    assert sleep.calls == []
+    assert interaction.messages == [message]
+
+
+def test_auth_error_during_submit_exits_2_without_reasking(tmp_path):
+    # A 401 at submit time is the same token problem: surfacing it beats re-asking
+    # the human for answers bk will reject again.
+    meeting = _meeting_dir(tmp_path)
+    message = "bk rejected the request (HTTP 401) — check [bk].token"
+    client = FakeBkClient(
+        states=[_fixture("workflow-awaiting-review-meeting-mapping.json")],
+        submit_results=[BkAuthError(message)],
+    )
+    interaction = ScriptedInteraction([MAPPING_ANSWER])
+
+    code = run_review(
+        meeting, client, interaction, sleep=RecordingSleep(), open_url=RecordingOpen()
+    )
+
+    assert code == 2
+    assert len(client.submitted) == 1
+    assert len(interaction.seen) == 1  # the gate was NOT re-asked
+    assert interaction.messages == [message]
+
+
+def test_submit_network_blip_offers_retry_and_resends_the_same_body(tmp_path):
+    # Design §errors: the answers are still in memory, so a transport blip offers a
+    # retry of the SAME body instead of re-walking the whole gate.
+    meeting = _meeting_dir(tmp_path)
+    client = FakeBkClient(
+        states=[_fixture("workflow-awaiting-review-meeting-mapping.json")],
+        submit_results=[BkError("connection reset"), _fixture("workflow-done.json")],
+    )
+    interaction = ScriptedInteraction([MAPPING_ANSWER, True])  # True = retry
+
+    code = run_review(
+        meeting, client, interaction, sleep=RecordingSleep(), open_url=RecordingOpen()
+    )
+
+    assert code == 0
+    body = _fixture("task-submit-meeting-mapping-select.json")
+    url = client.submitted[0][0]
+    assert client.submitted == [(url, body), (url, body)]  # identical resend
+    assert len(interaction.seen) == 1  # the gate was asked exactly once
+
+
+def test_submit_network_blip_declined_retry_exits_0_without_resending(tmp_path):
+    meeting = _meeting_dir(tmp_path)
+    client = FakeBkClient(
+        states=[_fixture("workflow-awaiting-review-meeting-mapping.json")],
+        submit_results=[BkError("connection reset")],
+    )
+    interaction = ScriptedInteraction([MAPPING_ANSWER, False])  # False = quit
+
+    code = run_review(
+        meeting, client, interaction, sleep=RecordingSleep(), open_url=RecordingOpen()
+    )
+
+    assert code == 0
+    assert len(client.submitted) == 1
+
+
+def test_processing_stint_renders_one_reporter_stage_span(tmp_path):
+    # Design §engine: "spinner via Reporter" — one stage spans the whole processing
+    # stint (not one per poll), and it is closed before the loop returns.
+    meeting = _meeting_dir(tmp_path)
+    client = FakeBkClient(
+        states=[_fixture("workflow-processing.json")] * 3 + [_fixture("workflow-done.json")]
+    )
+    reporter = RecordingReporter()
+
+    code = run_review(
+        meeting, client, ScriptedInteraction([]), reporter, sleep=RecordingSleep(),
+        open_url=RecordingOpen(),
+    )
+
+    assert code == 0
+    assert [event for event, _ in reporter.stages] == ["enter", "exit"]
 
 
 def test_keyboard_interrupt_during_sleep_exits_0_with_the_last_state_persisted(tmp_path):

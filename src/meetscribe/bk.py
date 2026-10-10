@@ -36,6 +36,12 @@ class BkError(RuntimeError):
     The message is always actionable — it names the knob to turn."""
 
 
+class BkAuthError(BkError):
+    """401/403: bk rejected the token. Final — the contract forbids retry loops on
+    auth failures; re-sending a known-bad token only wastes the user's time. The
+    message names the token knobs to turn."""
+
+
 class BkRevisionConflict(BkError):
     """409 on a task submit: the task's revision moved under us. Final — the caller
     must re-fetch the workflow and re-ask the human; a transport retry would resend
@@ -179,7 +185,7 @@ class BkClient:
                 if final_codes and e.code in final_codes:
                     raise final_codes[e.code](detail or e.reason) from e
                 if e.code in (401, 403):
-                    raise BkError(
+                    raise BkAuthError(
                         f"bk rejected the request (HTTP {e.code}: {detail or e.reason})"
                         " — check [bk].token / [bk].token_cmd (or MEETSCRIBE_BK_TOKEN)"
                     ) from e

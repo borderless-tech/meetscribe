@@ -168,15 +168,18 @@ to be drop-in replaceable by bk's canonical set — divergence later = red test 
 ## Review loop (bk gates)
 
 `meetscribe review [dir]` walks bk's `awaiting_review` gates in the terminal; after a
-successful upload the loop auto-continues — **only when stderr is a TTY**
-(`cli._maybe_review`, injectable `isatty`). Design:
+successful upload the loop auto-continues — **only when stderr AND stdin are ttys**
+(`cli._maybe_review`, injectable `isatty`; stdin matters because the key reader does raw
+termios reads — stderr alone would crash on a redirected stdin after a successful upload).
+Design:
 `docs/plans/2026-10-10-phase4-review-loop-design.md`. Three seams keep every test offline:
 
 - `bk.submit_task(submit_url, body)` — POST with revision echo; `submit_url` from the
   task payload is a **host-relative path** joined onto `base_url`, not an id. 409 →
   `BkRevisionConflict`, **never retried** (each round needs a fresh human answer);
-  422 → `BkInvalidSubmission` carrying the server's message; 5xx retries like the
-  other calls.
+  422 → `BkInvalidSubmission` carrying the server's message; 401/403 →
+  `BkAuthError` (final everywhere — the contract forbids retry loops on auth
+  failures); 5xx retries like the other calls.
 - `interaction.py` — the **task-level** front-end protocol (`Interaction`: one method
   per gate type, exchanging frozen view-models for answers — deliberately not
   prompt-level, so the later tray GUI renders one form per gate instead of a wizard).
@@ -187,16 +190,22 @@ successful upload the loop auto-continues — **only when stderr is a TTY**
   owns ffplay playback — `ffplay_argv` is the pure, tested part, missing ffplay
   degrades to a notify.
 - `review.py` — the pure engine: `run_review(meeting_dir, client, interaction,
-  reporter, *, sleep, open_url)`, all side effects injected. Polls 5 s (15 s after the
-  first minute); a submit's 200 response **is** the next state (no extra GET). Unknown
-  task types and `OpenWeb` answers hand off to the task's `web_url`. View-model
-  building (`build_speaker_view`/`build_mapping_view`) and submission translation
-  (`speaker_submission`/`mapping_submission`) are pure functions tested against the
-  contract fixtures in `tests/fixtures/bk/`.
+  reporter, *, sleep, open_url, emit)`, all side effects injected. Polls 5 s (15 s
+  after the first minute) under ONE `reporter.stage` spinner per processing stint; a
+  submit's 200 response **is** the next state (no extra GET). Unknown task types and
+  `OpenWeb` answers hand off to the task's `web_url`. A plain `BkError` during submit
+  keeps the answers in memory and offers a retry of the same body
+  (`interaction.ask_retry`; a resend of a submit that secretly landed is a clean 409).
+  `emit` (default `print`) writes the single machine-useful stdout line
+  (`<workflow_id> <state>`) on every exit — all human rendering stays on stderr.
+  View-model building (`build_speaker_view`/`build_mapping_view`) and submission
+  translation (`speaker_submission`/`mapping_submission`) are pure functions tested
+  against the contract fixtures in `tests/fixtures/bk/`.
 
 Exit codes: `done`, user quit (`q`/Ctrl-C — gates wait 7 days), and web-handoff are
 **0**; workflow `failed` or `POLL_FAILURE_LIMIT` (5) consecutive poll errors are **1**;
-config problems / no uploaded meeting are **2**. The upload exit-code asymmetry carries
+config problems / no uploaded meeting / `BkAuthError` (bad token, never retried) are
+**2**. The upload exit-code asymmetry carries
 over: on `upload` the review's code becomes the command's (review is now the task), while
 `record`/`process` ignore it and stay exit 0. `bk-workflow.json` is rewritten after every
 state change, so `status` stays accurate for free.

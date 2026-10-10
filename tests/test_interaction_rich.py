@@ -271,6 +271,15 @@ def test_mapping_w_and_q():
     assert isinstance(rich_interaction(["q"]).review_mapping(mapping_view()), Quit)
 
 
+# ---- submit-retry prompt ----------------------------------------------------------------
+
+
+def test_ask_retry_enter_or_r_retries_q_quits_unknown_keys_rereads():
+    assert rich_interaction(["r"]).ask_retry("submit failed") is True
+    assert rich_interaction([ENTER]).ask_retry("submit failed") is True
+    assert rich_interaction(["x", "q"]).ask_retry("submit failed") is False
+
+
 # ---- ffplay playback --------------------------------------------------------------------
 
 

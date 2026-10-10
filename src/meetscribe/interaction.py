@@ -131,6 +131,7 @@ MappingResult = Union[MappingAnswer, OpenWeb, Quit]
 class Interaction(Protocol):
     def review_speakers(self, view: SpeakerReviewView) -> SpeakerResult: ...
     def review_mapping(self, view: MappingReviewView) -> MappingResult: ...
+    def ask_retry(self, message: str) -> bool: ...
     def notify(self, message: str) -> None: ...
 
 
@@ -145,6 +146,9 @@ class NullInteraction:
         raise RuntimeError(self._MSG)
 
     def review_mapping(self, view: MappingReviewView) -> MappingResult:
+        raise RuntimeError(self._MSG)
+
+    def ask_retry(self, message: str) -> bool:
         raise RuntimeError(self._MSG)
 
     def notify(self, message: str) -> None:
@@ -168,6 +172,10 @@ class ScriptedInteraction:
     def review_mapping(self, view: MappingReviewView) -> MappingResult:
         self.seen.append(view)
         return self._answers.pop(0)
+
+    def ask_retry(self, message: str) -> bool:
+        self.messages.append(message)
+        return self._answers.pop(0)  # scripted True (retry) / False (quit)
 
     def notify(self, message: str) -> None:
         self.messages.append(message)
@@ -247,6 +255,19 @@ class RichInteraction:
 
     def notify(self, message: str) -> None:
         self.console.print(message)
+
+    def ask_retry(self, message: str) -> bool:
+        """A submit failed in transit but the answers are still in memory: offer
+        re-sending the same body instead of re-walking the gate."""
+        self.console.print(f"[yellow]{message}[/yellow]")
+        self.console.print("  [dim]Enter/r retry · q quit[/dim]")
+        while True:
+            key = self._readkey()
+            if key == "r" or key in _ENTER_KEYS:
+                return True
+            if key == "q":
+                return False
+            # unknown key — ignore, re-read
 
     # -- speaker annotation gate --
 

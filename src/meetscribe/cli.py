@@ -263,20 +263,23 @@ def _resolve_bk_client(env, cfg):
     return bk_mod.BkClient(bk_mod.BkConfig(base_url, token))
 
 
-def _stderr_isatty() -> bool:
-    """A human is attached when stderr is a tty — the gate for auto-continuing
-    into the review loop. Module-level so tests can monkeypatch one symbol."""
-    return sys.stderr.isatty()
+def _stdio_isatty() -> bool:
+    """A human is attached only when BOTH stderr (gate rendering) and stdin (raw
+    keypresses) are ttys — stderr alone would crash the key reader on a redirected
+    stdin right after a successful upload. Module-level so tests can monkeypatch
+    one symbol."""
+    return sys.stderr.isatty() and sys.stdin.isatty()
 
 
 def _maybe_review(meeting_dir, client, reporter, isatty=None):
     """Post-upload auto-continue (design §command-surface): flow straight into the
-    review loop, but ONLY when a human is attached (stderr is a tty) — non-interactive
-    contexts keep the print-URL-and-exit behavior. Returns the review exit code, or
-    ``None`` when skipped; the CALLER decides what that means: ``upload`` adopts it
-    (review is now the task), record/process ignore it (the artifacts are complete,
-    a non-zero exit would make automation treat a *processed* meeting as failed)."""
-    if not (isatty or _stderr_isatty)():
+    review loop, but ONLY when a human is attached (stderr AND stdin are ttys) —
+    non-interactive contexts keep the print-URL-and-exit behavior. Returns the review
+    exit code, or ``None`` when skipped; the CALLER decides what that means:
+    ``upload`` adopts it (review is now the task), record/process ignore it (the
+    artifacts are complete, a non-zero exit would make automation treat a *processed*
+    meeting as failed)."""
+    if not (isatty or _stdio_isatty)():
         return None
     from . import review as review_mod
     from .interaction import RichInteraction

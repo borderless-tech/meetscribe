@@ -1386,10 +1386,35 @@ def test_review_default_dir_is_newest_uploaded_meeting(isolated_config, tmp_path
     assert [c[0] for c in calls] == [new]
 
 
+def test_stdio_isatty_requires_both_stderr_and_stdin(monkeypatch):
+    # The review loop renders on stderr but READS raw keys from stdin: with stdin
+    # redirected (e.g. `process dir < answers.txt`) the key reader would crash with
+    # termios.error AFTER a successful upload — so the gate must check both streams.
+    from meetscribe import cli
+
+    class Tty:
+        def isatty(self):
+            return True
+
+    class Pipe:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(cli.sys, "stderr", Tty())
+    monkeypatch.setattr(cli.sys, "stdin", Pipe())
+    assert cli._stdio_isatty() is False
+
+    monkeypatch.setattr(cli.sys, "stdin", Tty())
+    assert cli._stdio_isatty() is True
+
+    monkeypatch.setattr(cli.sys, "stderr", Pipe())
+    assert cli._stdio_isatty() is False
+
+
 def test_upload_non_tty_skips_review(isolated_config, tmp_path, monkeypatch):
-    # Under pytest stderr is a pipe → isatty() is False: upload behaves exactly as
-    # before (exit 0, engine never entered). The untouched upload tests above assert
-    # the same byte-identical output.
+    # Under pytest stdin/stderr are pipes → isatty() is False: upload behaves exactly
+    # as before (exit 0, engine never entered). The untouched upload tests above
+    # assert the same byte-identical output.
     from meetscribe.cli import main
 
     src = _meeting_dir(tmp_path)
@@ -1413,7 +1438,7 @@ def test_upload_on_tty_autocontinues_into_review(isolated_config, tmp_path, monk
     src = _meeting_dir(tmp_path)
     _write_bk_config(isolated_config)
     _fake_bk_client(monkeypatch)
-    monkeypatch.setattr(cli, "_stderr_isatty", lambda: True)
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
 
     calls = []
 
@@ -1440,7 +1465,7 @@ def test_upload_failure_on_tty_does_not_enter_review(
     src = _meeting_dir(tmp_path)
     _write_bk_config(isolated_config)
     _fake_bk_client(monkeypatch, upload_error=bk.BkError("network error: down"))
-    monkeypatch.setattr(cli, "_stderr_isatty", lambda: True)
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
     calls = _patch_run_review(monkeypatch)
 
     assert main(["upload", str(src)]) == 1
@@ -1460,7 +1485,7 @@ def test_pipeline_auto_upload_runs_review_but_ignores_its_exit_code(
     bundle_path = src / "meeting-m1.mscribe"
     bundle_dir(src, bundle_path)
     _fake_bk_client(monkeypatch)
-    monkeypatch.setattr(cli, "_stderr_isatty", lambda: True)
+    monkeypatch.setattr(cli, "_stdio_isatty", lambda: True)
     calls = _patch_run_review(monkeypatch, rc=1)
 
     result = pipeline._upload_to_bk(

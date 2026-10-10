@@ -17,6 +17,7 @@ import pytest
 
 from meetscribe.bk import (
     WORKFLOW_REF_NAME,
+    BkAuthError,
     BkClient,
     BkConfig,
     BkError,
@@ -282,12 +283,25 @@ def test_upload_third_failure_raises_bk_error(tmp_path):
 
 
 def test_upload_401_names_both_token_knobs_and_does_not_retry(tmp_path):
+    # Typed as BkAuthError so callers can treat a bad token as FINAL (contract:
+    # "401 → actionable client error, never a retry loop") — a generic BkError
+    # handler would conflate it with a transient network blip and retry.
     opener = SeqOpener([_http_error(401)])
     client, sleeps = _client(opener)
 
-    with pytest.raises(BkError, match="MEETSCRIBE_BK_TOKEN") as excinfo:
+    with pytest.raises(BkAuthError, match="MEETSCRIBE_BK_TOKEN") as excinfo:
         client.upload_bundle(_bundle(tmp_path), meeting_id="m")
     assert "[bk].token" in str(excinfo.value)
+    assert len(opener.calls) == 1
+    assert sleeps == []
+
+
+def test_submit_task_401_is_a_typed_final_auth_error():
+    opener = SeqOpener([_http_error(401)])
+    client, sleeps = _client(opener)
+
+    with pytest.raises(BkAuthError, match=r"\[bk\]\.token"):
+        client.submit_task(_submit_url(), _fixture("task-submit-speaker-annotation.json"))
     assert len(opener.calls) == 1
     assert sleeps == []
 
@@ -465,9 +479,10 @@ def test_submit_task_422_is_a_typed_final_invalid_submission_with_the_server_mes
 
 
 def test_submit_task_typed_errors_are_bk_errors():
-    # generic `except BkError` handlers (warn + retry hint) must still catch both
+    # generic `except BkError` handlers (warn + retry hint) must still catch all three
     assert issubclass(BkRevisionConflict, BkError)
     assert issubclass(BkInvalidSubmission, BkError)
+    assert issubclass(BkAuthError, BkError)
 
 
 def test_submit_task_retries_on_500_then_succeeds():
